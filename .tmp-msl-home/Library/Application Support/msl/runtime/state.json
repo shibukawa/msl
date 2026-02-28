@@ -1,0 +1,14 @@
+{
+  "activeSessionCount" : 0,
+  "bootstrap" : {
+    "completed" : false,
+    "phase" : "none"
+  },
+  "distro" : "default",
+  "idleTimer" : {
+    "armed" : false
+  },
+  "lastTransitionEpochMs" : 1770781215973,
+  "schemaVersion" : 1,
+  "vmState" : "Stopped"
+}

@@ -1,0 +1,10 @@
+[package]
+name = "msl-ext4-image"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Build ext4 disk images from extracted Linux rootfs directories"
+publish = false
+
+[dependencies]
+ext4-lwext4 = { version = "0.1.1", default-features = true }

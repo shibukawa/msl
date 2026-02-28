@@ -1,0 +1,10 @@
+[package]
+name = "msl-ext4-mkfs"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Create ext4 disk images for msl"
+publish = false
+
+[dependencies]
+ext4-mkfs = "0.1.0"

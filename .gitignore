@@ -1,0 +1,26 @@
+## OS
+.DS_Store
+
+## Local work/runtime directories
+tmp/
+tmp-workspace/
+~/
+
+## Swift Package Manager
+.build/
+.swiftpm/
+Package.resolved
+
+## Xcode/Apple tooling
+DerivedData/
+*.xcworkspace/xcuserdata/
+*.xcodeproj/project.xcworkspace/xcuserdata/
+*.xcodeproj/xcuserdata/
+
+## Editor settings
+.idea/
+.vscode/
+
+## Python caches (utility scripts)
+__pycache__/
+*.pyc

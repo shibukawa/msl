@@ -1,0 +1,336 @@
+import Foundation
+
+public enum DistributionSupportState: String, Codable {
+    case supported
+    case eol
+}
+
+public struct SudoPolicyTemplate: Codable, Equatable {
+    public var enabled: Bool
+    public var requireSudoBinary: Bool
+    public var dropInPath: String
+    public var passwordless: Bool?
+
+    public init(
+        enabled: Bool = true,
+        requireSudoBinary: Bool = false,
+        dropInPath: String = "/etc/sudoers.d/msl-user",
+        passwordless: Bool? = nil
+    ) {
+        self.enabled = enabled
+        self.requireSudoBinary = requireSudoBinary
+        self.dropInPath = dropInPath
+        self.passwordless = passwordless
+    }
+}
+
+public struct SuPolicyTemplate: Codable, Equatable {
+    public var enabled: Bool
+    public var passwordless: Bool?
+
+    public init(
+        enabled: Bool = false,
+        passwordless: Bool? = nil
+    ) {
+        self.enabled = enabled
+        self.passwordless = passwordless
+    }
+}
+
+public struct WelcomePolicyTemplate: Codable, Equatable {
+    public var enabled: Bool
+    public var frequency: String
+    public var respectHushlogin: Bool
+
+    public init(
+        enabled: Bool = true,
+        frequency: String = "daily",
+        respectHushlogin: Bool = true
+    ) {
+        self.enabled = enabled
+        self.frequency = frequency
+        self.respectHushlogin = respectHushlogin
+    }
+}
+
+public struct UserConvergencePolicyTemplate: Codable, Equatable {
+    public var templateId: String
+    public var commandFamily: String
+    public var adminGroup: String
+    public var sudoPolicy: SudoPolicyTemplate
+    public var suPolicy: SuPolicyTemplate?
+    public var shellFallbacks: [String]
+    public var welcomePolicy: WelcomePolicyTemplate
+    public var editable: Bool?
+
+    public init(
+        templateId: String,
+        commandFamily: String,
+        adminGroup: String,
+        sudoPolicy: SudoPolicyTemplate,
+        suPolicy: SuPolicyTemplate? = nil,
+        shellFallbacks: [String],
+        welcomePolicy: WelcomePolicyTemplate,
+        editable: Bool? = nil
+    ) {
+        self.templateId = templateId
+        self.commandFamily = commandFamily
+        self.adminGroup = adminGroup
+        self.sudoPolicy = sudoPolicy
+        self.suPolicy = suPolicy
+        self.shellFallbacks = shellFallbacks
+        self.welcomePolicy = welcomePolicy
+        self.editable = editable
+    }
+}
+
+public typealias UserConvergencePolicy = UserConvergencePolicyTemplate
+
+public struct DistributionManifestEntry: Codable, Equatable {
+    public var id: String
+    public var distro: String
+    public var version: String
+    public var arch: String
+    public var tarballURL: String
+    public var sha256: String
+    public var signatureURL: String?
+    public var checksumURL: String?
+    public var signatureTarget: String?
+    public var keyFingerprint: String?
+    public var supportState: DistributionSupportState
+    public var userConvergenceTemplate: UserConvergencePolicyTemplate?
+
+    public init(
+        id: String,
+        distro: String,
+        version: String,
+        arch: String,
+        tarballURL: String,
+        sha256: String,
+        signatureURL: String?,
+        checksumURL: String?,
+        signatureTarget: String?,
+        keyFingerprint: String?,
+        supportState: DistributionSupportState,
+        userConvergenceTemplate: UserConvergencePolicyTemplate? = nil
+    ) {
+        self.id = id
+        self.distro = distro
+        self.version = version
+        self.arch = arch
+        self.tarballURL = tarballURL
+        self.sha256 = sha256
+        self.signatureURL = signatureURL
+        self.checksumURL = checksumURL
+        self.signatureTarget = signatureTarget
+        self.keyFingerprint = keyFingerprint
+        self.supportState = supportState
+        self.userConvergenceTemplate = userConvergenceTemplate
+    }
+}
+
+public struct DistributionInstallDescriptor: Codable, Equatable {
+    public var canonicalName: String
+    public var aliases: [String]
+    public var manifestId: String
+
+    public init(canonicalName: String, aliases: [String], manifestId: String) {
+        self.canonicalName = canonicalName
+        self.aliases = aliases
+        self.manifestId = manifestId
+    }
+}
+
+public struct InstalledInstanceDescriptor: Codable, Equatable {
+    public var name: String
+    public var hasDisk: Bool
+    public var createdAtEpochMs: Int64?
+
+    public init(name: String, hasDisk: Bool, createdAtEpochMs: Int64?) {
+        self.name = name
+        self.hasDisk = hasDisk
+        self.createdAtEpochMs = createdAtEpochMs
+    }
+}
+
+public struct DistributionUninstallResult: Codable, Equatable {
+    public var name: String
+    public var removedInstancePath: String
+    public var removedCachePath: String?
+    public var keptCachePath: String?
+
+    public init(
+        name: String,
+        removedInstancePath: String,
+        removedCachePath: String?,
+        keptCachePath: String?
+    ) {
+        self.name = name
+        self.removedInstancePath = removedInstancePath
+        self.removedCachePath = removedCachePath
+        self.keptCachePath = keptCachePath
+    }
+}
+
+public struct DistributionSourceRecord: Codable, Equatable {
+    public var sourceType: String
+    public var distro: String?
+    public var version: String?
+    public var arch: String?
+    public var manifestId: String?
+    public var localPath: String?
+    public var tarballFileName: String
+    public var sha256: String
+    public var verifiedAtEpochMs: Int64
+}
+
+public struct WorkspacePolicy: Codable, Equatable {
+    public var activationMode: String
+    public var startupMountEnabled: Bool
+    public var protectedGuestPathPrefixes: [String]?
+
+    public init(
+        activationMode: String = "mslconfig_presence_only",
+        startupMountEnabled: Bool = true,
+        protectedGuestPathPrefixes: [String]? = nil
+    ) {
+        self.activationMode = activationMode
+        self.startupMountEnabled = startupMountEnabled
+        self.protectedGuestPathPrefixes = protectedGuestPathPrefixes
+    }
+}
+
+public struct DistributionCompressionPolicy: Codable, Equatable {
+    public var pathPolicies: [CompressionPathPolicyEntry]
+    public var cacheToggles: [String: Bool]
+    public var catalogPath: String
+    public var resolvedAtEpochMs: Int64
+
+    public init(
+        pathPolicies: [CompressionPathPolicyEntry],
+        cacheToggles: [String: Bool],
+        catalogPath: String,
+        resolvedAtEpochMs: Int64
+    ) {
+        self.pathPolicies = pathPolicies
+        self.cacheToggles = cacheToggles
+        self.catalogPath = catalogPath
+        self.resolvedAtEpochMs = resolvedAtEpochMs
+    }
+}
+
+public struct DistributionNetworkDNSPolicy: Codable, Equatable {
+    public var mode: String?
+    public var resolverBackend: String?
+    public var manualNameservers: [String]?
+    public var manualSearchDomains: [String]?
+
+    public init(
+        mode: String? = nil,
+        resolverBackend: String? = nil,
+        manualNameservers: [String]? = nil,
+        manualSearchDomains: [String]? = nil
+    ) {
+        self.mode = mode
+        self.resolverBackend = resolverBackend
+        self.manualNameservers = manualNameservers
+        self.manualSearchDomains = manualSearchDomains
+    }
+}
+
+public struct DistributionNetworkPolicy: Codable, Equatable {
+    public var dns: DistributionNetworkDNSPolicy?
+
+    public init(dns: DistributionNetworkDNSPolicy? = nil) {
+        self.dns = dns
+    }
+}
+
+public struct DistributionInstanceMetadata: Codable, Equatable {
+    public struct PrivilegeBootstrap: Codable, Equatable {
+        public var firstBootPending: Bool
+        public var privilegeBootstrapVersion: Int
+        public var lastResult: String
+        public var lastBootstrapAtEpochMs: Int64?
+
+        public init(
+            firstBootPending: Bool = true,
+            privilegeBootstrapVersion: Int = 1,
+            lastResult: String = "pending",
+            lastBootstrapAtEpochMs: Int64? = nil
+        ) {
+            self.firstBootPending = firstBootPending
+            self.privilegeBootstrapVersion = privilegeBootstrapVersion
+            self.lastResult = lastResult
+            self.lastBootstrapAtEpochMs = lastBootstrapAtEpochMs
+        }
+    }
+
+    public struct UserSnapshot: Codable, Equatable {
+        public var name: String
+        public var uid: Int
+        public var gid: Int
+        public var groups: [String]
+
+        public init(name: String, uid: Int, gid: Int, groups: [String]) {
+            self.name = name
+            self.uid = uid
+            self.gid = gid
+            self.groups = groups
+        }
+    }
+
+    public var name: String
+    public var distroFamily: String?
+    public var createdAtEpochMs: Int64
+    public var bootstrap: PrivilegeBootstrap?
+    public var user: UserSnapshot?
+    public var source: DistributionSourceRecord
+    public var diskPath: String
+    public var kernelProfileRef: String?
+    public var userConvergencePolicy: UserConvergencePolicy?
+    public var workspacePolicy: WorkspacePolicy?
+    public var compressionPolicy: DistributionCompressionPolicy?
+    public var networkPolicy: DistributionNetworkPolicy?
+
+    public init(
+        name: String,
+        distroFamily: String? = nil,
+        createdAtEpochMs: Int64,
+        bootstrap: PrivilegeBootstrap? = nil,
+        user: UserSnapshot? = nil,
+        source: DistributionSourceRecord,
+        diskPath: String,
+        kernelProfileRef: String?,
+        userConvergencePolicy: UserConvergencePolicy?,
+        workspacePolicy: WorkspacePolicy? = nil,
+        compressionPolicy: DistributionCompressionPolicy? = nil,
+        networkPolicy: DistributionNetworkPolicy? = nil
+    ) {
+        self.name = name
+        self.distroFamily = distroFamily
+        self.createdAtEpochMs = createdAtEpochMs
+        self.bootstrap = bootstrap
+        self.user = user
+        self.source = source
+        self.diskPath = diskPath
+        self.kernelProfileRef = kernelProfileRef
+        self.userConvergencePolicy = userConvergencePolicy
+        self.workspacePolicy = workspacePolicy
+        self.compressionPolicy = compressionPolicy
+        self.networkPolicy = networkPolicy
+    }
+}
+
+public struct DistributionVerifiedRecord: Codable, Equatable {
+    public var tarballPath: String
+    public var sha256: String
+    public var signatureFingerprint: String?
+    public var verifiedAtEpochMs: Int64
+    public var manifestId: String?
+}
+
+enum DistributionSourceSelection {
+    case manifest(DistributionManifestEntry)
+    case localFile(URL)
+}
