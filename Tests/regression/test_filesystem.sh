@@ -9,6 +9,10 @@ if [ "${MSL_LIVE_TESTS:-0}" != "1" ]; then
   skip_test "filesystem tests" "set MSL_LIVE_TESTS=1 to enable"
   return 0
 fi
+if ! ensure_live_ready; then
+  skip_test "filesystem tests" "$LIVE_READY_REASON"
+  return 0
+fi
 
 # --- /mnt/msl exists (macOS shared dir) ---
 run_test "shared dir /mnt/msl exists" "$MSL" run test -d /mnt/msl

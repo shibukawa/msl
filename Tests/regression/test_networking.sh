@@ -9,6 +9,10 @@ if [ "${MSL_LIVE_TESTS:-0}" != "1" ]; then
   skip_test "networking tests" "set MSL_LIVE_TESTS=1 to enable"
   return 0
 fi
+if ! ensure_live_ready; then
+  skip_test "networking tests" "$LIVE_READY_REASON"
+  return 0
+fi
 
 # --- loopback interface ---
 run_test_output "loopback interface" "lo" "$MSL" run ip link show lo

@@ -21,18 +21,19 @@ public struct MSLPaths {
     public let imagesDir: URL
     public let distrosDir: URL
     public let cacheDir: URL
+    public let legacyCacheDir: URL
     public let compressionCachePolicyCatalogFile: URL
     public let storageProvisionScriptFile: URL
     public let cacheDownloadsDir: URL
     public let cacheStagingDir: URL
+    public let legacyCacheDownloadsDir: URL
+    public let legacyCacheStagingDir: URL
     public let kernelsDir: URL
-    public let defaultDistroDir: URL
-    public let cloudInitDir: URL
-    public let cloudInitUserDataFile: URL
-    public let cloudInitMetaDataFile: URL
-    public let cloudInitSeedISOFile: URL
-    public let machineIdentifierFile: URL
-    public let efiVariableStoreFile: URL
+    public let bootstrapArtifactsDir: URL
+    public let bootstrapCloudInitDir: URL
+    public let bootstrapCloudInitUserDataFile: URL
+    public let bootstrapCloudInitMetaDataFile: URL
+    public let bootstrapCloudInitSeedISOFile: URL
     public let mslHostToolsDir: URL
     public let mslHostExt4MkfsHelperBinaryFile: URL
     public let mslHostInitBinaryFile: URL
@@ -73,19 +74,20 @@ public struct MSLPaths {
         self.configFile = appSupport.appendingPathComponent("config.json", isDirectory: false)
         self.imagesDir = appSupport.appendingPathComponent("images", isDirectory: true)
         self.distrosDir = appSupport.appendingPathComponent("distros", isDirectory: true)
-        self.cacheDir = appSupport.appendingPathComponent("cache", isDirectory: true)
+        self.cacheDir = appSupport.appendingPathComponent("caches", isDirectory: true)
+        self.legacyCacheDir = appSupport.appendingPathComponent("cache", isDirectory: true)
         self.compressionCachePolicyCatalogFile = appSupport.appendingPathComponent("compression-cache-policy-catalog.json", isDirectory: false)
         self.storageProvisionScriptFile = appSupport.appendingPathComponent("storage-provision.sh", isDirectory: false)
-        self.cacheDownloadsDir = cacheDir.appendingPathComponent("downloads", isDirectory: true)
+        self.cacheDownloadsDir = cacheDir.appendingPathComponent("rootfs", isDirectory: true)
         self.cacheStagingDir = cacheDir.appendingPathComponent("staging", isDirectory: true)
+        self.legacyCacheDownloadsDir = legacyCacheDir.appendingPathComponent("downloads", isDirectory: true)
+        self.legacyCacheStagingDir = legacyCacheDir.appendingPathComponent("staging", isDirectory: true)
         self.kernelsDir = appSupport.appendingPathComponent("kernels", isDirectory: true)
-        self.defaultDistroDir = distrosDir.appendingPathComponent("default", isDirectory: true)
-        self.cloudInitDir = defaultDistroDir.appendingPathComponent("cloud-init", isDirectory: true)
-        self.cloudInitUserDataFile = cloudInitDir.appendingPathComponent("user-data", isDirectory: false)
-        self.cloudInitMetaDataFile = cloudInitDir.appendingPathComponent("meta-data", isDirectory: false)
-        self.cloudInitSeedISOFile = defaultDistroDir.appendingPathComponent("seed.iso", isDirectory: false)
-        self.machineIdentifierFile = defaultDistroDir.appendingPathComponent("machine-identifier.bin", isDirectory: false)
-        self.efiVariableStoreFile = defaultDistroDir.appendingPathComponent("efi-variable-store", isDirectory: false)
+        self.bootstrapArtifactsDir = appSupport.appendingPathComponent("bootstrap", isDirectory: true)
+        self.bootstrapCloudInitDir = bootstrapArtifactsDir.appendingPathComponent("cloud-init", isDirectory: true)
+        self.bootstrapCloudInitUserDataFile = bootstrapCloudInitDir.appendingPathComponent("user-data", isDirectory: false)
+        self.bootstrapCloudInitMetaDataFile = bootstrapCloudInitDir.appendingPathComponent("meta-data", isDirectory: false)
+        self.bootstrapCloudInitSeedISOFile = bootstrapArtifactsDir.appendingPathComponent("seed.iso", isDirectory: false)
     }
 
     public func distroDirectory(named name: String) -> URL {

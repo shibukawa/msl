@@ -1451,8 +1451,18 @@ fn handle_request_line(line: &str) -> String {
             let argv = extract_string_array(line, "argv");
             let timeout_ms = extract_int(line, "timeoutMs");
             let cwd = extract_string(line, "cwd");
+            let env_additions = extract_string_map(line, "envAdditions").unwrap_or_default();
+            let run_as_root = extract_bool(line, "runAsRoot").unwrap_or(false);
             match argv {
-                Some(v) if !v.is_empty() => exec_response(&request_id, &op, v, cwd, timeout_ms),
+                Some(v) if !v.is_empty() => exec_response(
+                    &request_id,
+                    &op,
+                    v,
+                    cwd,
+                    timeout_ms,
+                    env_additions,
+                    run_as_root,
+                ),
                 _ => error_response(&request_id, &op, "invalid_request", "missing argv"),
             }
         }
@@ -1760,6 +1770,7 @@ fn pty_open_response(request_id: &str, op: &str, line: &str) -> String {
         return error_response(request_id, op, "invalid_request", "missing argv");
     }
     let requested_cwd = extract_string(line, "cwd");
+    let env_additions = extract_string_map(line, "envAdditions").unwrap_or_default();
 
     let rows = extract_int(line, "rows").unwrap_or(24) as u16;
     let cols = extract_int(line, "cols").unwrap_or(80) as u16;
@@ -1797,7 +1808,7 @@ fn pty_open_response(request_id: &str, op: &str, line: &str) -> String {
         .chain(std::iter::once(std::ptr::null())).collect();
 
     // Build environment as "KEY=VALUE\0" strings for execve
-    let env_values = vec![
+    let mut env_values = vec![
         format!("HOME={}", runtime.home),
         "TERM=xterm-256color".to_string(),
         "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
@@ -1807,6 +1818,11 @@ fn pty_open_response(request_id: &str, op: &str, line: &str) -> String {
         "LANG=C.UTF-8".to_string(),
         "LC_ALL=C.UTF-8".to_string(),
     ];
+    for (key, value) in env_additions {
+        if is_valid_env_key(&key) {
+            env_values.push(format!("{}={}", key, value));
+        }
+    }
     let env_cstrings: Vec<Vec<u8>> = env_values.iter().map(|s| {
         let mut v = s.as_bytes().to_vec();
         v.push(0);
@@ -3239,18 +3255,30 @@ fn exec_response(
     argv: Vec<String>,
     cwd: Option<String>,
     timeout_ms: Option<i32>,
+    env_additions: Vec<(String, String)>,
+    run_as_root: bool,
 ) -> String {
     let started = Instant::now();
-    let runtime = runtime_user()
-        .lock()
-        .map(|v| v.clone())
-        .unwrap_or(RuntimeUserContext {
+    let runtime = if run_as_root {
+        RuntimeUserContext {
             username: "root".to_string(),
             uid: 0,
             gid: 0,
             home: "/root".to_string(),
             shell: "/bin/sh".to_string(),
-        });
+        }
+    } else {
+        runtime_user()
+            .lock()
+            .map(|v| v.clone())
+            .unwrap_or(RuntimeUserContext {
+                username: "root".to_string(),
+                uid: 0,
+                gid: 0,
+                home: "/root".to_string(),
+                shell: "/bin/sh".to_string(),
+            })
+    };
     let mut cmd = Command::new(&argv[0]);
     if argv.len() > 1 {
         cmd.args(&argv[1..]);
@@ -3263,6 +3291,11 @@ fn exec_response(
     cmd.env("USER", &runtime.username);
     cmd.env("LOGNAME", &runtime.username);
     cmd.env("SHELL", &runtime.shell);
+    for (key, value) in env_additions {
+        if is_valid_env_key(&key) {
+            cmd.env(key, value);
+        }
+    }
     let desired_cwd = cwd
         .as_ref()
         .filter(|v| v.starts_with('/') && Path::new(v).is_dir())
@@ -3446,6 +3479,99 @@ fn extract_string_array(input: &str, key: &str) -> Option<Vec<String>> {
     }
 }
 
+fn extract_string_map(input: &str, key: &str) -> Option<Vec<(String, String)>> {
+    let pattern = format!("\"{}\":{{", key);
+    let start = input.find(&pattern)? + pattern.len();
+    let rest = &input[start..];
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut index = 0usize;
+
+    loop {
+        while let Some(c) = rest[index..].chars().next() {
+            if c.is_whitespace() {
+                index += c.len_utf8();
+            } else {
+                break;
+            }
+        }
+
+        if index >= rest.len() {
+            return None;
+        }
+
+        if rest[index..].starts_with('}') {
+            return Some(out);
+        }
+
+        if !rest[index..].starts_with('"') {
+            return None;
+        }
+        index += 1;
+        let (map_key, key_consumed) = decode_json_string(&rest[index..])?;
+        index += key_consumed;
+
+        while let Some(c) = rest[index..].chars().next() {
+            if c.is_whitespace() {
+                index += c.len_utf8();
+            } else {
+                break;
+            }
+        }
+        if !rest[index..].starts_with(':') {
+            return None;
+        }
+        index += 1;
+
+        while let Some(c) = rest[index..].chars().next() {
+            if c.is_whitespace() {
+                index += c.len_utf8();
+            } else {
+                break;
+            }
+        }
+        if !rest[index..].starts_with('"') {
+            return None;
+        }
+        index += 1;
+        let (map_value, value_consumed) = decode_json_string(&rest[index..])?;
+        index += value_consumed;
+        out.push((map_key, map_value));
+
+        while let Some(c) = rest[index..].chars().next() {
+            if c.is_whitespace() {
+                index += c.len_utf8();
+            } else {
+                break;
+            }
+        }
+
+        if index >= rest.len() {
+            return None;
+        }
+
+        if rest[index..].starts_with(',') {
+            index += 1;
+            continue;
+        }
+        if rest[index..].starts_with('}') {
+            return Some(out);
+        }
+        return None;
+    }
+}
+
+fn is_valid_env_key(key: &str) -> bool {
+    if key.is_empty() {
+        return false;
+    }
+    for ch in key.chars() {
+        if !(ch.is_ascii_alphanumeric() || ch == '_') {
+            return false;
+        }
+    }
+    true
+}
+
 fn decode_json_string(input: &str) -> Option<(String, usize)> {
     let mut out = String::new();
     let bytes = input.as_bytes();
@@ -3532,6 +3658,27 @@ mod tests {
                 "hello \"quoted\"".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn extract_string_map_unescapes_pairs() {
+        let input = r#"{"envAdditions":{"PIP_CACHE_DIR":"\/mnt\/macos\/cache","NPM_CONFIG_CACHE":"\/tmp\/npm"}}"#;
+        let values = extract_string_map(input, "envAdditions").unwrap_or_default();
+        assert_eq!(
+            values,
+            vec![
+                ("PIP_CACHE_DIR".to_string(), "/mnt/macos/cache".to_string()),
+                ("NPM_CONFIG_CACHE".to_string(), "/tmp/npm".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn env_key_validation_rejects_invalid_chars() {
+        assert!(is_valid_env_key("NPM_CONFIG_CACHE"));
+        assert!(!is_valid_env_key(""));
+        assert!(!is_valid_env_key("BAD-KEY"));
+        assert!(!is_valid_env_key("BAD.KEY"));
     }
 
     #[test]

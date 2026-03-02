@@ -63,7 +63,7 @@ make build
 Other build helpers:
 - `make build-ext4-helper`: build ext4 image helpers only
 - `make build-image`: run `scripts/build-msl-image.sh` (Step18 storage image build entrypoint)
-- `make reset`: remove writable VM disk (`~/Library/Application Support/msl/distros/default/disk.raw`, or `$MSL_HOME/...`)
+- `make reset`: legacy cleanup for old `distros/default/disk.raw` path (typically no-op on current instance-based installs)
 - `make clean-alpine`: uninstall all instances with `--keep-cache`, install fresh `alpine` (kernel selection is delegated to `msl install`), clear host logs, then launch `msl`
 - `make update-distribution-list`: refresh embedded manifest + install alias catalog
 
@@ -396,28 +396,23 @@ Then place your RAW image at:
 
 or set `MSL_IMAGE_PATH` to any absolute RAW path.
 
-## Bootstrap disk and user behavior
+## Bootstrap and user behavior
 
-On first bootstrap:
-- Base image remains immutable.
-- Writable VM disk is created at:
-  - `~/Library/Application Support/msl/distros/default/disk.raw`
-- cloud-init NoCloud files are generated at:
-  - `~/Library/Application Support/msl/distros/default/cloud-init/user-data`
-  - `~/Library/Application Support/msl/distros/default/cloud-init/meta-data`
-  - `~/Library/Application Support/msl/distros/default/seed.iso`
-- default login user is your macOS username
-  - default attach path uses `msl-init` control channel
+Current runtime is instance-based:
+- Writable VM disk is per instance:
+  - `~/Library/Application Support/msl/distros/<instance>/disk.raw`
+- Runtime attach path uses `msl-init` control channel.
+- Default login user is your macOS username.
   - serial fallback (`--serial-console`) still configures `hvc0`/`ttyS0` autologin
   - terminal type defaults to your host `TERM` when safe, with fallback to `xterm-256color` for compatibility
-- if you set `MSL_DEFAULT_PASSWORD`, password authentication is provisioned for that user
+- If you set `MSL_DEFAULT_PASSWORD`, password authentication is provisioned for that user.
 
-So package installs (`apt-get install ...`) are persisted to `disk.raw`, not the base image.
+Install/build helper artifacts (cloud-init seed inputs) are staged under:
+- `~/Library/Application Support/msl/bootstrap/cloud-init/user-data`
+- `~/Library/Application Support/msl/bootstrap/cloud-init/meta-data`
+- `~/Library/Application Support/msl/bootstrap/seed.iso`
 
-If you already booted once with older cloud-init settings, recreate the writable disk to re-apply user/bootstrap config:
-- stop VM
-- run `make reset`
-- run `msl` again (bootstrap regenerates disk + seed)
+Package installs (`apt-get install ...`) are persisted to the selected instance `disk.raw`, not the base image.
 
 ## Logs and state
 

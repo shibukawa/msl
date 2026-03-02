@@ -231,6 +231,44 @@ final class DistributionManagerTests: XCTestCase {
         XCTAssertEqual(url.path, ctx.paths.distroMetadataFile(named: "ci").path)
     }
 
+    func testReadOrRebuildInstanceMetadataBackfillsCacheSharingPolicy() throws {
+        let ctx = try DistributionContext.make()
+        defer { ctx.cleanup() }
+
+        let name = "alpine"
+        let instanceDir = ctx.paths.distroDirectory(named: name)
+        try FileManager.default.createDirectory(at: instanceDir, withIntermediateDirectories: true)
+        let disk = ctx.paths.distroDiskFile(named: name)
+        try Data([0x00]).write(to: disk)
+
+        let metadata = DistributionInstanceMetadata(
+            name: name,
+            distroFamily: "alpine",
+            createdAtEpochMs: nowEpochMs(),
+            source: DistributionSourceRecord(
+                sourceType: "manifest",
+                distro: "alpine",
+                version: "latest",
+                arch: "aarch64",
+                manifestId: "alpine-latest-aarch64",
+                localPath: nil,
+                tarballFileName: "rootfs.tar.gz",
+                sha256: "abc",
+                verifiedAtEpochMs: nowEpochMs()
+            ),
+            diskPath: disk.path,
+            kernelProfileRef: nil,
+            userConvergencePolicy: nil
+        )
+        let metadataURL = ctx.paths.distroMetadataFile(named: name)
+        try JSONEncoder().encode(metadata).write(to: metadataURL, options: .atomic)
+
+        let loaded = try ctx.makeManager().readOrRebuildInstanceMetadata(at: metadataURL)
+        XCTAssertEqual(loaded.cacheSharing?.enabled, true)
+        XCTAssertEqual(loaded.cacheSharing?.apt, false)
+        XCTAssertEqual(loaded.cacheSharing?.apk, true)
+    }
+
     func testRuntimeMetadataURLFailsForMissingExplicitInstance() throws {
         let ctx = try DistributionContext.make()
         defer { ctx.cleanup() }

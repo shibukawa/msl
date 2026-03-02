@@ -9,6 +9,10 @@ if [ "${MSL_LIVE_TESTS:-0}" != "1" ]; then
   skip_test "basic command tests" "set MSL_LIVE_TESTS=1 to enable"
   return 0
 fi
+if ! ensure_live_ready; then
+  skip_test "basic command tests" "$LIVE_READY_REASON"
+  return 0
+fi
 
 # --- echo ---
 run_test_output "echo hello" "hello" "$MSL" run echo hello

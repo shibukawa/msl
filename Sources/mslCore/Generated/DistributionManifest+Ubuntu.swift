@@ -35,6 +35,11 @@ enum EmbeddedDistributionManifestUbuntu {
                     respectHushlogin: true
                 ),
                 editable: false
+            ),
+            cacheSharingDefaults: CacheSharingConfig(
+                enabled: true,
+                apt: true,
+                apk: false
             )
         ),
         DistributionManifestEntry(
@@ -70,6 +75,11 @@ enum EmbeddedDistributionManifestUbuntu {
                     respectHushlogin: true
                 ),
                 editable: false
+            ),
+            cacheSharingDefaults: CacheSharingConfig(
+                enabled: true,
+                apt: true,
+                apk: false
             )
         )
     ]
