@@ -20,8 +20,6 @@ public final class BootstrapManager {
         try ensureDir(paths.logs)
         try ensureDir(paths.imagesDir)
         try ensureDir(paths.distrosDir)
-        try ensureDir(paths.defaultDistroDir)
-        try ensureDir(paths.cloudInitDir)
 
         if !fileManager.fileExists(atPath: paths.configFile.path) {
             try Data("{}\n".utf8).write(to: paths.configFile, options: .atomic)
@@ -36,6 +34,8 @@ public final class BootstrapManager {
 
         // Legacy RAW-image bootstrap path has been retired.
         // Install/build context now stages required host tools only.
+        try ensureDir(paths.bootstrapArtifactsDir)
+        try ensureDir(paths.bootstrapCloudInitDir)
         try stageInitBinaryIfAvailable()
         try stageExt4HelpersIfAvailable()
         try ensureCloudInitSeed()
@@ -74,13 +74,13 @@ public final class BootstrapManager {
         let hostname = ProcessInfo.processInfo.environment["MSL_DEFAULT_HOSTNAME"].flatMap { $0.isEmpty ? nil : $0 } ?? "msl"
 
         let userData = renderUserData(user: user, password: password)
-        let userDataChanged = try writeIfChanged(Data(userData.utf8), to: paths.cloudInitUserDataFile)
+        let userDataChanged = try writeIfChanged(Data(userData.utf8), to: paths.bootstrapCloudInitUserDataFile)
 
         let metaData = """
         instance-id: msl-default
         local-hostname: \(hostname)
         """
-        let metaDataChanged = try writeIfChanged(Data((metaData + "\n").utf8), to: paths.cloudInitMetaDataFile)
+        let metaDataChanged = try writeIfChanged(Data((metaData + "\n").utf8), to: paths.bootstrapCloudInitMetaDataFile)
         let initBinarySeedChanged = try syncInitBinaryIntoCloudInitSeed()
         let storageProvisionSeedChanged = try syncStorageProvisionScriptIntoCloudInitSeed()
 
@@ -88,19 +88,19 @@ public final class BootstrapManager {
             return
         }
 
-        let seedExists = fileManager.fileExists(atPath: paths.cloudInitSeedISOFile.path)
+        let seedExists = fileManager.fileExists(atPath: paths.bootstrapCloudInitSeedISOFile.path)
         if seedExists && !userDataChanged && !metaDataChanged && !initBinarySeedChanged && !storageProvisionSeedChanged {
             return
         }
 
         if seedExists {
-            try fileManager.removeItem(at: paths.cloudInitSeedISOFile)
+            try fileManager.removeItem(at: paths.bootstrapCloudInitSeedISOFile)
         }
 
         let success = try runCommand("/usr/bin/hdiutil", [
             "makehybrid",
-            "-o", paths.cloudInitSeedISOFile.path,
-            paths.cloudInitDir.path,
+            "-o", paths.bootstrapCloudInitSeedISOFile.path,
+            paths.bootstrapCloudInitDir.path,
             "-iso",
             "-joliet",
             "-default-volume-name", "cidata"
@@ -112,7 +112,7 @@ public final class BootstrapManager {
     }
 
     private func syncInitBinaryIntoCloudInitSeed() throws -> Bool {
-        let seedBinary = paths.cloudInitDir.appendingPathComponent("msl-init", isDirectory: false)
+        let seedBinary = paths.bootstrapCloudInitDir.appendingPathComponent("msl-init", isDirectory: false)
         if fileManager.fileExists(atPath: paths.mslHostInitBinaryFile.path) {
             let data = try Data(contentsOf: paths.mslHostInitBinaryFile)
             let changed = try writeIfChanged(data, to: seedBinary)
@@ -135,7 +135,7 @@ public final class BootstrapManager {
     }
 
     private func syncStorageProvisionScriptIntoCloudInitSeed() throws -> Bool {
-        let seedScript = paths.cloudInitDir.appendingPathComponent("msl-storage-provision.sh", isDirectory: false)
+        let seedScript = paths.bootstrapCloudInitDir.appendingPathComponent("msl-storage-provision.sh", isDirectory: false)
         let source = resolveStorageProvisionScriptSourcePath()
         guard let source else {
             if fileManager.fileExists(atPath: seedScript.path) {

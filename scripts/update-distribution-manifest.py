@@ -349,6 +349,11 @@ def alpine_entry(tmp_dir: Path):
             },
             "editable": False,
         },
+        "cacheSharingDefaults": {
+            "enabled": True,
+            "apt": False,
+            "apk": True,
+        },
     }
     return entry, discovered_fp, armored
 
@@ -431,6 +436,11 @@ def ubuntu_entry(version: str, page_url: str, tmp_dir: Path):
             },
             "editable": False,
         },
+        "cacheSharingDefaults": {
+            "enabled": True,
+            "apt": True,
+            "apk": False,
+        },
     }
     return entry, discovered_fp, armored
 
@@ -447,6 +457,7 @@ def swift_string(value: str) -> str:
 
 def render_entry(entry):
     template = entry.get("userConvergenceTemplate")
+    cache_sharing_defaults = entry.get("cacheSharingDefaults")
     if template:
         shell_fallbacks = ", ".join(swift_string(v) for v in template["shellFallbacks"])
         template_code = (
@@ -476,6 +487,17 @@ def render_entry(entry):
     else:
         template_code = "nil"
 
+    if cache_sharing_defaults:
+        cache_sharing_code = (
+            "CacheSharingConfig(\n"
+            f"                enabled: {'true' if cache_sharing_defaults.get('enabled', False) else 'false'},\n"
+            f"                apt: {'true' if cache_sharing_defaults.get('apt', True) else 'false'},\n"
+            f"                apk: {'true' if cache_sharing_defaults.get('apk', True) else 'false'}\n"
+            "            )"
+        )
+    else:
+        cache_sharing_code = "nil"
+
     return (
         "        DistributionManifestEntry(\n"
         f"            id: {swift_string(entry['id'])},\n"
@@ -489,7 +511,8 @@ def render_entry(entry):
         f"            signatureTarget: {swift_string(entry['signatureTarget'])},\n"
         f"            keyFingerprint: {swift_string(entry['keyFingerprint'])},\n"
         "            supportState: .supported,\n"
-        f"            userConvergenceTemplate: {template_code}\n"
+        f"            userConvergenceTemplate: {template_code},\n"
+        f"            cacheSharingDefaults: {cache_sharing_code}\n"
         "        )"
     )
 

@@ -221,6 +221,7 @@ final class DistributionManager {
 
     @discardableResult
     func uninstallInstance(name rawName: String, keepCache: Bool) throws -> DistributionUninstallResult {
+        try migrateLegacyRootfsCacheIfNeeded()
         let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty else {
             throw MSLRuntimeError("instance name is required")
@@ -285,6 +286,7 @@ final class DistributionManager {
         rebuild: Bool,
         diskSizeGB: Int?
     ) throws -> URL {
+        try migrateLegacyRootfsCacheIfNeeded()
         let name = try validateInstanceName(rawName)
         emitStatus("install: preparing instance '\(name)'")
         let source = try resolveSource(targetAlias: targetAlias, localFilePath: localFilePath)
@@ -372,6 +374,7 @@ final class DistributionManager {
         let kernelProfileRef = envKernelProfileRef ?? defaultKernelProfileRef ?? "slim"
         let compressionPolicy = try resolveCompressionPolicyForInstall()
         let initialPolicy = initialUserConvergencePolicy(for: source)
+        let initialCacheSharing = initialCacheSharingPolicy(for: source)
 
         let metadata = DistributionInstanceMetadata(
             name: name,
@@ -395,7 +398,8 @@ final class DistributionManager {
             userConvergencePolicy: initialPolicy,
             workspacePolicy: initialWorkspacePolicy(),
             compressionPolicy: compressionPolicy,
-            networkPolicy: initialNetworkPolicy()
+            networkPolicy: initialNetworkPolicy(),
+            cacheSharing: initialCacheSharing
         )
         try writeJSON(sourceRecord, to: sourceFile)
         try writeJSON(metadata, to: metadataFile)
@@ -418,6 +422,7 @@ final class DistributionManager {
         diskSizeGB: Int?,
         mslExecutablePath: String
     ) throws -> URL {
+        try migrateLegacyRootfsCacheIfNeeded()
         let name = try validateInstanceName(rawName)
         emitStatus("install: preparing instance '\(name)'")
         let source = try resolveSource(targetAlias: targetAlias, localFilePath: localFilePath)
@@ -511,6 +516,7 @@ final class DistributionManager {
             let compressionPolicy = try resolveCompressionPolicyForInstall()
             compressionPolicyCount = compressionPolicy.pathPolicies.count
             let initialPolicy = initialUserConvergencePolicy(for: source)
+            let initialCacheSharing = initialCacheSharingPolicy(for: source)
 
             let metadata = DistributionInstanceMetadata(
                 name: name,
@@ -534,7 +540,8 @@ final class DistributionManager {
                 userConvergencePolicy: initialPolicy,
                 workspacePolicy: initialWorkspacePolicy(),
                 compressionPolicy: compressionPolicy,
-                networkPolicy: initialNetworkPolicy()
+                networkPolicy: initialNetworkPolicy(),
+                cacheSharing: initialCacheSharing
             )
             try writeJSON(sourceRecord, to: sourceFile)
             try writeJSON(metadata, to: metadataFile)
@@ -561,7 +568,20 @@ final class DistributionManager {
 
     func readOrRebuildInstanceMetadata(at metadataURL: URL) throws -> DistributionInstanceMetadata {
         do {
-            return try readJSON(DistributionInstanceMetadata.self, from: metadataURL)
+            var metadata = try readJSON(DistributionInstanceMetadata.self, from: metadataURL)
+            if metadata.cacheSharing == nil {
+                metadata.cacheSharing = defaultCacheSharingPolicy(
+                    distroFamily: metadata.distroFamily
+                        ?? metadata.source.distro
+                        ?? inferDistroFamily(from: metadata.source.manifestId)
+                )
+                try writeJSON(metadata, to: metadataURL)
+                logger.log("cache_sharing_backfilled", fields: [
+                    "instance": metadata.name,
+                    "metadata": metadataURL.path
+                ])
+            }
+            return metadata
         } catch {
             logger.log("metadata_rebuild_started", fields: [
                 "metadata": metadataURL.path,
@@ -675,6 +695,22 @@ final class DistributionManager {
                 editable: true
             )
         }
+    }
+
+    private func initialCacheSharingPolicy(for source: DistributionSourceSelection) -> CacheSharingConfig {
+        switch source {
+        case .manifest(let entry):
+            if let defaults = entry.cacheSharingDefaults {
+                return defaults
+            }
+            return defaultCacheSharingPolicy(distroFamily: entry.distro)
+        case .localFile:
+            return defaultCacheSharingPolicy(distroFamily: nil)
+        }
+    }
+
+    private func defaultCacheSharingPolicy(distroFamily: String?) -> CacheSharingConfig {
+        CacheSharingPolicyResolver.defaultConfigForDistroFamily(distroFamily)
     }
 
     private func backfillUserConvergencePolicy(for metadata: DistributionInstanceMetadata) -> UserConvergencePolicy {
@@ -805,12 +841,16 @@ final class DistributionManager {
         }
     }
 
-    private func inferDistroFamily(from manifestID: String?) -> String? {
+    static func inferDistroFamilyStatic(from manifestID: String?) -> String? {
         guard let manifestID else { return nil }
         let lowered = manifestID.lowercased()
         if lowered.contains("alpine") { return "alpine" }
         if lowered.contains("ubuntu") { return "ubuntu" }
         return nil
+    }
+
+    private func inferDistroFamily(from manifestID: String?) -> String? {
+        Self.inferDistroFamilyStatic(from: manifestID)
     }
 
     private func resolveDefaultRuntimeUserName() -> String {
@@ -1012,7 +1052,10 @@ final class DistributionManager {
             userConvergencePolicy: recoveredPolicy,
             workspacePolicy: initialWorkspacePolicy(),
             compressionPolicy: nil,
-            networkPolicy: initialNetworkPolicy()
+            networkPolicy: initialNetworkPolicy(),
+            cacheSharing: defaultCacheSharingPolicy(
+                distroFamily: sourceRecord.distro ?? inferDistroFamily(from: sourceRecord.manifestId)
+            )
         )
         try writeJSON(metadata, to: metadataURL)
         return metadata
@@ -1139,6 +1182,7 @@ final class DistributionManager {
     }
 
     internal func fetchManifestEntry(_ entry: DistributionManifestEntry, force: Bool) throws -> DistributionVerifiedRecord {
+        try migrateLegacyRootfsCacheIfNeeded()
         let cacheDir = paths.cacheDownloadsDir
             .appendingPathComponent(entry.distro, isDirectory: true)
             .appendingPathComponent(entry.version, isDirectory: true)
@@ -1220,6 +1264,7 @@ final class DistributionManager {
     }
 
     internal func cacheLocalFile(_ fileURL: URL, force: Bool) throws -> DistributionVerifiedRecord {
+        try migrateLegacyRootfsCacheIfNeeded()
         let sha = try computeSHA256(fileAt: fileURL)
         let short = String(sha.prefix(12))
         let cacheDir = paths.cacheDownloadsDir
@@ -1707,6 +1752,43 @@ final class DistributionManager {
                 .appendingPathComponent(short, isDirectory: true)
         }
         return nil
+    }
+
+    func migrateLegacyRootfsCacheIfNeeded() throws {
+        let legacyDownloads = paths.legacyCacheDownloadsDir
+        let legacyStaging = paths.legacyCacheStagingDir
+        let newDownloads = paths.cacheDownloadsDir
+        let newStaging = paths.cacheStagingDir
+
+        let hasLegacyDownloads = fileManager.fileExists(atPath: legacyDownloads.path)
+        let hasLegacyStaging = fileManager.fileExists(atPath: legacyStaging.path)
+        guard hasLegacyDownloads || hasLegacyStaging else {
+            return
+        }
+
+        try ensureDir(paths.cacheDir)
+
+        if hasLegacyDownloads, !fileManager.fileExists(atPath: newDownloads.path) {
+            try fileManager.moveItem(at: legacyDownloads, to: newDownloads)
+            logger.log("cache_layout_migrated", fields: [
+                "from": legacyDownloads.path,
+                "to": newDownloads.path
+            ])
+        }
+
+        if hasLegacyStaging, !fileManager.fileExists(atPath: newStaging.path) {
+            try fileManager.moveItem(at: legacyStaging, to: newStaging)
+            logger.log("cache_layout_migrated", fields: [
+                "from": legacyStaging.path,
+                "to": newStaging.path
+            ])
+        }
+
+        if fileManager.fileExists(atPath: paths.legacyCacheDir.path),
+           let entries = try? fileManager.contentsOfDirectory(atPath: paths.legacyCacheDir.path),
+           entries.isEmpty {
+            try? fileManager.removeItem(at: paths.legacyCacheDir)
+        }
     }
 
     private func writeJSON<T: Encodable>(_ value: T, to url: URL) throws {

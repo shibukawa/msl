@@ -194,6 +194,64 @@ public struct MSLConfig: Codable, Equatable {
     }
 }
 
+public struct CacheSharingConfig: Codable, Equatable {
+    public var enabled: Bool?
+    public var apt: Bool?
+    public var apk: Bool?
+    public var go: Bool?
+    public var python: Bool?
+    public var npm: Bool?
+    public var pnpm: Bool?
+    public var yarn: Bool?
+    public var maven: Bool?
+    public var gradle: Bool?
+    public var composer: Bool?
+    public var scala: Bool?
+    public var ruby: Bool?
+    public var rust: Bool?
+    public var deno: Bool?
+    public var bun: Bool?
+    public var nuget: Bool?
+
+    public init(
+        enabled: Bool? = nil,
+        apt: Bool? = nil,
+        apk: Bool? = nil,
+        go: Bool? = nil,
+        python: Bool? = nil,
+        npm: Bool? = nil,
+        pnpm: Bool? = nil,
+        yarn: Bool? = nil,
+        maven: Bool? = nil,
+        gradle: Bool? = nil,
+        composer: Bool? = nil,
+        scala: Bool? = nil,
+        ruby: Bool? = nil,
+        rust: Bool? = nil,
+        deno: Bool? = nil,
+        bun: Bool? = nil,
+        nuget: Bool? = nil
+    ) {
+        self.enabled = enabled
+        self.apt = apt
+        self.apk = apk
+        self.go = go
+        self.python = python
+        self.npm = npm
+        self.pnpm = pnpm
+        self.yarn = yarn
+        self.maven = maven
+        self.gradle = gradle
+        self.composer = composer
+        self.scala = scala
+        self.ruby = ruby
+        self.rust = rust
+        self.deno = deno
+        self.bun = bun
+        self.nuget = nuget
+    }
+}
+
 public struct MemoryPolicyConfig: Codable, Equatable {
     public var shortIdle: String?
     public var longIdle: String?

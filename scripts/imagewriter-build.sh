@@ -109,9 +109,12 @@ host_to_guest_path() {
 }
 
 resolve_default_alpine_tarball() {
-  base="$APP_SUPPORT/cache/downloads/alpine"
+  base="$APP_SUPPORT/caches/rootfs/alpine"
   if [ ! -d "$base" ]; then
-    return 1
+    base="$APP_SUPPORT/cache/downloads/alpine"
+    if [ ! -d "$base" ]; then
+      return 1
+    fi
   fi
 
   best=""
@@ -146,7 +149,7 @@ else
       echo "using fetched alpine cached rootfs: $ROOTFS_TARBALL"
     else
       echo "error: alpine rootfs fetch completed but cache tarball was not found." >&2
-      echo "expected under: $APP_SUPPORT/cache/downloads/alpine/<version>/aarch64/" >&2
+      echo "expected under: $APP_SUPPORT/caches/rootfs/alpine/<version>/aarch64/" >&2
       exit 1
     fi
   fi

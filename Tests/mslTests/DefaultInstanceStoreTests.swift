@@ -83,6 +83,32 @@ final class DefaultInstanceStoreTests: XCTestCase {
         XCTAssertEqual(config.storageCacheToggles?["docker"], true)
     }
 
+    func testLoadConfigIgnoresLegacyCacheSharingSection() throws {
+        let ctx = try DefaultInstanceContext.make()
+        defer { ctx.cleanup() }
+
+        let raw = """
+        {
+          "schemaVersion": 1,
+          "cacheSharing": {
+            "enabled": true,
+            "apt": true,
+            "apk": false,
+            "go": true,
+            "npm": false,
+            "rust": true,
+            "nuget": true
+          }
+        }
+        """
+        try Data(raw.utf8).write(to: ctx.paths.configFile, options: .atomic)
+
+        let store = DefaultInstanceStore(paths: ctx.paths)
+        let config = try store.loadConfig()
+        XCTAssertEqual(config.schemaVersion, 1)
+        XCTAssertNil(config.defaultInstanceName)
+    }
+
     func testLoadStorageCacheTogglesReturnsDefaultsWhenUnset() throws {
         let ctx = try DefaultInstanceContext.make()
         defer { ctx.cleanup() }

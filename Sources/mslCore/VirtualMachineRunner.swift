@@ -296,15 +296,7 @@ public final class VirtualMachineRunner {
 
         let diskAttachment = try VZDiskImageStorageDeviceAttachment(url: diskURL, readOnly: false)
         let blockDevice = VZVirtioBlockDeviceConfiguration(attachment: diskAttachment)
-        var storage: [VZStorageDeviceConfiguration] = [blockDevice]
-
-        if ProcessInfo.processInfo.environment["MSL_ATTACH_SEED"] == "1",
-           FileManager.default.fileExists(atPath: paths.cloudInitSeedISOFile.path) {
-            let seedAttachment = try VZDiskImageStorageDeviceAttachment(url: paths.cloudInitSeedISOFile, readOnly: true)
-            let seedDevice = VZVirtioBlockDeviceConfiguration(attachment: seedAttachment)
-            storage.append(seedDevice)
-        }
-        vm.storageDevices = storage
+        vm.storageDevices = [blockDevice]
 
         if #available(macOS 12.0, *) {
             let hostShareRoot = ProcessInfo.processInfo.environment["MSL_HOST_SHARE_ROOT"].flatMap { $0.isEmpty ? nil : $0 } ?? "/"

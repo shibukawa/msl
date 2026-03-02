@@ -279,7 +279,10 @@ do {
                 force: parsed.force
             )
         }
-        fail("unsupported cache command. use: msl cache fetch <distro>|--rootfs <path> [--force]")
+        if sub == "status" {
+            try manager.runCacheSharingStatus()
+        }
+        fail("unsupported cache command. use: msl cache fetch <distro>|--rootfs <path> [--force] | msl cache status")
     }
 
     if args.count >= 2, args[0] == "init" {
@@ -307,7 +310,14 @@ do {
             fail("unsupported config cache command. use: msl config cache ls")
         }
 
-        fail("unsupported config command. use: msl config set storageCacheToggles.<name> <true|false> | network.dns.mode <host|manual|unmanaged> | network.dns.manualNameservers <ip[,ip...]> | network.dns.manualSearchDomains <domain[,domain...]> | msl config cache ls")
+        if sub == "cache-sharing" {
+            if args.count == 3, args[2] == "ls" {
+                try manager.runCacheSharingStatus()
+            }
+            fail("unsupported config cache-sharing command. use: msl config cache-sharing ls")
+        }
+
+        fail("unsupported config command. use: msl config set storageCacheToggles.<name> <true|false> | network.dns.mode <host|manual|unmanaged> | network.dns.manualNameservers <ip[,ip...]> | network.dns.manualSearchDomains <domain[,domain...]> | msl config cache ls | msl config cache-sharing ls")
     }
 
     if args.first == "memory" {
@@ -425,7 +435,7 @@ do {
         Foundation.exit(exitCode)
     }
 
-    fail("unsupported arguments. use: msl | msl --list | msl --set-default <name> | msl install ... | msl _bootstrap-install ... | msl uninstall ... | msl run <cmd> | msl cache fetch ... | msl config set storageCacheToggles.<name> <true|false> | msl config cache ls | msl init workspace [--force] | msl memory [status] | msl network [status]|reconcile | msl --status | msl --stop | msl port [ls]|add|rm")
+    fail("unsupported arguments. use: msl | msl --list | msl --set-default <name> | msl install ... | msl uninstall ... | msl run <cmd> | msl cache fetch ... | msl cache status | msl config set storageCacheToggles.<name> <true|false> | msl config cache ls | msl config cache-sharing ls | msl init workspace [--force] | msl memory [status] | msl network [status]|reconcile | msl --status | msl --stop | msl port [ls]|add|rm")
 } catch let err as MSLRuntimeError {
     fail(err.message, code: err.exitCode)
 } catch {

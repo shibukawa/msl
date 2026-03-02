@@ -14,6 +14,7 @@ final class BootstrapManagerTests: XCTestCase {
         let bootstrap = BootstrapManager(paths: ctx.paths, logger: logger)
 
         XCTAssertNoThrow(try bootstrap.ensureBootstrapped(context: .runtime))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: ctx.paths.distroDirectory(named: "default").path))
 
         let logText = try String(contentsOf: logURL, encoding: .utf8)
         XCTAssertTrue(logText.contains("\"event\":\"bootstrap_completed\""))
@@ -54,17 +55,16 @@ final class BootstrapManagerTests: XCTestCase {
         let bootstrap = BootstrapManager(paths: ctx.paths, logger: logger)
         XCTAssertNoThrow(try bootstrap.ensureBootstrapped(context: .install))
 
-        XCTAssertFalse(FileManager.default.fileExists(atPath: ctx.paths.defaultDistroDir.appendingPathComponent("disk.raw").path))
-        XCTAssertFalse(FileManager.default.fileExists(atPath: ctx.paths.defaultDistroDir.appendingPathComponent("metadata.json").path))
-        XCTAssertTrue(FileManager.default.fileExists(atPath: ctx.paths.cloudInitUserDataFile.path))
-        XCTAssertTrue(FileManager.default.fileExists(atPath: ctx.paths.cloudInitMetaDataFile.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: ctx.paths.distroDirectory(named: "default").path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: ctx.paths.bootstrapCloudInitUserDataFile.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: ctx.paths.bootstrapCloudInitMetaDataFile.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: ctx.paths.mslHostInitBinaryFile.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: ctx.paths.mslHostExt4MkfsHelperBinaryFile.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: ctx.paths.mslHostExt4HelperBinaryFile.path))
-        XCTAssertTrue(FileManager.default.fileExists(atPath: ctx.paths.cloudInitDir.appendingPathComponent("msl-init").path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: ctx.paths.bootstrapCloudInitDir.appendingPathComponent("msl-init").path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: ctx.paths.compressionCachePolicyCatalogFile.path))
 
-        let userData = try String(contentsOf: ctx.paths.cloudInitUserDataFile)
+        let userData = try String(contentsOf: ctx.paths.bootstrapCloudInitUserDataFile)
         XCTAssertTrue(userData.contains("output:"))
         XCTAssertTrue(userData.contains("all: \"| tee -a /var/log/cloud-init-output.log\""))
         XCTAssertTrue(userData.contains("macos /mnt/macos virtiofs"))

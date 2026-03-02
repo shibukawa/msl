@@ -9,6 +9,9 @@ PASSED=0
 FAILED=0
 SKIPPED=0
 ERRORS=()
+LIVE_READY_CHECKED=0
+LIVE_READY_OK=0
+LIVE_READY_REASON=""
 
 # --- helpers ---
 
@@ -108,6 +111,43 @@ skip_test() {
   local reason="$2"
   echo "  $name ... SKIP ($reason)"
   ((SKIPPED++))
+}
+
+# ensure_live_ready:
+# Run one VM smoke command once and cache result.
+# Returns 0 when live commands are runnable.
+ensure_live_ready() {
+  if [ "${MSL_LIVE_TESTS:-0}" != "1" ]; then
+    LIVE_READY_REASON="set MSL_LIVE_TESTS=1 to enable"
+    return 1
+  fi
+  if [ "$LIVE_READY_CHECKED" -eq 1 ]; then
+    [ "$LIVE_READY_OK" -eq 1 ]
+    return $?
+  fi
+  LIVE_READY_CHECKED=1
+
+  local output
+  if output=$("$MSL" run --timeout 5 true 2>&1); then
+    LIVE_READY_OK=1
+    LIVE_READY_REASON=""
+    return 0
+  fi
+
+  if echo "$output" | grep -q "com.apple.security.virtualization"; then
+    LIVE_READY_OK=0
+    LIVE_READY_REASON="virtualization entitlement is unavailable in this build"
+    return 1
+  fi
+  if echo "$output" | grep -q "daemon did not start within"; then
+    LIVE_READY_OK=0
+    LIVE_READY_REASON="VM daemon startup timed out in current environment"
+    return 1
+  fi
+
+  LIVE_READY_OK=0
+  LIVE_READY_REASON="live VM smoke failed"
+  return 1
 }
 
 # --- banner ---

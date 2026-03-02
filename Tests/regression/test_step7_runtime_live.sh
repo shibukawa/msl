@@ -8,23 +8,21 @@ if [ "${MSL_LIVE_TESTS:-0}" != "1" ]; then
   skip_test "step7 live runtime integration" "set MSL_LIVE_TESTS=1 to enable"
   return 0
 fi
+if ! ensure_live_ready; then
+  skip_test "step7 live runtime integration" "$LIVE_READY_REASON"
+  return 0
+fi
 
-mapfile -t STEP7_INSTANCES < <(
-  "$MSL" --list 2>/dev/null | sed -e 's/ \[default\]$//' | awk '{print $1}'
-)
+STEP7_INSTANCE_LIST="$("$MSL" --list 2>/dev/null | sed -e 's/ \[default\]$//' | awk '{print $1}')"
+STEP7_INSTANCE="$(printf "%s\n" "$STEP7_INSTANCE_LIST" | sed -n '1p')"
+STEP7_SECOND_INSTANCE="$(printf "%s\n" "$STEP7_INSTANCE_LIST" | sed -n '2p')"
 
-if [ "${#STEP7_INSTANCES[@]}" -eq 0 ]; then
+if [ -z "$STEP7_INSTANCE" ]; then
   skip_test "step7 live boot/attach" "no installed instance"
   skip_test "step7 no-seed boot path" "no installed instance"
   skip_test "step7 diagnostic logs" "no installed instance"
   skip_test "step7 instance mismatch guidance" "no installed instance"
   return 0
-fi
-
-STEP7_INSTANCE="${STEP7_INSTANCES[0]}"
-STEP7_SECOND_INSTANCE=""
-if [ "${#STEP7_INSTANCES[@]}" -ge 2 ]; then
-  STEP7_SECOND_INSTANCE="${STEP7_INSTANCES[1]}"
 fi
 
 # Clean start to make instance selection deterministic.

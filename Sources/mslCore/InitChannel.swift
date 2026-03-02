@@ -28,6 +28,7 @@ public struct InitChannelRequest: Codable {
     public var op: String
     public var argv: [String]?
     public var envAdditions: [String: String]?
+    public var runAsRoot: Bool?
     public var cwd: String?
     public var hostShareRoot: String?
     public var timeoutMs: Int?
@@ -70,6 +71,7 @@ public struct InitChannelRequest: Codable {
         op: String,
         argv: [String]? = nil,
         envAdditions: [String: String]? = nil,
+        runAsRoot: Bool? = nil,
         cwd: String? = nil,
         hostShareRoot: String? = nil,
         timeoutMs: Int? = nil,
@@ -111,6 +113,7 @@ public struct InitChannelRequest: Codable {
         self.op = op
         self.argv = argv
         self.envAdditions = envAdditions
+        self.runAsRoot = runAsRoot
         self.cwd = cwd
         self.hostShareRoot = hostShareRoot
         self.timeoutMs = timeoutMs
@@ -274,6 +277,7 @@ public final class InitChannelClient {
     public func ptyOpen(
         argv: [String],
         cwd: String? = nil,
+        envAdditions: [String: String]? = nil,
         rows: Int?,
         cols: Int?,
         timeoutMs: Int? = nil
@@ -281,6 +285,7 @@ public final class InitChannelClient {
         try send(InitChannelRequest(
             op: "pty_open",
             argv: argv,
+            envAdditions: envAdditions,
             cwd: cwd,
             timeoutMs: timeoutMs ?? self.timeoutMs,
             rows: rows,

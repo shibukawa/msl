@@ -68,6 +68,14 @@ public final class RuntimeManager {
         self.sessions = SessionManager(store: store)
         self.executablePath = RuntimeManager.resolveExecutablePath(executablePath, fileManager: fileManager)
         self.defaultInstanceStore = DefaultInstanceStore(paths: paths, fileManager: fileManager)
+
+        do {
+            try distributionManager.migrateLegacyRootfsCacheIfNeeded()
+        } catch {
+            logger.log("cache_layout_migration_failed", fields: [
+                "error": String(describing: error)
+            ])
+        }
     }
 
     public func runInitWorkspace(force: Bool) throws -> Never {
@@ -179,6 +187,39 @@ public final class RuntimeManager {
         for key in toggles.keys.sorted() {
             let value = toggles[key] == true ? "true" : "false"
             print("\(key)=\(value)")
+        }
+        Foundation.exit(0)
+    }
+
+    public func runCacheSharingStatus() throws -> Never {
+        let defaultInstanceName = try defaultInstanceStore.loadDefaultInstanceName()
+        let metadataURL = try distributionManager.runtimeMetadataURL(defaultInstanceName: defaultInstanceName)
+        let metadata = try distributionManager.readOrRebuildInstanceMetadata(at: metadataURL)
+        let policyConfig = metadata.cacheSharing ?? CacheSharingPolicyResolver.defaultConfigForDistroFamily(
+            metadata.distroFamily
+                ?? metadata.source.distro
+                ?? DistributionManager.inferDistroFamilyStatic(from: metadata.source.manifestId)
+        )
+        let source = metadata.cacheSharing == nil ? "metadata_inferred" : "metadata"
+        let policy = CacheSharingPolicyResolver.resolve(config: policyConfig)
+        let hostHome = ProcessInfo.processInfo.environment["HOME"] ?? fileManager.homeDirectoryForCurrentUser.path
+        let hostCacheRoot = CacheSharingPolicyResolver.hostCacheRootPath(hostHome: hostHome)
+        let hostShareRoot = resolveWorkspaceHostShareRoot()
+        let guestCacheRoot = CacheSharingPolicyResolver.guestPathForHostPath(
+            hostPath: hostCacheRoot,
+            hostShareRoot: hostShareRoot
+        ) ?? "unavailable"
+
+        print("instance=\(metadata.name)")
+        print("configSource=\(source)")
+        print("enabled=\(policy.enabled ? "true" : "false")")
+        print("hostCacheRoot=\(hostCacheRoot)")
+        print("hostShareRoot=\(hostShareRoot)")
+        print("guestCacheRoot=\(guestCacheRoot)")
+        let flags = CacheSharingPolicyResolver.toolFlagList(policy: policy)
+        for key in flags.keys.sorted() {
+            let value = flags[key] == true ? "true" : "false"
+            print("tool.\(key)=\(value)")
         }
         Foundation.exit(0)
     }
@@ -439,6 +480,7 @@ public final class RuntimeManager {
             expectedInstanceName: target.instanceName,
             hostShareRoot: resolveWorkspaceHostShareRoot()
         )
+        prepareCacheSharingIfNeeded(instanceName: target.instanceName)
         let shellCwd = prepareWorkspaceIfNeeded(policy: workspacePolicy, instanceName: target.instanceName)
 
         // Register session
@@ -727,6 +769,7 @@ public final class RuntimeManager {
             expectedInstanceName: target.instanceName,
             hostShareRoot: resolveWorkspaceHostShareRoot()
         )
+        prepareCacheSharingIfNeeded(instanceName: target.instanceName)
         let execCwd = prepareWorkspaceIfNeeded(policy: workspacePolicy, instanceName: target.instanceName)
 
         // Register session
@@ -1437,6 +1480,31 @@ public final class RuntimeManager {
             environment: ProcessInfo.processInfo.environment,
             fileManager: fileManager
         )
+    }
+
+    private func prepareCacheSharingIfNeeded(instanceName: String) {
+        do {
+            let response = try daemonClient.send(RuntimeControlRequest(op: "cache_share_prepare"))
+            if response.ok {
+                logger.log("cache_share_prepare_started", fields: [
+                    "instance": instanceName,
+                    "status": response.meta?["status"] ?? "applied",
+                    "reason": response.meta?["reason"] ?? "-"
+                ])
+            } else {
+                logger.log("cache_share_fallback_local", fields: [
+                    "instance": instanceName,
+                    "reason": "daemon_error",
+                    "error": response.error ?? "unknown"
+                ])
+            }
+        } catch {
+            logger.log("cache_share_fallback_local", fields: [
+                "instance": instanceName,
+                "reason": "daemon_request_error",
+                "error": String(describing: error)
+            ])
+        }
     }
 
     private func prepareWorkspaceIfNeeded(

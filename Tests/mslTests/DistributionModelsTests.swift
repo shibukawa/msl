@@ -33,6 +33,7 @@ final class DistributionModelsTests: XCTestCase {
         let decoded = try JSONDecoder().decode(DistributionInstanceMetadata.self, from: Data(raw.utf8))
         XCTAssertNil(decoded.workspacePolicy)
         XCTAssertNil(decoded.compressionPolicy)
+        XCTAssertNil(decoded.cacheSharing)
       }
 
       func testDistributionInstanceMetadataRoundTripsCompressionPolicy() throws {
@@ -139,5 +140,55 @@ final class DistributionModelsTests: XCTestCase {
         let data = try JSONEncoder().encode(metadata)
         let decoded = try JSONDecoder().decode(DistributionInstanceMetadata.self, from: data)
         XCTAssertEqual(decoded.networkPolicy?.dns?.mode, "unmanaged")
+    }
+
+    func testDistributionMetadataRoundTripsCacheSharing() throws {
+        let metadata = DistributionInstanceMetadata(
+            name: "dev",
+            createdAtEpochMs: 100,
+            source: DistributionSourceRecord(
+                sourceType: "manifest",
+                distro: "ubuntu",
+                version: "24.04",
+                arch: "arm64",
+                manifestId: "ubuntu-24.04",
+                localPath: nil,
+                tarballFileName: "rootfs.tar.xz",
+                sha256: "abc",
+                verifiedAtEpochMs: 100
+            ),
+            diskPath: "/tmp/disk.raw",
+            kernelProfileRef: nil,
+            userConvergencePolicy: nil,
+            cacheSharing: CacheSharingConfig(enabled: true, apt: true, apk: false)
+        )
+        let data = try JSONEncoder().encode(metadata)
+        let decoded = try JSONDecoder().decode(DistributionInstanceMetadata.self, from: data)
+        XCTAssertEqual(decoded.cacheSharing?.enabled, true)
+        XCTAssertEqual(decoded.cacheSharing?.apt, true)
+        XCTAssertEqual(decoded.cacheSharing?.apk, false)
+    }
+
+    func testManifestEntryRoundTripsCacheSharingDefaults() throws {
+        let entry = DistributionManifestEntry(
+            id: "ubuntu-24.04-arm64",
+            distro: "ubuntu",
+            version: "24.04",
+            arch: "arm64",
+            tarballURL: "https://example.com/rootfs.tar.xz",
+            sha256: "abc",
+            signatureURL: "https://example.com/SHA256SUMS.gpg",
+            checksumURL: "https://example.com/SHA256SUMS",
+            signatureTarget: "checksum",
+            keyFingerprint: "DEADBEEF",
+            supportState: .supported,
+            userConvergenceTemplate: nil,
+            cacheSharingDefaults: CacheSharingConfig(enabled: true, apt: true, apk: false)
+        )
+        let data = try JSONEncoder().encode(entry)
+        let decoded = try JSONDecoder().decode(DistributionManifestEntry.self, from: data)
+        XCTAssertEqual(decoded.cacheSharingDefaults?.enabled, true)
+        XCTAssertEqual(decoded.cacheSharingDefaults?.apt, true)
+        XCTAssertEqual(decoded.cacheSharingDefaults?.apk, false)
     }
 }

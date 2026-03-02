@@ -99,6 +99,7 @@ public struct DistributionManifestEntry: Codable, Equatable {
     public var keyFingerprint: String?
     public var supportState: DistributionSupportState
     public var userConvergenceTemplate: UserConvergencePolicyTemplate?
+    public var cacheSharingDefaults: CacheSharingConfig?
 
     public init(
         id: String,
@@ -112,7 +113,8 @@ public struct DistributionManifestEntry: Codable, Equatable {
         signatureTarget: String?,
         keyFingerprint: String?,
         supportState: DistributionSupportState,
-        userConvergenceTemplate: UserConvergencePolicyTemplate? = nil
+        userConvergenceTemplate: UserConvergencePolicyTemplate? = nil,
+        cacheSharingDefaults: CacheSharingConfig? = nil
     ) {
         self.id = id
         self.distro = distro
@@ -126,6 +128,7 @@ public struct DistributionManifestEntry: Codable, Equatable {
         self.keyFingerprint = keyFingerprint
         self.supportState = supportState
         self.userConvergenceTemplate = userConvergenceTemplate
+        self.cacheSharingDefaults = cacheSharingDefaults
     }
 }
 
@@ -292,6 +295,7 @@ public struct DistributionInstanceMetadata: Codable, Equatable {
     public var workspacePolicy: WorkspacePolicy?
     public var compressionPolicy: DistributionCompressionPolicy?
     public var networkPolicy: DistributionNetworkPolicy?
+    public var cacheSharing: CacheSharingConfig?
 
     public init(
         name: String,
@@ -305,7 +309,8 @@ public struct DistributionInstanceMetadata: Codable, Equatable {
         userConvergencePolicy: UserConvergencePolicy?,
         workspacePolicy: WorkspacePolicy? = nil,
         compressionPolicy: DistributionCompressionPolicy? = nil,
-        networkPolicy: DistributionNetworkPolicy? = nil
+        networkPolicy: DistributionNetworkPolicy? = nil,
+        cacheSharing: CacheSharingConfig? = nil
     ) {
         self.name = name
         self.distroFamily = distroFamily
@@ -319,6 +324,7 @@ public struct DistributionInstanceMetadata: Codable, Equatable {
         self.workspacePolicy = workspacePolicy
         self.compressionPolicy = compressionPolicy
         self.networkPolicy = networkPolicy
+        self.cacheSharing = cacheSharing
     }
 }
 

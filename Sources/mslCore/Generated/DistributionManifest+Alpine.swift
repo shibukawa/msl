@@ -35,6 +35,11 @@ enum EmbeddedDistributionManifestAlpine {
                     respectHushlogin: true
                 ),
                 editable: false
+            ),
+            cacheSharingDefaults: CacheSharingConfig(
+                enabled: true,
+                apt: false,
+                apk: true
             )
         )
     ]

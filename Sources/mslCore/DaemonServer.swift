@@ -62,6 +62,7 @@ public final class DaemonServer {
     private let portMappingsSnapshotLock = NSLock()
     private var effectivePortMappingsSnapshot: EffectivePortMappings = .empty
     private var autoPortErrorsByHostPort: [Int: String] = [:]
+    private var cacheShareEnvAdditions: [String: String] = [:]
     private static let legacyHostSharePrepareScript = """
     set -eu
     share_root="$1"
@@ -109,6 +110,210 @@ public final class DaemonServer {
     else
       printf "reused"
     fi
+    """
+    private static let cacheSharePrepareScript = """
+    set -eu
+    cache_root="$1"; shift
+    runtime_home="$1"; shift
+    host_home_guest="$1"; shift
+    enable_apt="$1"; shift
+    enable_apk="$1"; shift
+    enable_go="$1"; shift
+    enable_python="$1"; shift
+    enable_npm="$1"; shift
+    enable_pnpm="$1"; shift
+    enable_yarn="$1"; shift
+    enable_maven="$1"; shift
+    enable_gradle="$1"; shift
+    enable_composer="$1"; shift
+    enable_scala="$1"; shift
+    enable_ruby="$1"; shift
+    enable_rust="$1"; shift
+    enable_deno="$1"; shift
+    enable_bun="$1"; shift
+    enable_nuget="$1"; shift
+
+    applied=0
+    fallback=0
+
+    is_mount_target() {
+      awk -v target="$1" '$5 == target { found=1 } END { exit(found ? 0 : 1) }' /proc/self/mountinfo
+    }
+
+    ensure_dir() {
+      path="$1"
+      if mkdir -p "$path" 2>/dev/null; then
+        return 0
+      fi
+      if command -v sudo >/dev/null 2>&1; then
+        sudo -n mkdir -p "$path" 2>/dev/null && return 0
+      fi
+      return 1
+    }
+
+    bind_mount() {
+      src="$1"
+      dst="$2"
+      if mount -o bind "$src" "$dst" 2>/dev/null; then
+        return 0
+      fi
+      if command -v sudo >/dev/null 2>&1; then
+        sudo -n mount -o bind "$src" "$dst" 2>/dev/null && return 0
+      fi
+      return 1
+    }
+
+    ensure_bind_mount() {
+      src="$1"
+      dst="$2"
+      if [ ! -e "$src" ]; then
+        fallback=$((fallback+1))
+        return 0
+      fi
+      if ! ensure_dir "$dst"; then
+        fallback=$((fallback+1))
+        return 0
+      fi
+      if is_mount_target "$dst"; then
+        return 0
+      fi
+      if bind_mount "$src" "$dst"; then
+        applied=1
+      else
+        fallback=$((fallback+1))
+      fi
+      return 0
+    }
+
+    if [ -z "$runtime_home" ] || [ "${runtime_home#/}" = "$runtime_home" ]; then
+      runtime_home="/root"
+    fi
+
+    if [ -z "$host_home_guest" ] || [ "${host_home_guest#/}" = "$host_home_guest" ]; then
+      host_home_guest="/__msl_host_home_unavailable__"
+    fi
+
+    prefer_existing_dir() {
+      fallback_path="$1"; shift
+      for candidate_path in "$@"; do
+        if [ -n "$candidate_path" ] && [ -d "$candidate_path" ]; then
+          printf "%s" "$candidate_path"
+          return 0
+        fi
+      done
+      printf "%s" "$fallback_path"
+    }
+
+    mkdir -p "$cache_root" 2>/dev/null || true
+
+    os_id=""
+    version_id=""
+    if [ -r /etc/os-release ]; then
+      os_id="$(. /etc/os-release; printf '%s' "${ID:-}")"
+      version_id="$(. /etc/os-release; printf '%s' "${VERSION_ID:-}")"
+    fi
+
+    if [ "$enable_apt" = "1" ] && command -v apt-get >/dev/null 2>&1; then
+      release_key="ubuntu-${version_id:-unknown}"
+      archives_src="$cache_root/apt/$release_key/archives"
+      lists_src="$cache_root/apt/$release_key/lists"
+      mkdir -p "$archives_src/partial" "$lists_src/partial" 2>/dev/null || true
+      ensure_bind_mount "$archives_src" "/var/cache/apt/archives"
+      ensure_bind_mount "$lists_src" "/var/lib/apt/lists"
+    fi
+
+    if [ "$enable_apk" = "1" ] && command -v apk >/dev/null 2>&1; then
+      apk_src="$cache_root/apk/cache"
+      mkdir -p "$apk_src" 2>/dev/null || true
+      ensure_bind_mount "$apk_src" "/var/cache/apk"
+    fi
+
+    if [ "$enable_go" = "1" ]; then
+      mkdir -p "$cache_root/go/modcache" "$cache_root/go/sumdb" 2>/dev/null || true
+      go_mod_src="$(prefer_existing_dir "$cache_root/go/modcache" "$host_home_guest/go/pkg/mod")"
+      go_sumdb_src="$(prefer_existing_dir "$cache_root/go/sumdb" "$host_home_guest/go/pkg/sumdb")"
+      ensure_bind_mount "$go_mod_src" "$runtime_home/go/pkg/mod"
+      ensure_bind_mount "$go_sumdb_src" "$runtime_home/go/pkg/sumdb"
+    fi
+    if [ "$enable_python" = "1" ]; then
+      mkdir -p "$cache_root/python/pip" 2>/dev/null || true
+      python_pip_src="$(prefer_existing_dir "$cache_root/python/pip" "$host_home_guest/Library/Caches/pip" "$host_home_guest/.cache/pip")"
+      ensure_bind_mount "$python_pip_src" "$runtime_home/.cache/pip"
+    fi
+    if [ "$enable_npm" = "1" ]; then
+      mkdir -p "$cache_root/node/npm" 2>/dev/null || true
+      npm_src="$(prefer_existing_dir "$cache_root/node/npm" "$host_home_guest/.npm")"
+      ensure_bind_mount "$npm_src" "$runtime_home/.npm"
+    fi
+    if [ "$enable_pnpm" = "1" ]; then
+      mkdir -p "$cache_root/node/pnpm-store" 2>/dev/null || true
+      pnpm_src="$(prefer_existing_dir "$cache_root/node/pnpm-store" "$host_home_guest/Library/pnpm/store" "$host_home_guest/.local/share/pnpm/store")"
+      ensure_bind_mount "$pnpm_src" "$runtime_home/.local/share/pnpm/store"
+    fi
+    if [ "$enable_yarn" = "1" ]; then
+      mkdir -p "$cache_root/node/yarn" 2>/dev/null || true
+      yarn_src="$(prefer_existing_dir "$cache_root/node/yarn" "$host_home_guest/Library/Caches/Yarn" "$host_home_guest/.cache/yarn")"
+      ensure_bind_mount "$yarn_src" "$runtime_home/.cache/yarn"
+    fi
+    if [ "$enable_maven" = "1" ]; then
+      mkdir -p "$cache_root/java/maven-repo" 2>/dev/null || true
+      maven_src="$(prefer_existing_dir "$cache_root/java/maven-repo" "$host_home_guest/.m2/repository")"
+      ensure_bind_mount "$maven_src" "$runtime_home/.m2/repository"
+    fi
+    if [ "$enable_gradle" = "1" ]; then
+      mkdir -p "$cache_root/java/gradle" 2>/dev/null || true
+      gradle_src="$(prefer_existing_dir "$cache_root/java/gradle" "$host_home_guest/.gradle/caches")"
+      ensure_bind_mount "$gradle_src" "$runtime_home/.gradle/caches"
+    fi
+    if [ "$enable_composer" = "1" ]; then
+      mkdir -p "$cache_root/php/composer" 2>/dev/null || true
+      composer_src="$(prefer_existing_dir "$cache_root/php/composer" "$host_home_guest/Library/Caches/composer" "$host_home_guest/.cache/composer")"
+      ensure_bind_mount "$composer_src" "$runtime_home/.cache/composer"
+    fi
+    if [ "$enable_scala" = "1" ]; then
+      mkdir -p "$cache_root/scala/coursier" "$cache_root/scala/ivy2" 2>/dev/null || true
+      scala_coursier_src="$(prefer_existing_dir "$cache_root/scala/coursier" "$host_home_guest/Library/Caches/Coursier/v1" "$host_home_guest/.cache/coursier")"
+      scala_ivy_src="$(prefer_existing_dir "$cache_root/scala/ivy2" "$host_home_guest/.ivy2/cache")"
+      ensure_bind_mount "$scala_coursier_src" "$runtime_home/.cache/coursier"
+      ensure_bind_mount "$scala_ivy_src" "$runtime_home/.ivy2/cache"
+    fi
+    if [ "$enable_ruby" = "1" ]; then
+      mkdir -p "$cache_root/ruby/bundle" 2>/dev/null || true
+      ruby_bundle_src="$(prefer_existing_dir "$cache_root/ruby/bundle" "$host_home_guest/.bundle/cache")"
+      ensure_bind_mount "$ruby_bundle_src" "$runtime_home/.bundle/cache"
+    fi
+    if [ "$enable_rust" = "1" ]; then
+      mkdir -p "$cache_root/rust/cargo-home/registry" "$cache_root/rust/cargo-home/git" 2>/dev/null || true
+      rust_registry_src="$(prefer_existing_dir "$cache_root/rust/cargo-home/registry" "$host_home_guest/.cargo/registry")"
+      rust_git_src="$(prefer_existing_dir "$cache_root/rust/cargo-home/git" "$host_home_guest/.cargo/git")"
+      ensure_bind_mount "$rust_registry_src" "$runtime_home/.cargo/registry"
+      ensure_bind_mount "$rust_git_src" "$runtime_home/.cargo/git"
+    fi
+    if [ "$enable_deno" = "1" ]; then
+      mkdir -p "$cache_root/deno/dir" 2>/dev/null || true
+      deno_src="$(prefer_existing_dir "$cache_root/deno/dir" "$host_home_guest/Library/Caches/deno" "$host_home_guest/.cache/deno")"
+      ensure_bind_mount "$deno_src" "$runtime_home/.cache/deno"
+    fi
+    if [ "$enable_bun" = "1" ]; then
+      mkdir -p "$cache_root/bun/cache" 2>/dev/null || true
+      bun_src="$(prefer_existing_dir "$cache_root/bun/cache" "$host_home_guest/.bun/install/cache")"
+      ensure_bind_mount "$bun_src" "$runtime_home/.bun/install/cache"
+    fi
+    if [ "$enable_nuget" = "1" ]; then
+      mkdir -p "$cache_root/dotnet/nuget-packages" "$cache_root/dotnet/nuget-http" 2>/dev/null || true
+      nuget_packages_src="$(prefer_existing_dir "$cache_root/dotnet/nuget-packages" "$host_home_guest/.nuget/packages")"
+      nuget_http_src="$(prefer_existing_dir "$cache_root/dotnet/nuget-http" "$host_home_guest/Library/Caches/NuGet/v3-cache" "$host_home_guest/.local/share/NuGet/v3-cache")"
+      ensure_bind_mount "$nuget_packages_src" "$runtime_home/.nuget/packages"
+      ensure_bind_mount "$nuget_http_src" "$runtime_home/.local/share/NuGet/v3-cache"
+    fi
+
+    status="reused"
+    if [ "$fallback" -gt 0 ]; then
+      status="partial"
+    elif [ "$applied" -eq 1 ]; then
+      status="applied"
+    fi
+    printf "%s" "$status"
     """
 
     public init(
@@ -373,6 +578,8 @@ public final class DaemonServer {
             return handleExec(request)
         case "workspace_prepare":
             return handleWorkspacePrepare(request)
+        case "cache_share_prepare":
+            return handleCacheSharePrepare()
 
         // --- provision_status ---
         case "provision_status":
@@ -440,6 +647,7 @@ public final class DaemonServer {
             let initReq = InitChannelRequest(
                 op: "exec",
                 argv: execTarget.argv,
+                envAdditions: cacheShareEnvAdditions.isEmpty ? nil : cacheShareEnvAdditions,
                 cwd: execTarget.cwd,
                 timeoutMs: timeoutMs
             )
@@ -577,6 +785,147 @@ public final class DaemonServer {
         }
     }
 
+    private func handleCacheSharePrepare() -> RuntimeControlResponse {
+        guard let client = initClient else {
+            return RuntimeControlResponse(ok: false, error: "init channel not available")
+        }
+
+        let policyConfig: CacheSharingConfig?
+        let policySource: String
+        if let metadataURL = runtimeMetadataURL,
+           let metadata = try? distributionManager.readOrRebuildInstanceMetadata(at: metadataURL) {
+            policyConfig = metadata.cacheSharing ?? CacheSharingPolicyResolver.defaultConfigForDistroFamily(
+                metadata.distroFamily
+                    ?? metadata.source.distro
+                    ?? DistributionManager.inferDistroFamilyStatic(from: metadata.source.manifestId)
+            )
+            policySource = metadata.cacheSharing == nil ? "metadata_inferred" : "metadata"
+        } else {
+            policyConfig = nil
+            policySource = "unavailable"
+        }
+
+        let policy = CacheSharingPolicyResolver.resolve(config: policyConfig)
+        guard policy.enabled else {
+            logger.log("cache_share_skipped", fields: [
+                "reason": "disabled",
+                "policy_source": policySource
+            ])
+            cacheShareEnvAdditions = [:]
+            return RuntimeControlResponse(ok: true, meta: ["status": "skipped", "reason": "disabled"])
+        }
+
+        let hostShareRoot = resolveConfiguredHostShareRoot()
+        let hostHome = ProcessInfo.processInfo.environment["HOME"] ?? FileManager.default.homeDirectoryForCurrentUser.path
+        let hostCacheRoot = CacheSharingPolicyResolver.hostCacheRootPath(hostHome: hostHome)
+        let guestHostHome = CacheSharingPolicyResolver.guestPathForHostPath(hostPath: hostHome, hostShareRoot: hostShareRoot) ?? ""
+        guard let guestCacheRoot = CacheSharingPolicyResolver.guestPathForHostPath(hostPath: hostCacheRoot, hostShareRoot: hostShareRoot) else {
+            logger.log("cache_share_fallback_local", fields: [
+                "reason": "host_cache_outside_share_root",
+                "host_cache_root": hostCacheRoot,
+                "host_share_root": hostShareRoot
+            ])
+            cacheShareEnvAdditions = [:]
+            return RuntimeControlResponse(ok: true, meta: [
+                "status": "skipped",
+                "reason": "host_cache_outside_share_root",
+            ])
+        }
+
+        let flags = CacheSharingPolicyResolver.toolFlagList(policy: policy)
+        let runtimeHome = runtimeUser?.home ?? "/root"
+        let enabledToolCount = flags.values.filter { $0 }.count
+        let argv = [
+            "/bin/sh",
+            "-lc",
+            Self.cacheSharePrepareScript,
+            "msl-cache-share-prepare",
+            guestCacheRoot,
+            runtimeHome,
+            guestHostHome,
+            flags["apt"] == true ? "1" : "0",
+            flags["apk"] == true ? "1" : "0",
+            flags["go"] == true ? "1" : "0",
+            flags["python"] == true ? "1" : "0",
+            flags["npm"] == true ? "1" : "0",
+            flags["pnpm"] == true ? "1" : "0",
+            flags["yarn"] == true ? "1" : "0",
+            flags["maven"] == true ? "1" : "0",
+            flags["gradle"] == true ? "1" : "0",
+            flags["composer"] == true ? "1" : "0",
+            flags["scala"] == true ? "1" : "0",
+            flags["ruby"] == true ? "1" : "0",
+            flags["rust"] == true ? "1" : "0",
+            flags["deno"] == true ? "1" : "0",
+            flags["bun"] == true ? "1" : "0",
+            flags["nuget"] == true ? "1" : "0",
+        ]
+
+        do {
+            let response = try client.send(InitChannelRequest(
+                op: "exec",
+                argv: argv,
+                runAsRoot: true,
+                timeoutMs: 4_000
+            ))
+            let exitCode = response.exitCode ?? 0
+            if response.ok, exitCode == 0 {
+                cacheShareEnvAdditions = CacheSharingPolicyResolver.environment(
+                    guestCacheRoot: guestCacheRoot,
+                    policy: policy
+                )
+                let status = response.stdout?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .lowercased()
+                let resolvedStatus: String
+                if status == "applied" || status == "reused" || status == "partial" {
+                    resolvedStatus = status ?? "applied"
+                } else {
+                    resolvedStatus = "applied"
+                }
+                logger.log("cache_share_applied", fields: [
+                    "status": resolvedStatus,
+                    "policy_source": policySource,
+                    "guest_cache_root": guestCacheRoot,
+                    "host_cache_root": hostCacheRoot,
+                    "enabled_tools": String(enabledToolCount),
+                    "runtime_home": runtimeHome
+                ])
+                return RuntimeControlResponse(ok: true, meta: [
+                    "status": resolvedStatus,
+                    "guest_cache_root": guestCacheRoot,
+                    "host_cache_root": hostCacheRoot,
+                    "enabled_tools": String(enabledToolCount),
+                    "runtime_home": runtimeHome,
+                ])
+            }
+
+            let errorMessage = response.error?.message ?? response.stderr ?? "cache_share_prepare failed"
+            logger.log("cache_share_fallback_local", fields: [
+                "reason": "guest_apply_failed",
+                "policy_source": policySource,
+                "error": errorMessage,
+                "exit_code": String(exitCode)
+            ])
+            cacheShareEnvAdditions = [:]
+            return RuntimeControlResponse(ok: true, meta: [
+                "status": "partial",
+                "reason": "guest_apply_failed",
+            ])
+        } catch {
+            logger.log("cache_share_fallback_local", fields: [
+                "reason": "request_error",
+                "policy_source": policySource,
+                "error": String(describing: error)
+            ])
+            cacheShareEnvAdditions = [:]
+            return RuntimeControlResponse(ok: true, meta: [
+                "status": "partial",
+                "reason": "request_error",
+            ])
+        }
+    }
+
     // MARK: - PTY ops
 
     private func handlePtyOpen(_ request: RuntimeControlRequest) -> RuntimeControlResponse {
@@ -591,6 +940,7 @@ public final class DaemonServer {
             let resp = try client.ptyOpen(
                 argv: ptyTarget.argv,
                 cwd: ptyTarget.cwd,
+                envAdditions: cacheShareEnvAdditions.isEmpty ? nil : cacheShareEnvAdditions,
                 rows: request.rows,
                 cols: request.cols,
                 timeoutMs: 3_000
@@ -659,6 +1009,7 @@ public final class DaemonServer {
                     hostShareRoot,
                     workspacePath
                 ],
+                runAsRoot: true,
                 timeoutMs: 4_000
             ))
 
