@@ -328,7 +328,8 @@ final class DistributionManager {
         emitStatus("install: extracting rootfs")
         try extractTarArchive(tarballURL, to: rootfsDir)
         emitStatus("install: injecting msl-init")
-        try stageInitBinary(intoRootfs: rootfsDir)
+        let runtimeProfile = initialRuntimeProfile(for: source, instanceName: name)
+        try stageInitBinary(intoRootfs: rootfsDir, runtimeProfile: runtimeProfile)
 
         emitStatus("install: creating ext4 disk image")
         try buildExt4Disk(
@@ -395,6 +396,7 @@ final class DistributionManager {
             source: sourceRecord,
             diskPath: diskFile.path,
             kernelProfileRef: kernelProfileRef,
+            runtimeProfile: runtimeProfile,
             userConvergencePolicy: initialPolicy,
             workspacePolicy: initialWorkspacePolicy(),
             compressionPolicy: compressionPolicy,
@@ -517,6 +519,7 @@ final class DistributionManager {
             compressionPolicyCount = compressionPolicy.pathPolicies.count
             let initialPolicy = initialUserConvergencePolicy(for: source)
             let initialCacheSharing = initialCacheSharingPolicy(for: source)
+            let runtimeProfile = initialRuntimeProfile(for: source, instanceName: name)
 
             let metadata = DistributionInstanceMetadata(
                 name: name,
@@ -537,6 +540,7 @@ final class DistributionManager {
                 source: sourceRecord,
                 diskPath: diskFile.path,
                 kernelProfileRef: kernelProfileRef,
+                runtimeProfile: runtimeProfile,
                 userConvergencePolicy: initialPolicy,
                 workspacePolicy: initialWorkspacePolicy(),
                 compressionPolicy: compressionPolicy,
@@ -569,17 +573,44 @@ final class DistributionManager {
     func readOrRebuildInstanceMetadata(at metadataURL: URL) throws -> DistributionInstanceMetadata {
         do {
             var metadata = try readJSON(DistributionInstanceMetadata.self, from: metadataURL)
+            var didMutate = false
             if metadata.cacheSharing == nil {
                 metadata.cacheSharing = defaultCacheSharingPolicy(
                     distroFamily: metadata.distroFamily
                         ?? metadata.source.distro
                         ?? inferDistroFamily(from: metadata.source.manifestId)
                 )
-                try writeJSON(metadata, to: metadataURL)
+                didMutate = true
                 logger.log("cache_sharing_backfilled", fields: [
                     "instance": metadata.name,
                     "metadata": metadataURL.path
                 ])
+            }
+            if metadata.runtimeProfile == nil {
+                metadata.runtimeProfile = backfillRuntimeProfile(
+                    metadata: metadata,
+                    preferServiceManaged: false
+                )
+                didMutate = true
+                logger.log("runtime_profile_backfilled", fields: [
+                    "instance": metadata.name,
+                    "metadata": metadataURL.path,
+                    "init_mode": metadata.runtimeProfile?.initMode ?? "-",
+                    "service_manager": metadata.runtimeProfile?.serviceManager ?? "-"
+                ])
+            } else if let manifestDefaultMode = resolveManifestDefaultInitMode(for: metadata.source),
+                      manifestDefaultMode == "direct-init",
+                      metadata.runtimeProfile?.initMode != manifestDefaultMode {
+                metadata.runtimeProfile?.initMode = manifestDefaultMode
+                didMutate = true
+                logger.log("runtime_profile_mode_overridden_by_manifest", fields: [
+                    "instance": metadata.name,
+                    "metadata": metadataURL.path,
+                    "init_mode": manifestDefaultMode
+                ])
+            }
+            if didMutate {
+                try writeJSON(metadata, to: metadataURL)
             }
             return metadata
         } catch {
@@ -772,6 +803,158 @@ final class DistributionManager {
                 manualSearchDomains: nil
             )
         )
+    }
+
+    private func initialRuntimeProfile(
+        for source: DistributionSourceSelection,
+        instanceName: String
+    ) -> DistributionInstanceMetadata.RuntimeInitProfile {
+        let resolvedServiceManager = resolveServiceManager(for: source)
+        let manifestDefaultMode = resolveManifestDefaultInitMode(for: source)
+        let serviceManager = resolvedServiceManager ?? "systemd"
+        let canUseServiceManaged: Bool
+        switch source {
+        case .manifest:
+            canUseServiceManaged = resolvedServiceManager != nil
+        case .localFile:
+            canUseServiceManaged = false
+        }
+        let initMode: String
+        if isReservedInternalInstanceName(instanceName) {
+            initMode = "direct-init"
+        } else if let manifestDefaultMode {
+            if manifestDefaultMode == "service-managed-init", !canUseServiceManaged {
+                initMode = "direct-init"
+            } else {
+                initMode = manifestDefaultMode
+            }
+        } else if !canUseServiceManaged {
+            initMode = "direct-init"
+        } else {
+            initMode = "service-managed-init"
+        }
+        return DistributionInstanceMetadata.RuntimeInitProfile(
+            initMode: initMode,
+            serviceManager: serviceManager
+        )
+    }
+
+    private func backfillRuntimeProfile(
+        metadata: DistributionInstanceMetadata,
+        preferServiceManaged: Bool
+    ) -> DistributionInstanceMetadata.RuntimeInitProfile {
+        runtimeProfileForSourceRecord(
+            metadata.source,
+            instanceName: metadata.name,
+            preferServiceManaged: preferServiceManaged
+        )
+    }
+
+    private func runtimeProfileForSourceRecord(
+        _ source: DistributionSourceRecord,
+        instanceName: String,
+        preferServiceManaged: Bool
+    ) -> DistributionInstanceMetadata.RuntimeInitProfile {
+        let resolvedServiceManager = resolveServiceManager(for: source)
+        let manifestDefaultMode = resolveManifestDefaultInitMode(for: source)
+        let serviceManager = resolvedServiceManager ?? "systemd"
+        let initMode: String
+        if isReservedInternalInstanceName(instanceName) {
+            initMode = "direct-init"
+        } else if let manifestDefaultMode {
+            if manifestDefaultMode == "service-managed-init", resolvedServiceManager == nil {
+                initMode = "direct-init"
+            } else {
+                initMode = manifestDefaultMode
+            }
+        } else if preferServiceManaged, resolvedServiceManager != nil {
+            initMode = "service-managed-init"
+        } else {
+            initMode = "direct-init"
+        }
+        return DistributionInstanceMetadata.RuntimeInitProfile(
+            initMode: initMode,
+            serviceManager: serviceManager
+        )
+    }
+
+    private func resolveServiceManager(for source: DistributionSourceSelection) -> String? {
+        switch source {
+        case .manifest(let entry):
+            if let explicit = normalizeServiceManager(entry.serviceManager) {
+                return explicit
+            }
+            return inferServiceManagerFromDistro(entry.distro)
+        case .localFile:
+            return nil
+        }
+    }
+
+    private func resolveManifestDefaultInitMode(for source: DistributionSourceSelection) -> String? {
+        switch source {
+        case .manifest(let entry):
+            return normalizeInitMode(entry.defaultInitMode)
+        case .localFile:
+            return nil
+        }
+    }
+
+    private func resolveManifestDefaultInitMode(for source: DistributionSourceRecord) -> String? {
+        guard let manifestID = source.manifestId,
+              let entry = manifestStore.allEntries().first(where: { $0.id == manifestID }) else {
+            return nil
+        }
+        return normalizeInitMode(entry.defaultInitMode)
+    }
+
+    private func resolveServiceManager(for source: DistributionSourceRecord) -> String? {
+        if let manifestID = source.manifestId,
+           let entry = manifestStore.allEntries().first(where: { $0.id == manifestID }),
+           let explicit = normalizeServiceManager(entry.serviceManager) {
+            return explicit
+        }
+        if let distro = source.distro {
+            return inferServiceManagerFromDistro(distro)
+        }
+        return inferServiceManagerFromDistro(inferDistroFamily(from: source.manifestId) ?? "")
+    }
+
+    private func normalizeServiceManager(_ raw: String?) -> String? {
+        guard let raw else { return nil }
+        let normalized = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !normalized.isEmpty else { return nil }
+        switch normalized {
+        case "systemd", "openrc":
+            return normalized
+        default:
+            return nil
+        }
+    }
+
+    private func normalizeInitMode(_ raw: String?) -> String? {
+        guard let raw else { return nil }
+        let normalized = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !normalized.isEmpty else { return nil }
+        switch normalized {
+        case "direct-init", "service-managed-init":
+            return normalized
+        default:
+            return nil
+        }
+    }
+
+    private func inferServiceManagerFromDistro(_ distro: String) -> String? {
+        let normalized = distro.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if normalized.isEmpty {
+            return nil
+        }
+        if normalized.contains("alpine") {
+            return "openrc"
+        }
+        if normalized.contains("ubuntu") {
+            return "systemd"
+        }
+        return nil
     }
 
     private func resolveCompressionPolicyForInstall() throws -> DistributionCompressionPolicy {
@@ -1049,6 +1232,11 @@ final class DistributionManager {
             source: sourceRecord,
             diskPath: diskURL.path,
             kernelProfileRef: nil,
+            runtimeProfile: runtimeProfileForSourceRecord(
+                sourceRecord,
+                instanceName: instanceName,
+                preferServiceManaged: false
+            ),
             userConvergencePolicy: recoveredPolicy,
             workspacePolicy: initialWorkspacePolicy(),
             compressionPolicy: nil,
@@ -1459,7 +1647,10 @@ final class DistributionManager {
         _ = try process.run(fallocate, ["-d", imageURL.path], captureOutput: true)
     }
 
-    internal func stageInitBinary(intoRootfs rootfsDir: URL) throws {
+    internal func stageInitBinary(
+        intoRootfs rootfsDir: URL,
+        runtimeProfile: DistributionInstanceMetadata.RuntimeInitProfile? = nil
+    ) throws {
         let envPath = ProcessInfo.processInfo.environment["MSL_INIT_BINARY_PATH"]?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let sourcePath: String
@@ -1494,6 +1685,255 @@ final class DistributionManager {
             try fileManager.removeItem(at: guestMSL)
         }
         try fileManager.createSymbolicLink(atPath: guestMSL.path, withDestinationPath: "msl-init")
+        try normalizeRootFstabForVirtualDisk(rootfsDir: rootfsDir)
+
+        guard let runtimeProfile,
+              runtimeProfile.initMode == "service-managed-init" else {
+            return
+        }
+        try installGuestRuntimeServiceContracts(
+            rootfsDir: rootfsDir,
+            serviceManager: runtimeProfile.serviceManager
+        )
+    }
+
+    private func installGuestRuntimeServiceContracts(rootfsDir: URL, serviceManager rawServiceManager: String) throws {
+        let serviceManager = rawServiceManager.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        logger.log("guest_service_contract_install_started", fields: [
+            "service_manager": serviceManager,
+            "rootfs": rootfsDir.path
+        ])
+        switch serviceManager {
+        case "systemd":
+            try installSystemdMSLInitService(rootfsDir: rootfsDir)
+            try configureSystemdTimesyncdUpstream(rootfsDir: rootfsDir)
+        case "openrc":
+            try installOpenRCMSLInitService(rootfsDir: rootfsDir)
+            try configureOpenRCNTPUpstream(rootfsDir: rootfsDir)
+        default:
+            throw MSLRuntimeError("unsupported runtimeProfile.serviceManager '\(rawServiceManager)'")
+        }
+        logger.log("guest_service_contract_install_completed", fields: [
+            "service_manager": serviceManager,
+            "rootfs": rootfsDir.path
+        ])
+    }
+
+    private func installSystemdMSLInitService(rootfsDir: URL) throws {
+        let unitDir = rootfsDir.appendingPathComponent("etc/systemd/system", isDirectory: true)
+        try fileManager.createDirectory(at: unitDir, withIntermediateDirectories: true)
+
+        let unitFile = unitDir.appendingPathComponent("msl-init.service", isDirectory: false)
+        let unitText = """
+        [Unit]
+        Description=msl init control server
+        After=network.target local-fs.target
+        Before=docker.service containerd.service
+
+        [Service]
+        Type=simple
+        Environment=MSL_VSOCK_PORT=1024
+        Environment=MSL_INIT_LOG_FILE=/var/log/msl-init.log
+        ExecStart=/usr/local/bin/msl-init
+        Restart=always
+        RestartSec=1
+
+        [Install]
+        WantedBy=multi-user.target
+        """
+        try Data(unitText.utf8).write(to: unitFile, options: .atomic)
+
+        let wantsDir = unitDir.appendingPathComponent("multi-user.target.wants", isDirectory: true)
+        try fileManager.createDirectory(at: wantsDir, withIntermediateDirectories: true)
+        let wantsLink = wantsDir.appendingPathComponent("msl-init.service", isDirectory: false)
+        if fileManager.fileExists(atPath: wantsLink.path) {
+            try fileManager.removeItem(at: wantsLink)
+        }
+        try fileManager.createSymbolicLink(
+            atPath: wantsLink.path,
+            withDestinationPath: "../msl-init.service"
+        )
+        logger.log("init_service_contract_staged", fields: [
+            "service_manager": "systemd",
+            "unit": unitFile.path,
+            "enable_link": wantsLink.path
+        ])
+    }
+
+    private func configureSystemdTimesyncdUpstream(rootfsDir: URL) throws {
+        let confDir = rootfsDir.appendingPathComponent("etc/systemd/timesyncd.conf.d", isDirectory: true)
+        try fileManager.createDirectory(at: confDir, withIntermediateDirectories: true)
+        let confFile = confDir.appendingPathComponent("90-msl.conf", isDirectory: false)
+        let confText = """
+        [Time]
+        NTP=127.0.0.1
+        FallbackNTP=
+        """
+        try Data(confText.utf8).write(to: confFile, options: .atomic)
+        logger.log("ntp_upstream_config_applied", fields: [
+            "service_manager": "systemd",
+            "client": "systemd-timesyncd",
+            "upstream": "127.0.0.1",
+            "config": confFile.path
+        ])
+
+        // Keep distro default enablement, but ensure timesyncd is enabled when unit file exists.
+        let unitCandidates = [
+            rootfsDir.appendingPathComponent("lib/systemd/system/systemd-timesyncd.service", isDirectory: false),
+            rootfsDir.appendingPathComponent("usr/lib/systemd/system/systemd-timesyncd.service", isDirectory: false)
+        ]
+        guard let unitPath = unitCandidates.first(where: { fileManager.fileExists(atPath: $0.path) }) else {
+            logger.log("ntp_upstream_enable_skipped", fields: [
+                "service_manager": "systemd",
+                "reason": "timesyncd_unit_missing"
+            ])
+            return
+        }
+        let wantsDir = rootfsDir.appendingPathComponent("etc/systemd/system/sysinit.target.wants", isDirectory: true)
+        try fileManager.createDirectory(at: wantsDir, withIntermediateDirectories: true)
+        let wantsLink = wantsDir.appendingPathComponent("systemd-timesyncd.service", isDirectory: false)
+        if fileManager.fileExists(atPath: wantsLink.path) {
+            try fileManager.removeItem(at: wantsLink)
+        }
+        let relative = unitPath.path.replacingOccurrences(of: rootfsDir.path, with: "")
+        try fileManager.createSymbolicLink(atPath: wantsLink.path, withDestinationPath: relative)
+        logger.log("ntp_upstream_enable_applied", fields: [
+            "service_manager": "systemd",
+            "client": "systemd-timesyncd",
+            "enable_link": wantsLink.path
+        ])
+    }
+
+    private func installOpenRCMSLInitService(rootfsDir: URL) throws {
+        let initDir = rootfsDir.appendingPathComponent("etc/init.d", isDirectory: true)
+        try fileManager.createDirectory(at: initDir, withIntermediateDirectories: true)
+        let serviceFile = initDir.appendingPathComponent("msl-init", isDirectory: false)
+        let serviceText = """
+        #!/sbin/openrc-run
+        name="msl-init"
+        description="msl init control server"
+        command="/usr/local/bin/msl-init"
+        command_background="yes"
+        pidfile="/run/msl-init.pid"
+        output_log="/var/log/msl-init.log"
+        error_log="/var/log/msl-init.log"
+        supervisor=supervise-daemon
+        respawn_delay=1
+        respawn_max=0
+        respawn_period=0
+
+        depend() {
+            need localmount
+            after bootmisc
+            before docker
+        }
+
+        start_pre() {
+            checkpath --file --mode 0644 /var/log/msl-init.log
+        }
+        """
+        try Data(serviceText.utf8).write(to: serviceFile, options: .atomic)
+        try fileManager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: serviceFile.path)
+
+        let runlevelDir = rootfsDir.appendingPathComponent("etc/runlevels/default", isDirectory: true)
+        try fileManager.createDirectory(at: runlevelDir, withIntermediateDirectories: true)
+        let runlevelLink = runlevelDir.appendingPathComponent("msl-init", isDirectory: false)
+        if fileManager.fileExists(atPath: runlevelLink.path) {
+            try fileManager.removeItem(at: runlevelLink)
+        }
+        try fileManager.createSymbolicLink(atPath: runlevelLink.path, withDestinationPath: "/etc/init.d/msl-init")
+        logger.log("init_service_contract_staged", fields: [
+            "service_manager": "openrc",
+            "service": serviceFile.path,
+            "runlevel_link": runlevelLink.path
+        ])
+    }
+
+    private func configureOpenRCNTPUpstream(rootfsDir: URL) throws {
+        let confDir = rootfsDir.appendingPathComponent("etc/conf.d", isDirectory: true)
+        try fileManager.createDirectory(at: confDir, withIntermediateDirectories: true)
+        let ntpdConf = confDir.appendingPathComponent("ntpd", isDirectory: false)
+        let ntpdText = """
+        NTPD_OPTS="-p 127.0.0.1"
+        """
+        try Data(ntpdText.utf8).write(to: ntpdConf, options: .atomic)
+        logger.log("ntp_upstream_config_applied", fields: [
+            "service_manager": "openrc",
+            "client": "ntpd",
+            "upstream": "127.0.0.1",
+            "config": ntpdConf.path
+        ])
+    }
+
+    private func normalizeRootFstabForVirtualDisk(rootfsDir: URL) throws {
+        let fstab = rootfsDir.appendingPathComponent("etc/fstab", isDirectory: false)
+        guard fileManager.fileExists(atPath: fstab.path) else {
+            return
+        }
+        let original = try String(contentsOf: fstab, encoding: .utf8)
+        let normalized = normalizeRootFstabText(original)
+        guard normalized.changed else {
+            return
+        }
+        try Data(normalized.text.utf8).write(to: fstab, options: .atomic)
+        logger.log("guest_fstab_root_source_normalized", fields: [
+            "path": fstab.path,
+            "from": normalized.originalRootSource ?? "unknown",
+            "to": "/dev/vda"
+        ])
+    }
+
+    private func normalizeRootFstabText(_ text: String) -> (text: String, changed: Bool, originalRootSource: String?) {
+        let endsWithNewline = text.hasSuffix("\n")
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
+        var changed = false
+        var originalRootSource: String?
+        var normalizedRootWritten = false
+        var out: [String] = []
+        out.reserveCapacity(lines.count)
+
+        for raw in lines {
+            let line = String(raw)
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.isEmpty || trimmed.hasPrefix("#") {
+                out.append(line)
+                continue
+            }
+
+            let commentIndex = line.firstIndex(of: "#")
+            let head = commentIndex.map { String(line[..<$0]) } ?? line
+            let tail = commentIndex.map { String(line[$0...]) } ?? ""
+            let parts = head.split(whereSeparator: \.isWhitespace).map(String.init)
+            guard parts.count >= 2 else {
+                out.append(line)
+                continue
+            }
+
+            if parts[1] == "/" {
+                if !changed {
+                    originalRootSource = parts[0]
+                }
+                if !normalizedRootWritten {
+                    let normalizedRoot = "/dev/vda\t/\tauto\tdefaults\t0\t1"
+                    let rebuilt = parts.joined(separator: "\t")
+                    if rebuilt != normalizedRoot || !tail.isEmpty {
+                        changed = true
+                    }
+                    out.append(normalizedRoot)
+                    normalizedRootWritten = true
+                } else {
+                    changed = true
+                }
+                continue
+            }
+            out.append(line)
+        }
+
+        var normalized = out.joined(separator: "\n")
+        if endsWithNewline {
+            normalized += "\n"
+        }
+        return (normalized, changed, originalRootSource)
     }
 
     internal func resolveExt4MkfsHelperExecutable() -> String? {

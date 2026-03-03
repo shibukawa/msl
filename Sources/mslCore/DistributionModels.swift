@@ -98,6 +98,8 @@ public struct DistributionManifestEntry: Codable, Equatable {
     public var signatureTarget: String?
     public var keyFingerprint: String?
     public var supportState: DistributionSupportState
+    public var serviceManager: String?
+    public var defaultInitMode: String?
     public var userConvergenceTemplate: UserConvergencePolicyTemplate?
     public var cacheSharingDefaults: CacheSharingConfig?
 
@@ -113,6 +115,8 @@ public struct DistributionManifestEntry: Codable, Equatable {
         signatureTarget: String?,
         keyFingerprint: String?,
         supportState: DistributionSupportState,
+        serviceManager: String? = nil,
+        defaultInitMode: String? = nil,
         userConvergenceTemplate: UserConvergencePolicyTemplate? = nil,
         cacheSharingDefaults: CacheSharingConfig? = nil
     ) {
@@ -127,6 +131,8 @@ public struct DistributionManifestEntry: Codable, Equatable {
         self.signatureTarget = signatureTarget
         self.keyFingerprint = keyFingerprint
         self.supportState = supportState
+        self.serviceManager = serviceManager
+        self.defaultInitMode = defaultInitMode
         self.userConvergenceTemplate = userConvergenceTemplate
         self.cacheSharingDefaults = cacheSharingDefaults
     }
@@ -250,6 +256,16 @@ public struct DistributionNetworkPolicy: Codable, Equatable {
 }
 
 public struct DistributionInstanceMetadata: Codable, Equatable {
+    public struct RuntimeInitProfile: Codable, Equatable {
+        public var initMode: String
+        public var serviceManager: String
+
+        public init(initMode: String, serviceManager: String) {
+            self.initMode = initMode
+            self.serviceManager = serviceManager
+        }
+    }
+
     public struct PrivilegeBootstrap: Codable, Equatable {
         public var firstBootPending: Bool
         public var privilegeBootstrapVersion: Int
@@ -291,6 +307,7 @@ public struct DistributionInstanceMetadata: Codable, Equatable {
     public var source: DistributionSourceRecord
     public var diskPath: String
     public var kernelProfileRef: String?
+    public var runtimeProfile: RuntimeInitProfile?
     public var userConvergencePolicy: UserConvergencePolicy?
     public var workspacePolicy: WorkspacePolicy?
     public var compressionPolicy: DistributionCompressionPolicy?
@@ -306,6 +323,7 @@ public struct DistributionInstanceMetadata: Codable, Equatable {
         source: DistributionSourceRecord,
         diskPath: String,
         kernelProfileRef: String?,
+        runtimeProfile: RuntimeInitProfile? = nil,
         userConvergencePolicy: UserConvergencePolicy?,
         workspacePolicy: WorkspacePolicy? = nil,
         compressionPolicy: DistributionCompressionPolicy? = nil,
@@ -320,6 +338,7 @@ public struct DistributionInstanceMetadata: Codable, Equatable {
         self.source = source
         self.diskPath = diskPath
         self.kernelProfileRef = kernelProfileRef
+        self.runtimeProfile = runtimeProfile
         self.userConvergencePolicy = userConvergencePolicy
         self.workspacePolicy = workspacePolicy
         self.compressionPolicy = compressionPolicy
