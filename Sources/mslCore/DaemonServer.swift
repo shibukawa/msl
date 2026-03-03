@@ -372,6 +372,12 @@ public final class DaemonServer {
             "metadata": metadataURL.path
         ])
         let bootProfile = try resolveBootProfile(metadataURL: metadataURL, instanceName: instanceName)
+        logger.log("init_mode_selected", fields: [
+            "instance": instanceName,
+            "init_mode": bootProfile.initMode,
+            "service_manager": bootProfile.serviceManager ?? "-",
+            "source": bootProfile.profileSource
+        ])
 
         // 2. Start VM and get init channel client
         let runner = VirtualMachineRunner(

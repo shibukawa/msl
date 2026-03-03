@@ -14,6 +14,8 @@ enum EmbeddedDistributionManifestAlpine {
             signatureTarget: "artifact",
             keyFingerprint: "0482D84022F52DF1C4E7CD43293ACD0907D9495A",
             supportState: .supported,
+            serviceManager: "openrc",
+            defaultInitMode: "direct-init",
             userConvergenceTemplate: UserConvergencePolicyTemplate(
                 templateId: "alpine-busybox-v1",
                 commandFamily: "busybox_adduser",

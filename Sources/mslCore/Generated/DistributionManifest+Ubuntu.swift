@@ -14,6 +14,8 @@ enum EmbeddedDistributionManifestUbuntu {
             signatureTarget: "checksum",
             keyFingerprint: "D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81",
             supportState: .supported,
+            serviceManager: "systemd",
+            defaultInitMode: nil,
             userConvergenceTemplate: UserConvergencePolicyTemplate(
                 templateId: "ubuntu-useradd-v1",
                 commandFamily: "useradd",
@@ -54,6 +56,8 @@ enum EmbeddedDistributionManifestUbuntu {
             signatureTarget: "checksum",
             keyFingerprint: "D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81",
             supportState: .supported,
+            serviceManager: "systemd",
+            defaultInitMode: nil,
             userConvergenceTemplate: UserConvergencePolicyTemplate(
                 templateId: "ubuntu-useradd-v1",
                 commandFamily: "useradd",

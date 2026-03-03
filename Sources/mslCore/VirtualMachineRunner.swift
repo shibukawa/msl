@@ -26,6 +26,8 @@ public final class VirtualMachineRunner {
     private var acceptedVsockConnection: AnyObject?  // retain VZVirtioSocketConnection
     private var dnsTunnelListener: AnyObject?
     private var dnsTunnelListenerDelegate: AnyObject?
+    private var timeTunnelListener: AnyObject?
+    private var timeTunnelListenerDelegate: AnyObject?
     private var memoryPlan: RuntimeMemoryPlan?
 
     #if canImport(Virtualization)
@@ -490,9 +492,15 @@ public final class VirtualMachineRunner {
             self?.handleDNSTunnelRequest(fd: fd)
         }
         dnsTunnelListener.delegate = dnsTunnelDelegate
+        let timeTunnelListener = VZVirtioSocketListener()
+        let timeTunnelDelegate = DNSTunnelListenerDelegate { [weak self] fd in
+            self?.handleTimeTunnelRequest(fd: fd)
+        }
+        timeTunnelListener.delegate = timeTunnelDelegate
         vmQueue.async {
             vsockDevice.setSocketListener(listener, forPort: 1024)
             vsockDevice.setSocketListener(dnsTunnelListener, forPort: 1053)
+            vsockDevice.setSocketListener(timeTunnelListener, forPort: 1067)
         }
 
         let timeoutSec = resolveInitAttachTimeoutSec()
@@ -537,6 +545,8 @@ public final class VirtualMachineRunner {
         self.runningDelegate = delegate
         self.dnsTunnelListener = dnsTunnelListener
         self.dnsTunnelListenerDelegate = dnsTunnelDelegate
+        self.timeTunnelListener = timeTunnelListener
+        self.timeTunnelListenerDelegate = timeTunnelDelegate
         startBalloonController(client: client)
 
         return client
@@ -573,6 +583,8 @@ public final class VirtualMachineRunner {
         self.acceptedVsockConnection = nil
         self.dnsTunnelListener = nil
         self.dnsTunnelListenerDelegate = nil
+        self.timeTunnelListener = nil
+        self.timeTunnelListenerDelegate = nil
         self.balloonDevice = nil
         self.balloonCurrentTargetBytes = nil
         self.balloonReturnedTotalBytes = 0
@@ -764,6 +776,36 @@ public final class VirtualMachineRunner {
         }
     }
 
+    private func handleTimeTunnelRequest(fd: Int32) {
+        let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+        defer {
+            try? handle.close()
+        }
+        guard let header = readExact(handle: handle, count: 4), header.count == 4 else {
+            return
+        }
+        let length = Int(header.withUnsafeBytes { $0.load(as: UInt32.self).bigEndian })
+        guard length > 0, length <= 16 * 1024,
+              let body = readExact(handle: handle, count: length),
+              (try? JSONDecoder().decode(TimeTunnelRequest.self, from: body)) != nil else {
+            return
+        }
+
+        let unixMs = Int64(Date().timeIntervalSince1970 * 1_000)
+        let response = TimeTunnelResponse(ok: true, unixMs: unixMs, error: nil)
+        guard let encoded = try? JSONEncoder().encode(response) else {
+            return
+        }
+        var len = UInt32(encoded.count).bigEndian
+        let lenData = Data(bytes: &len, count: 4)
+        do {
+            try handle.write(contentsOf: lenData)
+            try handle.write(contentsOf: encoded)
+        } catch {
+            logger?.log("time_tunnel_write_failed", fields: ["error": String(describing: error)])
+        }
+    }
+
     private func readExact(handle: FileHandle, count: Int) -> Data? {
         var out = Data()
         out.reserveCapacity(count)
@@ -922,21 +964,31 @@ public final class VirtualMachineRunner {
         listenerDelegate: VsockListenerDelegate,
         timeoutSec: Int
     ) throws -> Int32 {
+        let initMode = bootProfile?.initMode ?? "direct-init"
+        let serviceManager = bootProfile?.serviceManager ?? "-"
+        let checkCommand = initHandshakeCheckCommand()
+
         fputs("msl: waiting for msl-init vsock connection (timeout \(timeoutSec)s)\n", stderr)
         logger?.log("init_handshake_wait_started", fields: [
             "transport": "vsock_listener",
-            "timeout_sec": String(timeoutSec)
+            "timeout_sec": String(timeoutSec),
+            "init_mode": initMode,
+            "service_manager": serviceManager
         ])
 
         let waitResult = listenerDelegate.semaphore.wait(timeout: .now() + .seconds(timeoutSec))
         if waitResult == .timedOut {
             logger?.log("init_handshake_timeout", fields: [
                 "timeout_sec": String(timeoutSec),
-                "serial_log": paths.serialConsoleLogFile.path
+                "serial_log": paths.serialConsoleLogFile.path,
+                "init_mode": initMode,
+                "service_manager": serviceManager,
+                "check_command": checkCommand
             ])
             throw MSLRuntimeError(
                 "init channel did not connect within \(timeoutSec)s; " +
-                "verify direct-init path (e.g. `init=/sbin/msl-init`) and inspect serial log at \(paths.serialConsoleLogFile.path)"
+                "init_mode=\(initMode), service_manager=\(serviceManager). " +
+                "check guest service with `\(checkCommand)` and inspect serial log at \(paths.serialConsoleLogFile.path)"
             )
         }
 
@@ -951,8 +1003,31 @@ public final class VirtualMachineRunner {
         logger?.log("init_vsock_accepted", fields: [
             "fd": String(fd)
         ])
-        logger?.log("init_handshake_ready", fields: ["fd": String(fd)])
+        logger?.log("init_service_ready", fields: [
+            "fd": String(fd),
+            "init_mode": initMode,
+            "service_manager": serviceManager
+        ])
+        logger?.log("init_handshake_ready", fields: [
+            "fd": String(fd),
+            "init_mode": initMode,
+            "service_manager": serviceManager
+        ])
         return fd
+    }
+
+    private func initHandshakeCheckCommand() -> String {
+        if bootProfile?.initMode == "service-managed-init" {
+            switch bootProfile?.serviceManager {
+            case "systemd":
+                return "systemctl status msl-init.service --no-pager"
+            case "openrc":
+                return "rc-service msl-init status"
+            default:
+                return "ps -o pid,comm -p 1"
+            }
+        }
+        return "cat /proc/cmdline"
     }
 
     private func resolveInitAttachTimeoutSec() -> Int {
@@ -1130,6 +1205,16 @@ private struct DNSTunnelRequest: Codable {
 private struct DNSTunnelResponse: Codable {
     var ok: Bool
     var answers: [String]
+    var error: String?
+}
+
+private struct TimeTunnelRequest: Codable {
+    var op: String?
+}
+
+private struct TimeTunnelResponse: Codable {
+    var ok: Bool
+    var unixMs: Int64
     var error: String?
 }
 
