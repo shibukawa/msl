@@ -808,6 +808,7 @@ public final class RuntimeManager {
             op: "exec",
             argv: argv,
             timeoutMs: execTimeoutMs,
+            runAsRoot: shouldForceRootRuntimeUser(),
             sessionId: sessionID,
             cwd: execCwd
         ))
@@ -1687,6 +1688,16 @@ public final class RuntimeManager {
         )
         let instanceName = metadataURL.deletingLastPathComponent().lastPathComponent
         return (instanceName, metadataURL)
+    }
+
+    private func shouldForceRootRuntimeUser() -> Bool {
+        guard let raw = ProcessInfo.processInfo.environment["MSL_RUNTIME_USER_ROOT"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        else {
+            return false
+        }
+        return raw == "1" || raw == "true" || raw == "yes"
     }
 
     private func formatBytes(_ bytes: UInt64) -> String {

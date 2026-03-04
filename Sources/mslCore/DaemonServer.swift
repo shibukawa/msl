@@ -29,7 +29,6 @@ public final class DaemonServer {
     private var controlServer: RuntimeControlServer?
     private var eventBus: DaemonEventBus?
     private var forwarder: PortForwardingManager?
-    private var runtimeUser: RuntimeUserState?
     private var runtimeMetadataURL: URL?
     private let dnsStateLock = NSLock()
     private let dnsReconcileLock = NSLock()
@@ -466,7 +465,6 @@ public final class DaemonServer {
                 metadataURL: metadataURL,
                 instanceName: instanceName
             )
-            self.runtimeUser = resolved.runtimeUser
             instanceContext.runtimeUser = resolved.runtimeUser
             try distributionManager.writeBootstrapResult(
                 metadataURL: metadataURL,
@@ -573,7 +571,7 @@ public final class DaemonServer {
             state.daemonEventSocket = eventSocketPath
             state.activeSessionCount = 0
             state.idleTimer = IdleTimerState(armed: false, deadlineEpochMs: nil)
-            state.runtimeUser = runtimeUser
+            state.runtimeUser = instanceContext.runtimeUser
             upsertInstanceState(
                 &state,
                 instanceName: instanceName,
@@ -582,7 +580,7 @@ public final class DaemonServer {
                 idleTimer: state.idleTimer,
                 runtimeHostPid: state.runtimeHostPid,
                 runtimeControlSocket: state.runtimeControlSocket,
-                runtimeUser: state.runtimeUser,
+                runtimeUser: instanceContext.runtimeUser,
                 initChannel: state.initChannel,
                 lastError: nil
             )
@@ -1005,6 +1003,7 @@ public final class DaemonServer {
                 op: "exec",
                 argv: execTarget.argv,
                 envAdditions: cacheShareEnvAdditions.isEmpty ? nil : cacheShareEnvAdditions,
+                runAsRoot: request.runAsRoot,
                 cwd: execTarget.cwd,
                 timeoutMs: timeoutMs
             )
@@ -1215,7 +1214,7 @@ public final class DaemonServer {
         }
 
         let flags = CacheSharingPolicyResolver.toolFlagList(policy: policy)
-        let runtimeHome = runtimeUser?.home ?? "/root"
+        let runtimeHome = instanceRegistry.context(for: currentRuntimeInstanceName()).runtimeUser?.home ?? "/root"
         let enabledToolCount = flags.values.filter { $0 }.count
         let argv = [
             "/bin/sh",
@@ -1316,7 +1315,7 @@ public final class DaemonServer {
             return RuntimeControlResponse(ok: false, error: "instance_not_running")
         }
         maybeReconcileDNSBeforeGuestOperation(instanceName: context.instanceName)
-        let defaultShell = runtimeUser?.shell ?? "/bin/sh"
+        let defaultShell = context.runtimeUser?.shell ?? "/bin/sh"
         let argv = request.argv ?? [defaultShell, "-l"]
         let ptyTarget = resolveCWDForwarding(argv: argv, cwd: request.cwd)
         do {
@@ -1668,16 +1667,17 @@ public final class DaemonServer {
                     targetIdleTimer = IdleTimerState(armed: false, deadlineEpochMs: nil)
                     state.idleTimer = targetIdleTimer
                 }
+                let targetEntry = state.instances?.first(where: { $0.instance == instanceName })
                 upsertInstanceState(
                     &state,
                     instanceName: instanceName,
                     lifecycleState: .running,
                     activeSessionCount: instanceSessionCount,
                     idleTimer: targetIdleTimer,
-                    runtimeHostPid: state.runtimeHostPid,
-                    runtimeControlSocket: state.runtimeControlSocket,
-                    runtimeUser: state.runtimeUser,
-                    initChannel: state.initChannel,
+                    runtimeHostPid: targetEntry?.runtimeHostPid ?? state.runtimeHostPid,
+                    runtimeControlSocket: targetEntry?.runtimeControlSocket ?? state.runtimeControlSocket,
+                    runtimeUser: targetEntry?.runtimeUser,
+                    initChannel: targetEntry?.initChannel ?? state.initChannel,
                     lastError: nil
                 )
                 try store.saveState(state)
@@ -1722,16 +1722,17 @@ public final class DaemonServer {
                         targetIdleTimer = state.idleTimer
                     }
                 }
+                let targetEntry = state.instances?.first(where: { $0.instance == targetInstance })
                 upsertInstanceState(
                     &state,
                     instanceName: targetInstance,
                     lifecycleState: .running,
                     activeSessionCount: remainingForInstance,
                     idleTimer: targetIdleTimer,
-                    runtimeHostPid: state.runtimeHostPid,
-                    runtimeControlSocket: state.runtimeControlSocket,
-                    runtimeUser: state.runtimeUser,
-                    initChannel: state.initChannel,
+                    runtimeHostPid: targetEntry?.runtimeHostPid ?? state.runtimeHostPid,
+                    runtimeControlSocket: targetEntry?.runtimeControlSocket ?? state.runtimeControlSocket,
+                    runtimeUser: targetEntry?.runtimeUser,
+                    initChannel: targetEntry?.initChannel ?? state.initChannel,
                     lastError: nil
                 )
                 try store.saveState(state)
@@ -2507,16 +2508,17 @@ public final class DaemonServer {
                         state.activeSessionCount = aliveForInstance.count
                         state.idleTimer = targetIdle
                     }
+                    let targetEntry = state.instances?.first(where: { $0.instance == instanceName })
                     upsertInstanceState(
                         &state,
                         instanceName: instanceName,
                         lifecycleState: .running,
                         activeSessionCount: aliveForInstance.count,
                         idleTimer: targetIdle,
-                        runtimeHostPid: state.runtimeHostPid,
-                        runtimeControlSocket: state.runtimeControlSocket,
-                        runtimeUser: state.runtimeUser,
-                        initChannel: state.initChannel,
+                        runtimeHostPid: targetEntry?.runtimeHostPid ?? state.runtimeHostPid,
+                        runtimeControlSocket: targetEntry?.runtimeControlSocket ?? state.runtimeControlSocket,
+                        runtimeUser: targetEntry?.runtimeUser,
+                        initChannel: targetEntry?.initChannel ?? state.initChannel,
                         lastError: nil
                     )
                     try store.saveState(state)
@@ -2548,6 +2550,7 @@ public final class DaemonServer {
         context.runtimeUser = nil
         context.lifecycleState = .stopped
         context.lastError = nil
+        context.clearBootError()
 
         do {
             try lock.withExclusiveLock {
@@ -2597,7 +2600,6 @@ public final class DaemonServer {
         runtimeMetadataURL = context.metadataURL
         vmRunner = context.vmRunner
         initClient = context.initClient
-        runtimeUser = context.runtimeUser
 
         do {
             try lock.withExclusiveLock {
@@ -2685,6 +2687,7 @@ public final class DaemonServer {
         if let activeInstanceName {
             let context = instanceRegistry.context(for: activeInstanceName)
             context.lifecycleState = .stopped
+            context.clearBootError()
         }
         let instanceName = currentRuntimeInstanceName()
         logRouter.logVM(
@@ -3425,7 +3428,7 @@ public final class DaemonServer {
                     idleTimer: state.idleTimer,
                     runtimeHostPid: state.runtimeHostPid,
                     runtimeControlSocket: state.runtimeControlSocket,
-                    runtimeUser: state.runtimeUser,
+                    runtimeUser: instanceRegistry.context(for: currentRuntimeInstanceName()).runtimeUser,
                     initChannel: initState,
                     lastError: nil
                 )

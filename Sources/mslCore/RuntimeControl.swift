@@ -11,6 +11,7 @@ public struct RuntimeControlRequest: Codable {
     // exec / pty / session ops
     public var argv: [String]?
     public var timeoutMs: Int?
+    public var runAsRoot: Bool?
     public var ptyId: String?
     public var dataBase64: String?
     public var rows: Int?
