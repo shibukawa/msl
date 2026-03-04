@@ -78,6 +78,12 @@ else
   msl_retry _bootstrap-install --name "$INSTANCE" alpine
 fi
 
+# NOTE:
+# MSL_RUNTIME_USER_ROOT is read by daemon startup context.
+# If daemon is already running with host-user context, root-required setup
+# commands (apk add) may fail. Force a daemon restart before root operations.
+"$MSL_BIN" --instance "$INSTANCE" --stop >/dev/null 2>&1 || true
+
 MSL_RUNTIME_USER_ROOT=1 msl_retry --instance "$INSTANCE" run true >/dev/null
 
 MSL_RUNTIME_USER_ROOT=1 msl_retry --instance "$INSTANCE" run sh -lc '

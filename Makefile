@@ -24,21 +24,48 @@ build-image:
 build-imagewriter-help:
 	@echo "Imagewriter (Alpine instance for storage image build)"
 	@echo ""
-	@echo "Setup builder instance:"
-	@echo "  make build-imagewriter"
+	@echo "Setup builder instance only:"
+	@echo "  make imagewriter-setup"
 	@echo "    # distros は事前にクリーンされ、_imagewriter を再作成します"
+	@echo ""
+	@echo "Build _imagewriter disk (two-stage ext4 -> btrfs):"
+	@echo "  make build-imagewriter"
+	@echo "    # setup 後に _imagewriter/disk.raw を two-stage で再生成します"
 	@echo ""
 	@echo "Optional env:"
 	@echo "  IMAGEWRITER_PACKAGES=\"btrfs-progs e2fsprogs util-linux tar zstd xz coreutils\""
 	@echo "  IMAGEWRITER_CLEAN_DISTROS=1   # default: 1 (cleanup before recreate)"
+	@echo "  IMAGEWRITER_FORCE_SETUP=1     # default for make build-imagewriter: 1"
+	@echo "  MSL_INIT_BINARY_PATH=...      # default: $$HOME/.msl-system/msl-init"
 	@echo "  MSL_BIN=./.build/debug/msl"
 
-build-imagewriter:
+imagewriter-setup:
 	IMAGEWRITER_INSTANCE="$(IMAGEWRITER_INSTANCE)" \
 	IMAGEWRITER_PACKAGES="$(IMAGEWRITER_PACKAGES)" \
 	IMAGEWRITER_CLEAN_DISTROS="$(IMAGEWRITER_CLEAN_DISTROS)" \
 	MSL_BIN="$(MSL)" \
 	./scripts/imagewriter-setup.sh
+
+build-imagewriter:
+	@MSL_HOME_DIR="$${MSL_HOME:-$$HOME}"; \
+	APP_SUPPORT_DIR="$$MSL_HOME_DIR/Library/Application Support/msl"; \
+	INSTANCE_NAME="$${IMAGEWRITER_INSTANCE:-_imagewriter}"; \
+	OUTPUT_PATH="$$APP_SUPPORT_DIR/distros/$$INSTANCE_NAME/disk.raw"; \
+	INIT_BIN_PATH="$${MSL_INIT_BINARY_PATH:-$$HOME/.msl-system/msl-init}"; \
+	IMAGE_SIZE_MB_VALUE="$${IMAGE_SIZE_MB:-2048}"; \
+	echo "building imagewriter disk via two-stage pipeline: $$OUTPUT_PATH"; \
+	echo "using init binary: $$INIT_BIN_PATH"; \
+	echo "using image size (MB): $$IMAGE_SIZE_MB_VALUE"; \
+	IMAGEWRITER_INSTANCE="$$INSTANCE_NAME" \
+	IMAGEWRITER_PACKAGES="$(IMAGEWRITER_PACKAGES)" \
+	IMAGEWRITER_CLEAN_DISTROS="$(IMAGEWRITER_CLEAN_DISTROS)" \
+	IMAGEWRITER_FORCE_SETUP="$${IMAGEWRITER_FORCE_SETUP:-1}" \
+	IMAGEWRITER_INIT_BINARY="$$INIT_BIN_PATH" \
+	IMAGE_SIZE_MB="$$IMAGE_SIZE_MB_VALUE" \
+	IMAGE_FS="btrfs" \
+	OUTPUT_RAW="$$OUTPUT_PATH" \
+	MSL_BIN="$(MSL)" \
+	./scripts/imagewriter-build.sh
 
 reset: reset-disk
 
