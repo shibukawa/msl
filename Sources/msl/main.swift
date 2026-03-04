@@ -230,13 +230,31 @@ do {
         try manager.runDefaultShell(instanceName: instanceName)
     }
 
-    if args.count == 1, args[0] == "--status" {
-        try manager.printStatus()
+    if !args.isEmpty, args[0] == "--status" {
+        let tail = Array(args.dropFirst())
+        var all = false
+        for token in tail {
+            if token == "--all" {
+                all = true
+                continue
+            }
+            fail("unknown option for --status: \(token)")
+        }
+        try manager.printStatus(instanceName: instanceName, all: all)
         Foundation.exit(0)
     }
 
-    if args.count == 1, args[0] == "--stop" {
-        try manager.stopVM()
+    if !args.isEmpty, args[0] == "--stop" {
+        let tail = Array(args.dropFirst())
+        var all = false
+        for token in tail {
+            if token == "--all" {
+                all = true
+                continue
+            }
+            fail("unknown option for --stop: \(token)")
+        }
+        try manager.stopVM(instanceName: instanceName, all: all)
         Foundation.exit(0)
     }
 
@@ -388,22 +406,22 @@ do {
 
     if args.first == "port" {
         if args.count == 1 {
-            try manager.listPortMappings()
+            try manager.listPortMappings(instanceName: instanceName)
             Foundation.exit(0)
         }
         let sub = args[1]
         if sub == "add", args.count == 3 {
             let mapping = String(args[2])
-            try manager.addPortMapping(mapping)
+            try manager.addPortMapping(mapping, instanceName: instanceName)
             Foundation.exit(0)
         }
         if sub == "ls", args.count == 2 {
-            try manager.listPortMappings()
+            try manager.listPortMappings(instanceName: instanceName)
             Foundation.exit(0)
         }
         if sub == "rm", args.count == 3 {
             let hostPortArg = String(args[2])
-            try manager.removePortMapping(hostPortArg)
+            try manager.removePortMapping(hostPortArg, instanceName: instanceName)
             Foundation.exit(0)
         }
         fail("unsupported port command. use: msl port [ls] | msl port add <hostPort>:<guestPort> | msl port rm <hostPort>")
@@ -435,7 +453,7 @@ do {
         Foundation.exit(exitCode)
     }
 
-    fail("unsupported arguments. use: msl | msl --list | msl --set-default <name> | msl install ... | msl uninstall ... | msl run <cmd> | msl cache fetch ... | msl cache status | msl config set storageCacheToggles.<name> <true|false> | msl config cache ls | msl config cache-sharing ls | msl init workspace [--force] | msl memory [status] | msl network [status]|reconcile | msl --status | msl --stop | msl port [ls]|add|rm")
+    fail("unsupported arguments. use: msl | msl --list | msl --set-default <name> | msl install ... | msl uninstall ... | msl run <cmd> | msl cache fetch ... | msl cache status | msl config set storageCacheToggles.<name> <true|false> | msl config cache ls | msl config cache-sharing ls | msl init workspace [--force] | msl memory [status] | msl network [status]|reconcile | msl --status [--all] | msl --stop [--all] | msl port [ls]|add|rm")
 } catch let err as MSLRuntimeError {
     fail(err.message, code: err.exitCode)
 } catch {

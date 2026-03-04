@@ -19,10 +19,15 @@ public final class DaemonServer {
     private let explicitInstanceName: String?
     private let distributionManager: DistributionManager
     private let defaultInstanceStore: DefaultInstanceStore
+    private let instanceRegistry = InstanceRuntimeRegistry()
+    private let launchOriginTracker = LaunchOriginTracker()
+    private let logRouter: RuntimeLogRouter
+    private var activeInstanceName: String?
 
     private var initClient: InitChannelClient?
     private var vmRunner: VirtualMachineRunner?
     private var controlServer: RuntimeControlServer?
+    private var eventBus: DaemonEventBus?
     private var forwarder: PortForwardingManager?
     private var runtimeUser: RuntimeUserState?
     private var runtimeMetadataURL: URL?
@@ -42,7 +47,7 @@ public final class DaemonServer {
     private var lastHostResolverSnapshotHash: String?
 
     private let stopSemaphore = DispatchSemaphore(value: 0)
-    private var idleTimerSource: DispatchSourceTimer?
+    private var idleTimerSources: [String: DispatchSourceTimer] = [:]
     private let idleTimerQueue = DispatchQueue(label: "msl.daemon.idle")
     private let memoryReclaimQueue = DispatchQueue(label: "msl.daemon.memory-reclaim")
     private let reclaimStateQueue = DispatchQueue(label: "msl.daemon.memory-reclaim.state")
@@ -338,6 +343,7 @@ public final class DaemonServer {
         self.distributionManager = DistributionManager(paths: paths, logger: logger, fileManager: fileManager)
         self.defaultInstanceStore = DefaultInstanceStore(paths: paths, fileManager: fileManager)
         self.sessions = SessionManager(store: store)
+        self.logRouter = RuntimeLogRouter(paths: paths, fileManager: fileManager)
         self.executablePath = executablePath
         self.explicitInstanceName = explicitInstanceName?.trimmingCharacters(in: .whitespacesAndNewlines)
     }
@@ -357,9 +363,19 @@ public final class DaemonServer {
             "elapsed_ms": String(max(0, daemonMonotonicMs() - bootstrapStartMs))
         ])
 
+        try performStartupRecovery()
+
         let metadataResolveStartMs = daemonMonotonicMs()
         let metadataURL = try resolveRuntimeMetadataURL(explicitInstanceName: explicitInstanceName)
         let instanceName = metadataURL.deletingLastPathComponent().lastPathComponent
+        let instanceContext = instanceRegistry.context(for: instanceName)
+        instanceContext.metadataURL = metadataURL
+        instanceContext.lifecycleState = .booting
+        activeInstanceName = instanceName
+        launchOriginTracker.record(
+            instance: instanceName,
+            callerCwd: ProcessInfo.processInfo.environment["MSL_DAEMON_LAUNCH_CWD"]
+        )
         let initialMetadata = try distributionManager.readOrRebuildInstanceMetadata(at: metadataURL)
         self.runtimeMetadataURL = metadataURL
         logger.log("startup_phase_duration_ms", fields: [
@@ -371,6 +387,12 @@ public final class DaemonServer {
             "instance": instanceName,
             "metadata": metadataURL.path
         ])
+        logRouter.logVM(
+            instance: instanceName,
+            event: "daemon_instance_boot_start",
+            fields: ["op": "boot", "result": "started"]
+        )
+        publishInstanceStateEvent(instance: instanceName, state: "Booting", reason: "boot_started")
         let bootProfile = try resolveBootProfile(metadataURL: metadataURL, instanceName: instanceName)
         logger.log("init_mode_selected", fields: [
             "instance": instanceName,
@@ -390,16 +412,38 @@ public final class DaemonServer {
             }
         )
         self.vmRunner = runner
+        instanceContext.vmRunner = runner
 
         let client: InitChannelClient
         do {
-            client = try runner.startVMForDaemon()
+            var resolvedClient: InitChannelClient?
+            try instanceContext.runBootOnce {
+                resolvedClient = try runner.startVMForDaemon()
+            }
+            guard let resolvedClient else {
+                throw MSLRuntimeError("instance boot did not provide init channel")
+            }
+            client = resolvedClient
         } catch {
             logger.log("daemon_vm_start_failed", fields: ["error": String(describing: error)])
+            logRouter.logVM(
+                instance: instanceName,
+                event: "daemon_instance_boot_failed",
+                fields: ["op": "boot", "result": "failed", "error": String(describing: error)]
+            )
+            publishInstanceStateEvent(
+                instance: instanceName,
+                state: "Error",
+                reason: "boot_failed",
+                error: String(describing: error)
+            )
+            instanceContext.lifecycleState = .error
+            instanceContext.lastError = String(describing: error)
             updateStateStopped()
             Foundation.exit(1)
         }
         self.initClient = client
+        instanceContext.initClient = client
 
         prepareHostShareRootMountOnStartup(client: client)
         syncGuestClockAtStartup(client: client, instanceName: instanceName)
@@ -423,6 +467,7 @@ public final class DaemonServer {
                 instanceName: instanceName
             )
             self.runtimeUser = resolved.runtimeUser
+            instanceContext.runtimeUser = resolved.runtimeUser
             try distributionManager.writeBootstrapResult(
                 metadataURL: metadataURL,
                 result: "success",
@@ -451,6 +496,19 @@ public final class DaemonServer {
                 "instance": instanceName,
                 "error": String(describing: error)
             ])
+            logRouter.logVM(
+                instance: instanceName,
+                event: "daemon_instance_boot_failed",
+                fields: ["op": "user_converge", "result": "failed", "error": String(describing: error)]
+            )
+            publishInstanceStateEvent(
+                instance: instanceName,
+                state: "Error",
+                reason: "user_converge_failed",
+                error: String(describing: error)
+            )
+            instanceContext.lifecycleState = .error
+            instanceContext.lastError = String(describing: error)
             runner.stopRunningVM()
             updateStateStopped()
             Foundation.exit(1)
@@ -476,16 +534,28 @@ public final class DaemonServer {
 
         // 5. Start control socket server
         let controlSocketPath = paths.runtimeControlSocketFile.path
+        let eventSocketPath = paths.runtimeEventSocketFile.path
         let server = RuntimeControlServer(socketPath: controlSocketPath) { [weak self] request in
             self?.handleControlRequest(request) ?? RuntimeControlResponse(ok: false, error: "daemon unavailable")
         }
         self.controlServer = server
+        let bus = DaemonEventBus(socketPath: eventSocketPath, logger: logger)
+        self.eventBus = bus
 
         do {
             try server.start()
             logger.log("daemon_control_socket_started", fields: ["path": controlSocketPath])
         } catch {
             logger.log("daemon_control_socket_failed", fields: ["error": String(describing: error)])
+            runner.stopRunningVM()
+            Foundation.exit(1)
+        }
+        do {
+            try bus.start()
+            logger.log("daemon_event_socket_started", fields: ["path": eventSocketPath])
+        } catch {
+            logger.log("daemon_event_socket_failed", fields: ["error": String(describing: error)])
+            server.stop()
             runner.stopRunningVM()
             Foundation.exit(1)
         }
@@ -498,15 +568,39 @@ public final class DaemonServer {
             state.lastTransitionEpochMs = nowEpochMs()
             state.runtimeHostPid = Int32(getpid())
             state.runtimeControlSocket = controlSocketPath
+            state.daemonHostPid = Int32(getpid())
+            state.daemonControlSocket = controlSocketPath
+            state.daemonEventSocket = eventSocketPath
             state.activeSessionCount = 0
             state.idleTimer = IdleTimerState(armed: false, deadlineEpochMs: nil)
             state.runtimeUser = runtimeUser
+            upsertInstanceState(
+                &state,
+                instanceName: instanceName,
+                lifecycleState: .running,
+                activeSessionCount: 0,
+                idleTimer: state.idleTimer,
+                runtimeHostPid: state.runtimeHostPid,
+                runtimeControlSocket: state.runtimeControlSocket,
+                runtimeUser: state.runtimeUser,
+                initChannel: state.initChannel,
+                lastError: nil
+            )
             try store.saveState(state)
         }
+        instanceContext.lifecycleState = .running
+        instanceContext.lastError = nil
+        instanceContext.clearBootError()
+        logRouter.logVM(
+            instance: instanceName,
+            event: "daemon_instance_boot_ready",
+            fields: ["op": "boot", "result": "ok"]
+        )
+        publishInstanceStateEvent(instance: instanceName, state: "Running", reason: "boot_ready")
 
         // 7. Arm initial idle timer (VM has no sessions yet)
         startAutoPortForwardLoop()
-        armIdleTimer()
+        armIdleTimer(for: instanceName)
         startMemoryReclaimLoop()
 
         logger.log("daemon_ready")
@@ -519,12 +613,152 @@ public final class DaemonServer {
         Foundation.exit(0)
     }
 
+    private func performStartupRecovery() throws {
+        let staleSessions = try sessions.reconcile()
+        if !staleSessions.isEmpty {
+            try sessions.clearAllAndTerminate()
+        }
+
+        let nowMs = nowEpochMs()
+        let summary = try lock.withExclusiveLock { () throws -> DaemonStartupStateNormalizationSummary in
+            var state = try store.loadState()
+            let result = DaemonStartupStateNormalizer.normalizeForDaemonStart(state: &state, nowMs: nowMs)
+            if result.legacyStateReset || !result.normalizedInstances.isEmpty {
+                try store.saveState(state)
+            }
+            return result
+        }
+
+        let controlSocketPath = paths.runtimeControlSocketFile.path
+        let eventSocketPath = paths.runtimeEventSocketFile.path
+        var removedSocket = false
+        if FileManager.default.fileExists(atPath: controlSocketPath) {
+            do {
+                try FileManager.default.removeItem(atPath: controlSocketPath)
+                removedSocket = true
+            } catch {
+                logger.log("daemon_startup_recovery_socket_remove_failed", fields: [
+                    "path": controlSocketPath,
+                    "error": String(describing: error)
+                ])
+            }
+        }
+        var removedEventSocket = false
+        if FileManager.default.fileExists(atPath: eventSocketPath) {
+            do {
+                try FileManager.default.removeItem(atPath: eventSocketPath)
+                removedEventSocket = true
+            } catch {
+                logger.log("daemon_startup_recovery_socket_remove_failed", fields: [
+                    "path": eventSocketPath,
+                    "error": String(describing: error)
+                ])
+            }
+        }
+
+        if !staleSessions.isEmpty || summary.legacyStateReset || !summary.normalizedInstances.isEmpty || removedSocket || removedEventSocket {
+            logger.log("daemon_startup_recovery_applied", fields: [
+                "stale_session_count": String(staleSessions.count),
+                "legacy_state_reset": summary.legacyStateReset ? "true" : "false",
+                "normalized_instances": summary.normalizedInstances.joined(separator: ","),
+                "removed_control_socket": removedSocket ? "true" : "false",
+                "removed_event_socket": removedEventSocket ? "true" : "false"
+            ])
+        } else {
+            logger.log("daemon_startup_recovery_clean")
+        }
+    }
+
+    private func publishInstanceStateEvent(
+        instance: String,
+        state: String,
+        reason: String,
+        error: String? = nil
+    ) {
+        var meta: [String: String] = ["reason": reason]
+        if let error, !error.isEmpty {
+            meta["error"] = error
+        }
+        eventBus?.publish(
+            topic: "instance_state",
+            type: "instance_state_changed",
+            instance: instance,
+            state: state,
+            meta: meta
+        )
+    }
+
     private func resolveRuntimeMetadataURL(explicitInstanceName: String?) throws -> URL {
         let configured = try defaultInstanceStore.loadDefaultInstanceName()
         return try distributionManager.runtimeMetadataURL(
             explicitInstanceName: explicitInstanceName,
             defaultInstanceName: configured
         )
+    }
+
+    private func currentRuntimeInstanceName() -> String {
+        if let activeInstanceName, !activeInstanceName.isEmpty {
+            return activeInstanceName
+        }
+        if let runtimeMetadataURL {
+            let name = runtimeMetadataURL.deletingLastPathComponent().lastPathComponent
+            if !name.isEmpty {
+                return name
+            }
+        }
+        return explicitInstanceName ?? "default"
+    }
+
+    private func legacyVMState(for lifecycle: InstanceLifecycleState) -> VMState {
+        switch lifecycle {
+        case .running:
+            return .running
+        default:
+            return .stopped
+        }
+    }
+
+    private func upsertInstanceState(
+        _ state: inout RuntimeState,
+        instanceName: String,
+        lifecycleState: InstanceLifecycleState,
+        activeSessionCount: Int,
+        idleTimer: IdleTimerState,
+        runtimeHostPid: Int32?,
+        runtimeControlSocket: String?,
+        runtimeUser: RuntimeUserState?,
+        initChannel: InitChannelState?,
+        lastError: String?
+    ) {
+        var entries = state.instances ?? []
+        if let existingIndex = entries.firstIndex(where: { $0.instance == instanceName }) {
+            entries[existingIndex].vmState = legacyVMState(for: lifecycleState)
+            entries[existingIndex].activeSessionCount = activeSessionCount
+            entries[existingIndex].idleTimer = idleTimer
+            entries[existingIndex].runtimeHostPid = runtimeHostPid
+            entries[existingIndex].runtimeControlSocket = runtimeControlSocket
+            entries[existingIndex].runtimeUser = runtimeUser
+            entries[existingIndex].initChannel = initChannel
+            entries[existingIndex].lastError = lastError
+            entries[existingIndex].lastTransitionEpochMs = nowEpochMs()
+        } else {
+            entries.append(
+                RuntimeInstanceState(
+                    instance: instanceName,
+                    vmState: legacyVMState(for: lifecycleState),
+                    activeSessionCount: activeSessionCount,
+                    idleTimer: idleTimer,
+                    runtimeUser: runtimeUser,
+                    initChannel: initChannel,
+                    runtimeHostPid: runtimeHostPid,
+                    runtimeControlSocket: runtimeControlSocket,
+                    lastError: lastError,
+                    lastTransitionEpochMs: nowEpochMs()
+                )
+            )
+        }
+        entries.sort { $0.instance < $1.instance }
+        state.instances = entries
     }
 
     private func syncGuestClockAtStartup(client: InitChannelClient, instanceName: String) {
@@ -589,7 +823,7 @@ public final class DaemonServer {
 
         // --- provision_status ---
         case "provision_status":
-            return handleProvisionStatus()
+            return handleProvisionStatus(request)
 
         // --- PTY ops ---
         case "pty_open":
@@ -605,7 +839,7 @@ public final class DaemonServer {
 
         // --- session management ---
         case "session_register":
-            return handleSessionRegister()
+            return handleSessionRegister(request)
         case "session_unregister":
             return handleSessionUnregister(request)
 
@@ -615,17 +849,23 @@ public final class DaemonServer {
         case "port_rm":
             return handlePortRemove(request)
         case "port_ls":
-            return handlePortList()
+            return handlePortList(request)
         case "memory_status":
-            return handleMemoryStatus()
+            return handleMemoryStatus(request)
         case "dns_reconcile":
             return handleDNSReconcile(request)
         case "dns_status":
-            return handleDNSStatus()
+            return handleDNSStatus(request)
+        case "instance_ls":
+            return handleInstanceList()
+        case "instance_status":
+            return handleInstanceStatus(request)
+        case "instance_stop":
+            return handleInstanceStop(request)
 
         // --- stop ---
         case "stop":
-            return handleStop()
+            return handleInstanceStop(request)
 
         default:
             return RuntimeControlResponse(ok: false, error: "unsupported op: \(request.op)")
@@ -634,11 +874,116 @@ public final class DaemonServer {
 
     // MARK: - exec
 
-    private func handleExec(_ request: RuntimeControlRequest) -> RuntimeControlResponse {
-        guard let client = initClient else {
-            return RuntimeControlResponse(ok: false, error: "init channel not available")
+    private func resolveTargetInstanceName(_ request: RuntimeControlRequest) -> String {
+        if let explicit = request.instance?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !explicit.isEmpty {
+            return explicit
         }
-        maybeReconcileDNSBeforeGuestOperation()
+        if let sessionID = request.sessionId,
+           let entry = sessionEntry(id: sessionID) {
+            return entry.instance
+        }
+        return currentRuntimeInstanceName()
+    }
+
+    private func resolveContext(for request: RuntimeControlRequest) -> InstanceRuntimeContext? {
+        let instanceName = resolveTargetInstanceName(request)
+        let context = instanceRegistry.context(for: instanceName)
+        if context.lifecycleState == .running {
+            return context
+        }
+        if instanceName == currentRuntimeInstanceName(), context.initClient != nil {
+            return context
+        }
+        return nil
+    }
+
+    private func ensureInstanceRunning(instanceName: String, callerCwd: String?) throws -> InstanceRuntimeContext {
+        let context = instanceRegistry.context(for: instanceName)
+        if context.lifecycleState == .running, context.initClient != nil {
+            return context
+        }
+
+        let metadataURL = try resolveRuntimeMetadataURL(explicitInstanceName: instanceName)
+        context.metadataURL = metadataURL
+        context.lifecycleState = .booting
+        launchOriginTracker.record(instance: instanceName, callerCwd: callerCwd)
+        publishInstanceStateEvent(instance: instanceName, state: "Booting", reason: "boot_started")
+
+        let bootProfile = try resolveBootProfile(metadataURL: metadataURL, instanceName: instanceName)
+        let runner = VirtualMachineRunner(
+            paths: paths,
+            metadataURL: metadataURL,
+            bootProfile: bootProfile,
+            logger: logger,
+            initProbeHandler: { [weak self] probe in
+                self?.updateInitChannelState(probe)
+            }
+        )
+        context.vmRunner = runner
+
+        do {
+            var resolvedClient: InitChannelClient?
+            try context.runBootOnce {
+                resolvedClient = try runner.startVMForDaemon()
+            }
+            guard let resolvedClient else {
+                throw MSLRuntimeError("instance boot did not provide init channel")
+            }
+            context.initClient = resolvedClient
+            prepareHostShareRootMountOnStartup(client: resolvedClient)
+            syncGuestClockAtStartup(client: resolvedClient, instanceName: instanceName)
+            let resolved = try convergeRuntimeUser(
+                client: resolvedClient,
+                metadataURL: metadataURL,
+                instanceName: instanceName
+            )
+            context.runtimeUser = resolved.runtimeUser
+            ensureGuestMSLCommandAlias(client: resolvedClient)
+
+            try lock.withExclusiveLock {
+                var state = try store.loadState()
+                upsertInstanceState(
+                    &state,
+                    instanceName: instanceName,
+                    lifecycleState: .running,
+                    activeSessionCount: state.instances?.first(where: { $0.instance == instanceName })?.activeSessionCount ?? 0,
+                    idleTimer: state.instances?.first(where: { $0.instance == instanceName })?.idleTimer
+                        ?? IdleTimerState(armed: false, deadlineEpochMs: nil),
+                    runtimeHostPid: Int32(getpid()),
+                    runtimeControlSocket: paths.runtimeControlSocketFile.path,
+                    runtimeUser: resolved.runtimeUser,
+                    initChannel: state.instances?.first(where: { $0.instance == instanceName })?.initChannel,
+                    lastError: nil
+                )
+                try store.saveState(state)
+            }
+            context.lifecycleState = .running
+            context.lastError = nil
+            publishInstanceStateEvent(instance: instanceName, state: "Running", reason: "boot_ready")
+            return context
+        } catch {
+            context.lifecycleState = .error
+            context.lastError = String(describing: error)
+            context.vmRunner?.stopRunningVM()
+            context.vmRunner = nil
+            context.initClient = nil
+            publishInstanceStateEvent(
+                instance: instanceName,
+                state: "Error",
+                reason: "boot_failed",
+                error: String(describing: error)
+            )
+            throw error
+        }
+    }
+
+    private func handleExec(_ request: RuntimeControlRequest) -> RuntimeControlResponse {
+        guard let context = resolveContext(for: request),
+              let client = context.initClient ?? initClient else {
+            return RuntimeControlResponse(ok: false, error: "instance_not_running")
+        }
+        maybeReconcileDNSBeforeGuestOperation(instanceName: context.instanceName)
         guard let argv = request.argv, !argv.isEmpty else {
             return RuntimeControlResponse(ok: false, error: "missing argv")
         }
@@ -648,6 +993,12 @@ public final class DaemonServer {
         // 0 means no timeout for guest exec.
         let timeoutMs = request.timeoutMs ?? 0
         logger.log("run_command_started", fields: ["argv0": argv[0]])
+        logSessionScopedEvent(
+            sessionID: request.sessionId,
+            fallbackInstance: context.instanceName,
+            event: "session_exec_started",
+            fields: ["op": "exec", "argv0": argv[0], "timeout_ms": String(timeoutMs)]
+        )
 
         do {
             let initReq = InitChannelRequest(
@@ -664,6 +1015,18 @@ public final class DaemonServer {
                     "argv0": argv[0],
                     "exit_code": String(initResp.exitCode ?? 0)
                 ])
+                logSessionScopedEvent(
+                    sessionID: request.sessionId,
+                    fallbackInstance: context.instanceName,
+                    event: "session_exec_completed",
+                    fields: [
+                        "op": "exec",
+                        "result": "ok",
+                        "exit_code": String(initResp.exitCode ?? 0),
+                        "stdout_len": String(initResp.stdout?.count ?? 0),
+                        "stderr_len": String(initResp.stderr?.count ?? 0)
+                    ]
+                )
                 return RuntimeControlResponse(
                     ok: true,
                     stdout: initResp.stdout,
@@ -672,6 +1035,12 @@ public final class DaemonServer {
                 )
             } else {
                 let errMsg = initResp.error?.message ?? "exec failed"
+                logSessionScopedEvent(
+                    sessionID: request.sessionId,
+                    fallbackInstance: context.instanceName,
+                    event: "session_exec_failed",
+                    fields: ["op": "exec", "result": "failed", "error": errMsg]
+                )
                 return RuntimeControlResponse(ok: false, error: errMsg)
             }
         } catch {
@@ -679,15 +1048,22 @@ public final class DaemonServer {
                 "argv0": argv[0],
                 "error": String(describing: error)
             ])
+            logSessionScopedEvent(
+                sessionID: request.sessionId,
+                fallbackInstance: context.instanceName,
+                event: "session_exec_failed",
+                fields: ["op": "exec", "result": "failed", "error": String(describing: error)]
+            )
             return RuntimeControlResponse(ok: false, error: String(describing: error))
         }
     }
 
     // MARK: - provision_status
 
-    private func handleProvisionStatus() -> RuntimeControlResponse {
-        guard let client = initClient else {
-            return RuntimeControlResponse(ok: false, error: "init channel not available")
+    private func handleProvisionStatus(_ request: RuntimeControlRequest) -> RuntimeControlResponse {
+        guard let context = resolveContext(for: request),
+              let client = context.initClient ?? initClient else {
+            return RuntimeControlResponse(ok: false, error: "instance_not_running")
         }
 
         do {
@@ -935,10 +1311,11 @@ public final class DaemonServer {
     // MARK: - PTY ops
 
     private func handlePtyOpen(_ request: RuntimeControlRequest) -> RuntimeControlResponse {
-        guard let client = initClient else {
-            return RuntimeControlResponse(ok: false, error: "init channel not available")
+        guard let context = resolveContext(for: request),
+              let client = context.initClient ?? initClient else {
+            return RuntimeControlResponse(ok: false, error: "instance_not_running")
         }
-        maybeReconcileDNSBeforeGuestOperation()
+        maybeReconcileDNSBeforeGuestOperation(instanceName: context.instanceName)
         let defaultShell = runtimeUser?.shell ?? "/bin/sh"
         let argv = request.argv ?? [defaultShell, "-l"]
         let ptyTarget = resolveCWDForwarding(argv: argv, cwd: request.cwd)
@@ -952,6 +1329,12 @@ public final class DaemonServer {
                 timeoutMs: 3_000
             )
             if resp.ok, let ptyId = resp.ptyId {
+                logSessionScopedEvent(
+                    sessionID: request.sessionId,
+                    fallbackInstance: context.instanceName,
+                    event: "session_pty_opened",
+                    fields: ["op": "pty_open", "pty_id": ptyId]
+                )
                 return RuntimeControlResponse(ok: true, ptyId: ptyId)
             }
             return RuntimeControlResponse(ok: false, error: resp.error?.message ?? "pty_open failed")
@@ -961,14 +1344,23 @@ public final class DaemonServer {
     }
 
     private func handlePtyRead(_ request: RuntimeControlRequest) -> RuntimeControlResponse {
-        guard let client = initClient else {
-            return RuntimeControlResponse(ok: false, error: "init channel not available")
+        guard let context = resolveContext(for: request),
+              let client = context.initClient ?? initClient else {
+            return RuntimeControlResponse(ok: false, error: "instance_not_running")
         }
         guard let ptyId = request.ptyId else {
             return RuntimeControlResponse(ok: false, error: "missing ptyId")
         }
         do {
             let resp = try client.ptyRead(ptyId: ptyId, timeoutMs: request.timeoutMs ?? 1_000)
+            if resp.ok, let payload = resp.dataBase64, !payload.isEmpty {
+                logSessionScopedEvent(
+                    sessionID: request.sessionId,
+                    fallbackInstance: context.instanceName,
+                    event: "session_pty_output",
+                    fields: ["op": "pty_read", "pty_id": ptyId, "bytes_b64_len": String(payload.count)]
+                )
+            }
             return RuntimeControlResponse(
                 ok: resp.ok,
                 error: resp.error?.message,
@@ -1148,8 +1540,9 @@ public final class DaemonServer {
     }
 
     private func handlePtyWrite(_ request: RuntimeControlRequest) -> RuntimeControlResponse {
-        guard let client = initClient else {
-            return RuntimeControlResponse(ok: false, error: "init channel not available")
+        guard let context = resolveContext(for: request),
+              let client = context.initClient ?? initClient else {
+            return RuntimeControlResponse(ok: false, error: "instance_not_running")
         }
         guard let ptyId = request.ptyId, let b64 = request.dataBase64,
               let data = Data(base64Encoded: b64) else {
@@ -1158,6 +1551,14 @@ public final class DaemonServer {
         noteGuestActivity()
         do {
             let resp = try client.ptyWrite(ptyId: ptyId, data: data, timeoutMs: request.timeoutMs ?? 2_000)
+            if resp.ok {
+                logSessionScopedEvent(
+                    sessionID: request.sessionId,
+                    fallbackInstance: context.instanceName,
+                    event: "session_pty_input",
+                    fields: ["op": "pty_write", "pty_id": ptyId, "bytes": String(data.count)]
+                )
+            }
             return RuntimeControlResponse(ok: resp.ok, error: resp.error?.message)
         } catch {
             return RuntimeControlResponse(ok: false, error: String(describing: error))
@@ -1165,14 +1566,23 @@ public final class DaemonServer {
     }
 
     private func handlePtyResize(_ request: RuntimeControlRequest) -> RuntimeControlResponse {
-        guard let client = initClient else {
-            return RuntimeControlResponse(ok: false, error: "init channel not available")
+        guard let context = resolveContext(for: request),
+              let client = context.initClient ?? initClient else {
+            return RuntimeControlResponse(ok: false, error: "instance_not_running")
         }
         guard let ptyId = request.ptyId, let rows = request.rows, let cols = request.cols else {
             return RuntimeControlResponse(ok: false, error: "missing ptyId/rows/cols")
         }
         do {
             let resp = try client.ptyResize(ptyId: ptyId, rows: rows, cols: cols, timeoutMs: 300)
+            if resp.ok {
+                logSessionScopedEvent(
+                    sessionID: request.sessionId,
+                    fallbackInstance: context.instanceName,
+                    event: "session_pty_resized",
+                    fields: ["op": "pty_resize", "pty_id": ptyId, "rows": String(rows), "cols": String(cols)]
+                )
+            }
             return RuntimeControlResponse(ok: resp.ok, error: resp.error?.message)
         } catch {
             return RuntimeControlResponse(ok: false, error: String(describing: error))
@@ -1180,14 +1590,21 @@ public final class DaemonServer {
     }
 
     private func handlePtyClose(_ request: RuntimeControlRequest) -> RuntimeControlResponse {
-        guard let client = initClient else {
-            return RuntimeControlResponse(ok: false, error: "init channel not available")
+        guard let context = resolveContext(for: request),
+              let client = context.initClient ?? initClient else {
+            return RuntimeControlResponse(ok: false, error: "instance_not_running")
         }
         guard let ptyId = request.ptyId else {
             return RuntimeControlResponse(ok: false, error: "missing ptyId")
         }
         do {
             let resp = try client.ptyClose(ptyId: ptyId, timeoutMs: 500)
+            logSessionScopedEvent(
+                sessionID: request.sessionId,
+                fallbackInstance: context.instanceName,
+                event: "session_pty_closed",
+                fields: ["op": "pty_close", "pty_id": ptyId, "result": resp.ok ? "ok" : "failed"]
+            )
             return RuntimeControlResponse(ok: resp.ok, error: resp.error?.message, exitCode: resp.exitCode)
         } catch {
             return RuntimeControlResponse(ok: false, error: String(describing: error))
@@ -1196,20 +1613,84 @@ public final class DaemonServer {
 
     // MARK: - Session Management
 
-    private func handleSessionRegister() -> RuntimeControlResponse {
+    private func sessionEntry(id: String) -> SessionEntry? {
+        do {
+            return try lock.withExclusiveLock(timeoutSec: 2) {
+                try store.loadSessions().first { $0.id == id }
+            }
+        } catch {
+            return nil
+        }
+    }
+
+    private func logSessionScopedEvent(
+        sessionID: String?,
+        fallbackInstance: String,
+        event: String,
+        fields: [String: String] = [:]
+    ) {
+        guard let sessionID, !sessionID.isEmpty else {
+            logRouter.logVM(instance: fallbackInstance, event: event, fields: fields)
+            return
+        }
+        if let entry = sessionEntry(id: sessionID) {
+            if let logPath = entry.logPath, !logPath.isEmpty {
+                logRouter.appendToLogPath(logPath, instance: entry.instance, sessionID: sessionID, event: event, fields: fields)
+            } else {
+                logRouter.logSession(instance: entry.instance, sessionID: sessionID, event: event, fields: fields)
+            }
+            return
+        }
+        logRouter.logVM(instance: fallbackInstance, event: event, fields: fields)
+    }
+
+    private func handleSessionRegister(_ request: RuntimeControlRequest) -> RuntimeControlResponse {
         let sessionID = UUID().uuidString
         do {
+            let instanceName = resolveTargetInstanceName(request)
+            _ = try ensureInstanceRunning(instanceName: instanceName, callerCwd: request.callerCwd)
+            let logPath = try logRouter.ensureSessionLogFile(instance: instanceName, sessionID: sessionID).path
             try lock.withExclusiveLock {
-                let session = SessionEntry(id: sessionID, pid: Int32(getpid()), startedAtEpochMs: nowEpochMs())
+                let session = SessionEntry(
+                    id: sessionID,
+                    instance: instanceName,
+                    logPath: logPath,
+                    pid: Int32(getpid()),
+                    startedAtEpochMs: nowEpochMs()
+                )
                 let updated = try sessions.addSession(session)
+                let instanceSessionCount = updated.filter { $0.instance == instanceName }.count
                 var state = try store.loadState()
-                state.activeSessionCount = updated.count
-                state.idleTimer = IdleTimerState(armed: false, deadlineEpochMs: nil)
+                var targetIdleTimer = state.instances?.first(where: { $0.instance == instanceName })?.idleTimer
+                    ?? IdleTimerState(armed: false, deadlineEpochMs: nil)
+                if instanceName == currentRuntimeInstanceName() {
+                    state.activeSessionCount = instanceSessionCount
+                    targetIdleTimer = IdleTimerState(armed: false, deadlineEpochMs: nil)
+                    state.idleTimer = targetIdleTimer
+                }
+                upsertInstanceState(
+                    &state,
+                    instanceName: instanceName,
+                    lifecycleState: .running,
+                    activeSessionCount: instanceSessionCount,
+                    idleTimer: targetIdleTimer,
+                    runtimeHostPid: state.runtimeHostPid,
+                    runtimeControlSocket: state.runtimeControlSocket,
+                    runtimeUser: state.runtimeUser,
+                    initChannel: state.initChannel,
+                    lastError: nil
+                )
                 try store.saveState(state)
             }
             noteGuestActivity()
-            disarmIdleTimer()
-            logger.log("daemon_client_connected", fields: ["session": sessionID])
+            disarmIdleTimer(for: instanceName)
+            logger.log("daemon_client_connected", fields: ["session": sessionID, "instance": instanceName])
+            logRouter.logSession(
+                instance: instanceName,
+                sessionID: sessionID,
+                event: "daemon_session_log_opened",
+                fields: ["op": "session_register", "result": "ok", "log_path": logPath]
+            )
             return RuntimeControlResponse(ok: true, sessionId: sessionID)
         } catch {
             return RuntimeControlResponse(ok: false, error: String(describing: error))
@@ -1220,26 +1701,56 @@ public final class DaemonServer {
         guard let sessionID = request.sessionId else {
             return RuntimeControlResponse(ok: false, error: "missing sessionId")
         }
+        let detachedEntry = sessionEntry(id: sessionID)
+        let targetInstance = detachedEntry?.instance ?? resolveTargetInstanceName(request)
         do {
             let remainingCount: Int = try lock.withExclusiveLock {
                 let updated = try sessions.removeSession(id: sessionID)
+                let remainingForInstance = updated.filter { $0.instance == targetInstance }.count
                 var state = try store.loadState()
-                state.activeSessionCount = updated.count
-                if updated.isEmpty {
-                    let timeoutMs = resolveIdleTimeoutMs()
-                    let deadline = nowEpochMs() + timeoutMs
-                    state.idleTimer = IdleTimerState(armed: true, deadlineEpochMs: deadline)
-                } else {
-                    state.idleTimer = IdleTimerState(armed: false, deadlineEpochMs: nil)
+                var targetIdleTimer = state.instances?.first(where: { $0.instance == targetInstance })?.idleTimer
+                    ?? IdleTimerState(armed: false, deadlineEpochMs: nil)
+                if targetInstance == currentRuntimeInstanceName() {
+                    state.activeSessionCount = remainingForInstance
+                    if remainingForInstance == 0 {
+                        let timeoutMs = resolveIdleTimeoutMs()
+                        let deadline = nowEpochMs() + timeoutMs
+                        state.idleTimer = IdleTimerState(armed: true, deadlineEpochMs: deadline)
+                        targetIdleTimer = state.idleTimer
+                    } else {
+                        state.idleTimer = IdleTimerState(armed: false, deadlineEpochMs: nil)
+                        targetIdleTimer = state.idleTimer
+                    }
                 }
+                upsertInstanceState(
+                    &state,
+                    instanceName: targetInstance,
+                    lifecycleState: .running,
+                    activeSessionCount: remainingForInstance,
+                    idleTimer: targetIdleTimer,
+                    runtimeHostPid: state.runtimeHostPid,
+                    runtimeControlSocket: state.runtimeControlSocket,
+                    runtimeUser: state.runtimeUser,
+                    initChannel: state.initChannel,
+                    lastError: nil
+                )
                 try store.saveState(state)
-                return updated.count
+                return remainingForInstance
             }
-            logger.log("daemon_client_disconnected", fields: ["session": sessionID])
+            logger.log("daemon_client_disconnected", fields: ["session": sessionID, "instance": targetInstance])
+            if let detachedEntry, let logPath = detachedEntry.logPath, !logPath.isEmpty {
+                logRouter.appendToLogPath(
+                    logPath,
+                    instance: detachedEntry.instance,
+                    sessionID: sessionID,
+                    event: "daemon_session_log_closed",
+                    fields: ["op": "session_unregister", "result": "ok"]
+                )
+            }
 
             // Check if we should arm idle timer
-            if remainingCount == 0 {
-                armIdleTimer()
+            if remainingCount == 0 && targetInstance == currentRuntimeInstanceName() {
+                armIdleTimer(for: targetInstance)
             }
 
             return RuntimeControlResponse(ok: true)
@@ -1255,7 +1766,11 @@ public final class DaemonServer {
               let fw = forwarder else {
             return RuntimeControlResponse(ok: false, error: "missing hostPort/guestPort")
         }
-        let response = fw.add(PortMapping(hostPort: hostPort, guestPort: guestPort))
+        let instanceName = resolveTargetInstanceName(request)
+        guard instanceName == currentRuntimeInstanceName() else {
+            return RuntimeControlResponse(ok: false, error: "instance_not_running: \(instanceName)")
+        }
+        let response = fw.add(PortMapping(hostPort: hostPort, guestPort: guestPort, instance: instanceName))
         schedulePortMappingsRefresh(reason: "manual_add")
         return response
     }
@@ -1264,28 +1779,58 @@ public final class DaemonServer {
         guard let hostPort = request.hostPort, let fw = forwarder else {
             return RuntimeControlResponse(ok: false, error: "missing hostPort")
         }
-        let response = fw.remove(hostPort: hostPort)
+        let instanceName = resolveTargetInstanceName(request)
+        guard instanceName == currentRuntimeInstanceName() else {
+            return RuntimeControlResponse(ok: false, error: "instance_not_running: \(instanceName)")
+        }
+        let response = fw.remove(hostPort: hostPort, ownerInstance: instanceName)
         schedulePortMappingsRefresh(reason: "manual_remove")
         return response
     }
 
-    private func handlePortList() -> RuntimeControlResponse {
-        guard let fw = forwarder else {
-            return RuntimeControlResponse(ok: false, error: "forwarder unavailable")
+    private func handlePortList(_ request: RuntimeControlRequest) -> RuntimeControlResponse {
+        let instanceName = resolveTargetInstanceName(request)
+        if instanceName == currentRuntimeInstanceName() {
+            guard let fw = forwarder else {
+                return RuntimeControlResponse(ok: false, error: "forwarder unavailable")
+            }
+            let snapshot = currentEffectivePortMappingsSnapshot()
+            return fw.list(mappings: snapshot.mappings)
         }
-        let snapshot = currentEffectivePortMappingsSnapshot()
-        return fw.list(mappings: snapshot.mappings)
+
+        do {
+            let mappings = try lock.withExclusiveLock(timeoutSec: 1) {
+                try store.loadPortMappings().mappings
+                    .filter { $0.instance == instanceName }
+                    .sorted { $0.hostPort < $1.hostPort }
+            }
+            let items = mappings.map { mapping in
+                RuntimePortStatusItem(
+                    instance: mapping.instance,
+                    hostPort: mapping.hostPort,
+                    guestPort: mapping.guestPort,
+                    bindAddress: mapping.bindAddress,
+                    active: false,
+                    ownerInstance: nil,
+                    error: nil
+                )
+            }
+            return RuntimeControlResponse(ok: true, items: items)
+        } catch {
+            return RuntimeControlResponse(ok: false, error: String(describing: error))
+        }
     }
 
-    private func handleMemoryStatus() -> RuntimeControlResponse {
-        guard let _ = initClient else {
-            return RuntimeControlResponse(ok: false, error: "init channel not available")
+    private func handleMemoryStatus(_ request: RuntimeControlRequest) -> RuntimeControlResponse {
+        guard let context = resolveContext(for: request),
+              let client = context.initClient ?? initClient else {
+            return RuntimeControlResponse(ok: false, error: "instance_not_running")
         }
-        guard let balloon = vmRunner?.memoryBalloonRuntimeStats() else {
+        guard let balloon = context.vmRunner?.memoryBalloonRuntimeStats() else {
             return RuntimeControlResponse(ok: false, error: "balloon stats unavailable")
         }
 
-        let reclaim = readGuestMemoryReclaimStats()
+        let reclaim = readGuestMemoryReclaimStats(client: client)
         return RuntimeControlResponse(ok: true, meta: [
             "allocated_bytes": String(balloon.allocatedBytes),
             "max_bytes": String(balloon.maxBytes),
@@ -1297,19 +1842,27 @@ public final class DaemonServer {
         ])
     }
 
-    private func handleDNSStatus() -> RuntimeControlResponse {
-        dnsStateLock.lock()
-        defer { dnsStateLock.unlock() }
-        return RuntimeControlResponse(ok: true, meta: runtimeDNSMeta)
+    private func handleDNSStatus(_ request: RuntimeControlRequest) -> RuntimeControlResponse {
+        let instanceName = resolveTargetInstanceName(request)
+        let context = instanceRegistry.context(for: instanceName)
+        let meta = context.runtimeDNSMeta.isEmpty ? runtimeDNSMeta : context.runtimeDNSMeta
+        return RuntimeControlResponse(ok: true, meta: meta)
     }
 
     private func handleDNSReconcile(_ request: RuntimeControlRequest) -> RuntimeControlResponse {
         dnsReconcileLock.lock()
         defer { dnsReconcileLock.unlock() }
-        guard let client = initClient else {
-            return RuntimeControlResponse(ok: false, error: "init channel not available")
+        let instanceName = resolveTargetInstanceName(request)
+        guard let context = resolveContext(for: RuntimeControlRequest(
+            op: request.op,
+            instance: instanceName,
+            sessionId: request.sessionId
+        )), let client = context.initClient ?? initClient else {
+            return RuntimeControlResponse(ok: false, error: "instance_not_running")
         }
-        guard let metadataURL = runtimeMetadataURL else {
+        let metadataURL = context.metadataURL
+            ?? (try? resolveRuntimeMetadataURL(explicitInstanceName: instanceName))
+        guard let metadataURL else {
             return RuntimeControlResponse(ok: false, error: "runtime metadata unavailable")
         }
 
@@ -1338,6 +1891,7 @@ public final class DaemonServer {
             if policy.mode == .unmanaged {
                 lastHostResolverSnapshotHash = snapshot.hash
                 return updateDNSStateAndRespond(
+                    instanceName: instanceName,
                     mode: policy.mode.rawValue,
                     status: "healthy",
                     action: "policy_skip",
@@ -1375,6 +1929,7 @@ public final class DaemonServer {
 
             if !applyResult {
                 return updateDNSStateAndRespond(
+                    instanceName: instanceName,
                     mode: policy.mode.rawValue,
                     status: "failed",
                     action: "applied",
@@ -1390,6 +1945,7 @@ public final class DaemonServer {
             let transportReady = ensureGuestTransportReadyViaExec(client: client)
             if !transportReady.ok {
                 return updateDNSStateAndRespond(
+                    instanceName: instanceName,
                     mode: policy.mode.rawValue,
                     status: "degraded",
                     action: "applied",
@@ -1427,6 +1983,7 @@ public final class DaemonServer {
                     "error": healthError ?? "dns healthcheck failed"
                 ])
                 return updateDNSStateAndRespond(
+                    instanceName: instanceName,
                     mode: policy.mode.rawValue,
                     status: "degraded",
                     action: "applied",
@@ -1440,6 +1997,7 @@ public final class DaemonServer {
             }
 
             return updateDNSStateAndRespond(
+                instanceName: instanceName,
                 mode: policy.mode.rawValue,
                 status: "healthy",
                 action: "applied",
@@ -1456,6 +2014,7 @@ public final class DaemonServer {
                 "error": String(describing: error)
             ])
             return updateDNSStateAndRespond(
+                instanceName: instanceName,
                 mode: "unknown",
                 status: "failed",
                 action: "-",
@@ -1470,6 +2029,7 @@ public final class DaemonServer {
     }
 
     private func updateDNSStateAndRespond(
+        instanceName: String,
         mode: String,
         status: String,
         action: String,
@@ -1497,9 +2057,13 @@ public final class DaemonServer {
         if let error, !error.isEmpty {
             meta["error"] = error
         }
-        dnsStateLock.lock()
-        runtimeDNSMeta = meta
-        dnsStateLock.unlock()
+        let context = instanceRegistry.context(for: instanceName)
+        context.runtimeDNSMeta = meta
+        if instanceName == currentRuntimeInstanceName() {
+            dnsStateLock.lock()
+            runtimeDNSMeta = meta
+            dnsStateLock.unlock()
+        }
         if !snapshotHash.isEmpty {
             lastHostResolverSnapshotHash = snapshotHash
         }
@@ -1529,7 +2093,11 @@ public final class DaemonServer {
         return "dns_resolution"
     }
 
-    private func currentDNSMetaSnapshot() -> [String: String] {
+    private func currentDNSMetaSnapshot(instanceName: String) -> [String: String] {
+        let context = instanceRegistry.context(for: instanceName)
+        if !context.runtimeDNSMeta.isEmpty {
+            return context.runtimeDNSMeta
+        }
         dnsStateLock.lock()
         defer { dnsStateLock.unlock() }
         return runtimeDNSMeta
@@ -1627,8 +2195,8 @@ public final class DaemonServer {
         }
     }
 
-    private func maybeReconcileDNSBeforeGuestOperation() {
-        let meta = currentDNSMetaSnapshot()
+    private func maybeReconcileDNSBeforeGuestOperation(instanceName: String) {
+        let meta = currentDNSMetaSnapshot(instanceName: instanceName)
         if meta["dns_mode"] == "unmanaged" {
             return
         }
@@ -1637,11 +2205,11 @@ public final class DaemonServer {
         let snapshot = HostResolverSnapshotProvider().capture()
         let lastHash = meta["snapshot_hash"] ?? ""
         if !lastHash.isEmpty && snapshot.hash != lastHash {
-            _ = handleDNSReconcile(RuntimeControlRequest(op: "dns_reconcile", dnsSource: "stale_guard"))
+            _ = handleDNSReconcile(RuntimeControlRequest(op: "dns_reconcile", instance: instanceName, dnsSource: "stale_guard"))
             return
         }
         if now - lastReconcileMs >= 60_000 {
-            _ = handleDNSReconcile(RuntimeControlRequest(op: "dns_reconcile", dnsSource: "stale_guard"))
+            _ = handleDNSReconcile(RuntimeControlRequest(op: "dns_reconcile", instance: instanceName, dnsSource: "stale_guard"))
         }
     }
 
@@ -1651,7 +2219,8 @@ public final class DaemonServer {
         source.schedule(deadline: .now() + .seconds(5), repeating: .seconds(5))
         source.setEventHandler { [weak self] in
             guard let self else { return }
-            let meta = self.currentDNSMetaSnapshot()
+            let instanceName = self.currentRuntimeInstanceName()
+            let meta = self.currentDNSMetaSnapshot(instanceName: instanceName)
             if meta["dns_mode"] == "unmanaged" {
                 return
             }
@@ -1661,7 +2230,7 @@ public final class DaemonServer {
                 return
             }
             if self.lastHostResolverSnapshotHash != snapshot.hash {
-                _ = self.handleDNSReconcile(RuntimeControlRequest(op: "dns_reconcile", dnsSource: "host_change"))
+                _ = self.handleDNSReconcile(RuntimeControlRequest(op: "dns_reconcile", instance: instanceName, dnsSource: "host_change"))
             }
         }
         source.resume()
@@ -1739,55 +2308,229 @@ public final class DaemonServer {
         }
     }
 
-    // MARK: - Stop
+    // MARK: - Instance Status / Stop
 
-    private func handleStop() -> RuntimeControlResponse {
-        logger.log("daemon_stopping", fields: ["reason": "explicit_stop"])
-        // Signal the daemon to shut down after sending this response
+    private func handleInstanceList() -> RuntimeControlResponse {
+        do {
+            let state = try lock.withExclusiveLock(timeoutSec: 2) { try store.loadState() }
+            let fallback = RuntimeInstanceState(
+                instance: state.distro,
+                vmState: state.vmState,
+                activeSessionCount: state.activeSessionCount,
+                idleTimer: state.idleTimer,
+                runtimeUser: state.runtimeUser,
+                initChannel: state.initChannel,
+                runtimeHostPid: state.runtimeHostPid,
+                runtimeControlSocket: state.runtimeControlSocket,
+                lastError: nil,
+                lastTransitionEpochMs: state.lastTransitionEpochMs
+            )
+            let entries = (state.instances?.isEmpty == false ? state.instances! : [fallback]).sorted {
+                $0.instance < $1.instance
+            }
+            let items = entries.map { entry in
+                RuntimeInstanceStatusItem(
+                    instance: entry.instance,
+                    vmState: entry.vmState.rawValue,
+                    activeSessionCount: entry.activeSessionCount,
+                    idleTimerArmed: entry.idleTimer.armed,
+                    idleDeadlineEpochMs: entry.idleTimer.deadlineEpochMs,
+                    runtimeHostPid: entry.runtimeHostPid,
+                    lastError: entry.lastError,
+                    lastTransitionEpochMs: entry.lastTransitionEpochMs
+                )
+            }
+            return RuntimeControlResponse(ok: true, instances: items)
+        } catch {
+            return RuntimeControlResponse(ok: false, error: String(describing: error))
+        }
+    }
+
+    private func handleInstanceStatus(_ request: RuntimeControlRequest) -> RuntimeControlResponse {
+        let list = handleInstanceList()
+        guard list.ok else { return list }
+        guard let instance = request.instance?.trimmingCharacters(in: .whitespacesAndNewlines), !instance.isEmpty else {
+            return RuntimeControlResponse(ok: false, error: "instance_required")
+        }
+        let matched = list.instances?.filter { $0.instance == instance } ?? []
+        if matched.isEmpty {
+            return RuntimeControlResponse(ok: false, error: "instance_not_found: \(instance)")
+        }
+        return RuntimeControlResponse(ok: true, instances: matched)
+    }
+
+    private func handleInstanceStop(_ request: RuntimeControlRequest) -> RuntimeControlResponse {
+        let instanceName = currentRuntimeInstanceName()
+        let running = runningInstanceNames()
+
+        if request.all == true {
+            if running.isEmpty {
+                return RuntimeControlResponse(ok: true, meta: ["stopped_count": "0"])
+            }
+            for target in running where target != instanceName {
+                let context = instanceRegistry.context(for: target)
+                guard context.lifecycleState == .running else { continue }
+                disarmIdleTimer(for: target)
+                stopInstanceRuntime(instanceName: target, reason: "explicit_stop_all")
+            }
+            if instanceRegistry.context(for: instanceName).lifecycleState == .running {
+                return scheduleDaemonStop(reason: "explicit_stop_all", resolvedInstance: instanceName)
+            }
+            stopSemaphore.signal()
+            return RuntimeControlResponse(ok: true, meta: ["stopped_count": String(running.count)])
+        }
+
+        switch StopTargetResolver.resolve(
+            explicitInstance: request.instance,
+            runningInstances: running,
+            callerCwd: request.callerCwd,
+            launchOrigins: launchOriginTracker.snapshot()
+        ) {
+        case .success(let target):
+            logger.log("daemon_stop_target_resolved", fields: [
+                "target": target,
+                "caller_cwd": request.callerCwd ?? "",
+                "running": running.joined(separator: ",")
+            ])
+            if target != instanceName {
+                let context = instanceRegistry.context(for: target)
+                guard context.lifecycleState == .running else {
+                    return RuntimeControlResponse(ok: false, error: "instance_not_running: \(target)")
+                }
+                disarmIdleTimer(for: target)
+                stopInstanceRuntime(instanceName: target, reason: "explicit_stop")
+                return RuntimeControlResponse(ok: true, meta: ["stopped_instance": target])
+            }
+            let remainingRunning = running.filter { $0 != target }
+            if !remainingRunning.isEmpty {
+                disarmIdleTimer(for: target)
+                stopInstanceRuntime(instanceName: target, reason: "explicit_stop")
+                if let promoted = remainingRunning.first(where: { instanceRegistry.context(for: $0).lifecycleState == .running }) {
+                    promotePrimaryRuntime(to: promoted)
+                }
+                return RuntimeControlResponse(ok: true, meta: ["stopped_instance": target])
+            }
+            return scheduleDaemonStop(reason: "explicit_stop", resolvedInstance: target)
+
+        case .failure(.noRunningInstances):
+            return RuntimeControlResponse(ok: true, meta: ["stopped_count": "0"])
+
+        case .failure(.targetNotRunning(let target)):
+            return RuntimeControlResponse(ok: false, error: "instance_not_running: \(target)")
+
+        case .failure(.ambiguous(let candidates)):
+            logger.log("daemon_stop_target_ambiguous", fields: [
+                "caller_cwd": request.callerCwd ?? "",
+                "candidates": candidates.joined(separator: ",")
+            ])
+            return RuntimeControlResponse(
+                ok: false,
+                error: "stop_target_ambiguous: specify --instance (candidates=\(candidates.joined(separator: ",")))"
+            )
+        }
+    }
+
+    private func scheduleDaemonStop(reason: String, resolvedInstance: String) -> RuntimeControlResponse {
+        logger.log("daemon_stopping", fields: [
+            "reason": reason,
+            "instance": resolvedInstance
+        ])
+        publishInstanceStateEvent(instance: resolvedInstance, state: "Stopping", reason: reason)
+        logRouter.logVM(
+            instance: resolvedInstance,
+            event: "daemon_instance_stop_start",
+            fields: ["op": "stop", "result": "started", "reason": reason]
+        )
         DispatchQueue.global().asyncAfter(deadline: .now() + .milliseconds(100)) { [weak self] in
             self?.stopSemaphore.signal()
         }
-        return RuntimeControlResponse(ok: true)
+        return RuntimeControlResponse(ok: true, meta: ["stopped_instance": resolvedInstance])
+    }
+
+    private func runningInstanceNames() -> [String] {
+        do {
+            let state = try lock.withExclusiveLock(timeoutSec: 2) { try store.loadState() }
+            var result = Set<String>()
+            if state.vmState == .running {
+                result.insert(state.distro)
+            }
+            for entry in state.instances ?? [] where entry.vmState == .running {
+                result.insert(entry.instance)
+            }
+            return Array(result).sorted()
+        } catch {
+            if let activeInstanceName, instanceRegistry.context(for: activeInstanceName).lifecycleState == .running {
+                return [activeInstanceName]
+            }
+            return []
+        }
     }
 
     // MARK: - Idle Timer
 
-    private func armIdleTimer() {
-        disarmIdleTimer()
+    private func armIdleTimer(for instanceName: String) {
+        disarmIdleTimer(for: instanceName)
         let timeoutMs = resolveIdleTimeoutMs()
-        logger.log("idle_timer_armed", fields: ["timeout_ms": String(timeoutMs)])
+        logger.log("idle_timer_armed", fields: ["timeout_ms": String(timeoutMs), "instance": instanceName])
 
         let source = DispatchSource.makeTimerSource(queue: idleTimerQueue)
         source.schedule(deadline: .now() + .milliseconds(Int(timeoutMs)))
         source.setEventHandler { [weak self] in
-            self?.handleIdleExpiry()
+            self?.handleIdleExpiry(instanceName: instanceName)
         }
         source.resume()
-        idleTimerSource = source
+        idleTimerSources[instanceName] = source
     }
 
-    private func disarmIdleTimer() {
-        idleTimerSource?.cancel()
-        idleTimerSource = nil
+    private func disarmIdleTimer(for instanceName: String) {
+        idleTimerSources[instanceName]?.cancel()
+        idleTimerSources[instanceName] = nil
     }
 
-    private func handleIdleExpiry() {
+    private func disarmAllIdleTimers() {
+        for (_, source) in idleTimerSources {
+            source.cancel()
+        }
+        idleTimerSources.removeAll()
+    }
+
+    private func handleIdleExpiry(instanceName: String) {
         do {
             let shouldStop = try lock.withExclusiveLock { () -> Bool in
                 let alive = try sessions.reconcile()
-                if !alive.isEmpty {
+                let aliveForInstance = alive.filter { $0.instance == instanceName }
+                if !aliveForInstance.isEmpty {
                     // Sessions appeared, cancel
                     var state = try store.loadState()
-                    state.activeSessionCount = alive.count
-                    state.idleTimer = IdleTimerState(armed: false, deadlineEpochMs: nil)
+                    let targetIdle = IdleTimerState(armed: false, deadlineEpochMs: nil)
+                    if instanceName == currentRuntimeInstanceName() {
+                        state.activeSessionCount = aliveForInstance.count
+                        state.idleTimer = targetIdle
+                    }
+                    upsertInstanceState(
+                        &state,
+                        instanceName: instanceName,
+                        lifecycleState: .running,
+                        activeSessionCount: aliveForInstance.count,
+                        idleTimer: targetIdle,
+                        runtimeHostPid: state.runtimeHostPid,
+                        runtimeControlSocket: state.runtimeControlSocket,
+                        runtimeUser: state.runtimeUser,
+                        initChannel: state.initChannel,
+                        lastError: nil
+                    )
                     try store.saveState(state)
                     return false
                 }
                 return true
             }
             if shouldStop {
-                logger.log("daemon_stopping", fields: ["reason": "idle_timeout"])
-                stopSemaphore.signal()
+                if instanceName == currentRuntimeInstanceName() {
+                    logger.log("daemon_stopping", fields: ["reason": "idle_timeout", "instance": instanceName])
+                    stopSemaphore.signal()
+                } else {
+                    stopInstanceRuntime(instanceName: instanceName, reason: "idle_timeout")
+                }
             }
         } catch {
             logger.log("idle_timer_check_error", fields: ["error": String(describing: error)])
@@ -1796,13 +2539,112 @@ public final class DaemonServer {
 
     // MARK: - Shutdown
 
+    private func stopInstanceRuntime(instanceName: String, reason: String) {
+        let context = instanceRegistry.context(for: instanceName)
+        context.lifecycleState = .stopping
+        context.vmRunner?.stopRunningVM()
+        context.vmRunner = nil
+        context.initClient = nil
+        context.runtimeUser = nil
+        context.lifecycleState = .stopped
+        context.lastError = nil
+
+        do {
+            try lock.withExclusiveLock {
+                var state = try store.loadState()
+                let idle = IdleTimerState(armed: false, deadlineEpochMs: nil)
+                if instanceName == currentRuntimeInstanceName() {
+                    state.vmState = .stopped
+                    state.activeSessionCount = 0
+                    state.idleTimer = idle
+                    state.lastTransitionEpochMs = nowEpochMs()
+                    state.runtimeHostPid = nil
+                    state.runtimeControlSocket = nil
+                    state.runtimeUser = nil
+                }
+                upsertInstanceState(
+                    &state,
+                    instanceName: instanceName,
+                    lifecycleState: .stopped,
+                    activeSessionCount: 0,
+                    idleTimer: idle,
+                    runtimeHostPid: nil,
+                    runtimeControlSocket: nil,
+                    runtimeUser: nil,
+                    initChannel: nil,
+                    lastError: nil
+                )
+                try store.saveState(state)
+            }
+        } catch {
+            logger.log("instance_stop_state_update_failed", fields: [
+                "instance": instanceName,
+                "reason": reason,
+                "error": String(describing: error)
+            ])
+        }
+        logRouter.logVM(
+            instance: instanceName,
+            event: "daemon_instance_stop_done",
+            fields: ["op": "stop", "result": "ok", "reason": reason]
+        )
+        publishInstanceStateEvent(instance: instanceName, state: "Stopped", reason: reason)
+    }
+
+    private func promotePrimaryRuntime(to instanceName: String) {
+        let context = instanceRegistry.context(for: instanceName)
+        activeInstanceName = instanceName
+        runtimeMetadataURL = context.metadataURL
+        vmRunner = context.vmRunner
+        initClient = context.initClient
+        runtimeUser = context.runtimeUser
+
+        do {
+            try lock.withExclusiveLock {
+                var state = try store.loadState()
+                state.distro = instanceName
+                state.vmState = .running
+                state.lastTransitionEpochMs = nowEpochMs()
+                state.runtimeHostPid = Int32(getpid())
+                state.runtimeControlSocket = paths.runtimeControlSocketFile.path
+                state.daemonHostPid = Int32(getpid())
+                state.daemonControlSocket = paths.runtimeControlSocketFile.path
+                state.daemonEventSocket = paths.runtimeEventSocketFile.path
+                if let entry = state.instances?.first(where: { $0.instance == instanceName }) {
+                    state.activeSessionCount = entry.activeSessionCount
+                    state.idleTimer = entry.idleTimer
+                    state.runtimeUser = entry.runtimeUser
+                }
+                try store.saveState(state)
+            }
+        } catch {
+            logger.log("primary_instance_promote_failed", fields: [
+                "instance": instanceName,
+                "error": String(describing: error)
+            ])
+        }
+    }
+
     private func shutdown() {
         stopDNSMonitorLoop()
         stopAutoPortForwardLoop()
         stopMemoryReclaimLoop()
+        disarmAllIdleTimers()
         controlServer?.stop()
+        eventBus?.stop()
         forwarder?.stopAll()
+        if let activeInstanceName {
+            instanceRegistry.context(for: activeInstanceName).lifecycleState = .stopping
+        }
         vmRunner?.stopRunningVM()
+        if let activeInstanceName {
+            let context = instanceRegistry.context(for: activeInstanceName)
+            context.lifecycleState = .stopped
+            context.vmRunner = nil
+            context.initClient = nil
+            context.runtimeUser = nil
+            context.lastError = nil
+        }
         updateStateStopped()
         logger.log("daemon_stopped")
     }
@@ -1811,19 +2653,46 @@ public final class DaemonServer {
         do {
             try lock.withExclusiveLock {
                 var state = try store.loadState()
+                let instanceName = currentRuntimeInstanceName()
                 state.vmState = .stopped
                 state.activeSessionCount = 0
                 state.idleTimer = IdleTimerState(armed: false, deadlineEpochMs: nil)
                 state.lastTransitionEpochMs = nowEpochMs()
                 state.runtimeHostPid = nil
                 state.runtimeControlSocket = nil
+                state.daemonHostPid = nil
+                state.daemonControlSocket = nil
+                state.daemonEventSocket = nil
                 state.runtimeUser = nil
+                upsertInstanceState(
+                    &state,
+                    instanceName: instanceName,
+                    lifecycleState: .stopped,
+                    activeSessionCount: 0,
+                    idleTimer: state.idleTimer,
+                    runtimeHostPid: nil,
+                    runtimeControlSocket: nil,
+                    runtimeUser: nil,
+                    initChannel: state.initChannel,
+                    lastError: nil
+                )
                 try store.saveState(state)
                 try sessions.clearAllAndTerminate()
             }
         } catch {
             logger.log("daemon_state_cleanup_error", fields: ["error": String(describing: error)])
         }
+        if let activeInstanceName {
+            let context = instanceRegistry.context(for: activeInstanceName)
+            context.lifecycleState = .stopped
+        }
+        let instanceName = currentRuntimeInstanceName()
+        logRouter.logVM(
+            instance: instanceName,
+            event: "daemon_instance_stop_done",
+            fields: ["op": "stop", "result": "ok"]
+        )
+        publishInstanceStateEvent(instance: instanceName, state: "Stopped", reason: "daemon_shutdown")
     }
 
     private func convergeRuntimeUser(
@@ -1986,9 +2855,11 @@ public final class DaemonServer {
         }
 
         let manualMappings: [PortMapping]
+        let instanceName = currentRuntimeInstanceName()
         do {
             manualMappings = try lock.withExclusiveLock(timeoutSec: 1) {
                 try store.loadPortMappings().mappings
+                    .filter { $0.instance == instanceName }
             }
         } catch {
             logger.log("daemon_port_preload_failed", fields: ["error": String(describing: error)])
@@ -1998,7 +2869,8 @@ public final class DaemonServer {
         let previous = currentEffectivePortMappingsSnapshot()
         let effective = AutoPortForwardingPlanner.merge(
             manualMappings: manualMappings,
-            autoHostPorts: autoHostPorts
+            autoHostPorts: autoHostPorts,
+            instanceName: instanceName
         )
         setEffectivePortMappingsSnapshot(effective)
 
@@ -2471,10 +3343,7 @@ public final class DaemonServer {
         )
     }
 
-    private func readGuestMemoryReclaimStats() -> GuestMemoryReclaimStats {
-        guard let client = initClient else {
-            return .zero
-        }
+    private func readGuestMemoryReclaimStats(client: InitChannelClient) -> GuestMemoryReclaimStats {
         do {
             let response = try client.send(InitChannelRequest(
                 op: "exec",
@@ -2540,12 +3409,25 @@ public final class DaemonServer {
         do {
             try lock.withExclusiveLock(timeoutSec: 1) {
                 var state = try store.loadState()
-                state.initChannel = InitChannelState(
+                let initState = InitChannelState(
                     version: probe.version,
                     lastHeartbeatEpochMs: nowEpochMs(),
                     lastStatus: probe.status,
                     lastErrorCode: probe.errorCode,
                     lastErrorMessage: probe.errorMessage
+                )
+                state.initChannel = initState
+                upsertInstanceState(
+                    &state,
+                    instanceName: currentRuntimeInstanceName(),
+                    lifecycleState: state.vmState == .running ? .running : .stopped,
+                    activeSessionCount: state.activeSessionCount,
+                    idleTimer: state.idleTimer,
+                    runtimeHostPid: state.runtimeHostPid,
+                    runtimeControlSocket: state.runtimeControlSocket,
+                    runtimeUser: state.runtimeUser,
+                    initChannel: initState,
+                    lastError: nil
                 )
                 try store.saveState(state)
             }

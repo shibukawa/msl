@@ -351,6 +351,40 @@ final class DistributionManagerTests: XCTestCase {
         XCTAssertEqual(got, ctx.paths.mslHostExt4MkfsHelperBinaryFile.path)
     }
 
+    func testCreateImageWithImagewriterReportsStageHintFromExitCode() throws {
+        let ctx = try DistributionContext.make()
+        defer { ctx.cleanup() }
+
+        let localTarball = ctx.root.appendingPathComponent("rootfs.tar.gz", isDirectory: false)
+        try Data("not-a-real-tarball".utf8).write(to: localTarball)
+
+        let fakeInit = ctx.root.appendingPathComponent("msl-init-fake", isDirectory: false)
+        try Data(repeating: 0x42, count: 64).write(to: fakeInit)
+        setenv("MSL_INIT_BINARY_PATH", fakeInit.path, 1)
+        defer { unsetenv("MSL_INIT_BINARY_PATH") }
+
+        let fakeImagewriter = ctx.root.appendingPathComponent("imagewriter-fail.sh", isDirectory: false)
+        try Data("#!/bin/sh\nexit 22\n".utf8).write(to: fakeImagewriter)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeImagewriter.path)
+        setenv("MSL_IMAGEWRITER_BUILD_SCRIPT", fakeImagewriter.path, 1)
+        defer { unsetenv("MSL_IMAGEWRITER_BUILD_SCRIPT") }
+
+        let manager = ctx.makeManager()
+        XCTAssertThrowsError(try manager.createImageWithImagewriter(
+            name: "dev",
+            targetAlias: nil,
+            localFilePath: localTarball.path,
+            rebuild: false,
+            diskSizeGB: nil,
+            mslExecutablePath: "/usr/bin/true"
+        )) { error in
+            guard let runtime = error as? MSLRuntimeError else {
+                return XCTFail("unexpected error type: \(error)")
+            }
+            XCTAssertTrue(runtime.message.contains("stage=btrfs_build"))
+        }
+    }
+
     func testUninstallInstanceRemovesManifestCacheByDefault() throws {
         let ctx = try DistributionContext.make()
         defer { ctx.cleanup() }

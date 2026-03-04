@@ -9,7 +9,11 @@ struct EffectivePortMappings {
 }
 
 enum AutoPortForwardingPlanner {
-    static func merge(manualMappings: [PortMapping], autoHostPorts: Set<Int>) -> EffectivePortMappings {
+    static func merge(
+        manualMappings: [PortMapping],
+        autoHostPorts: Set<Int>,
+        instanceName: String
+    ) -> EffectivePortMappings {
         var mergedByHostPort: [Int: PortMapping] = [:]
         var manualHostPorts = Set<Int>()
 
@@ -23,7 +27,11 @@ enum AutoPortForwardingPlanner {
             guard mergedByHostPort[hostPort] == nil else {
                 continue
             }
-            mergedByHostPort[hostPort] = PortMapping(hostPort: hostPort, guestPort: hostPort)
+            mergedByHostPort[hostPort] = PortMapping(
+                hostPort: hostPort,
+                guestPort: hostPort,
+                instance: instanceName
+            )
             effectiveAutoPorts.insert(hostPort)
         }
 

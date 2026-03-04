@@ -471,6 +471,7 @@ final class DistributionManager {
             let initBinaryPath = try resolveImagewriterInitBinaryPath()
 
             emitStatus("install: creating btrfs disk image via imagewriter")
+            didRunImagewriterBuild = true
             try runImagewriterBuild(
                 scriptPath: imagewriterScript,
                 mslExecutablePath: mslExecutablePath,
@@ -479,7 +480,6 @@ final class DistributionManager {
                 sizeMB: requestedSizeMB,
                 initBinaryPath: initBinaryPath
             )
-            didRunImagewriterBuild = true
 
             let sourceRecord: DistributionSourceRecord
             switch source {
@@ -1105,7 +1105,20 @@ final class DistributionManager {
 
         let result = try process.run("/bin/sh", [scriptPath], captureOutput: false, environment: env)
         guard result.exitCode == 0 else {
-            throw MSLRuntimeError("imagewriter build failed (\(result.exitCode)). see imagewriter logs/output above.")
+            let stageHint: String
+            switch result.exitCode {
+            case 21:
+                stageHint = "stage=stage1_ext4"
+            case 22:
+                stageHint = "stage=btrfs_build"
+            case 23:
+                stageHint = "stage=finalize"
+            default:
+                stageHint = "stage=unknown"
+            }
+            throw MSLRuntimeError(
+                "imagewriter build failed (\(result.exitCode), \(stageHint)). see imagewriter logs/output above."
+            )
         }
     }
 

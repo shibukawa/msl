@@ -23,10 +23,26 @@ final class PortForwardingManager {
         defer { lock.unlock() }
 
         if let existing = active[mapping.hostPort], existing.mapping.guestPort == mapping.guestPort {
+            if existing.mapping.instance != mapping.instance {
+                let message = portConflictMessage(hostPort: mapping.hostPort, ownerInstance: existing.mapping.instance)
+                return RuntimeControlResponse(
+                    ok: false,
+                    error: message,
+                    items: snapshotWithProposedLocked(mapping, error: message, ownerInstance: existing.mapping.instance)
+                )
+            }
             return RuntimeControlResponse(ok: true, error: nil, items: snapshotCurrentLocked())
         }
 
         if let existing = active[mapping.hostPort] {
+            if existing.mapping.instance != mapping.instance {
+                let message = portConflictMessage(hostPort: mapping.hostPort, ownerInstance: existing.mapping.instance)
+                return RuntimeControlResponse(
+                    ok: false,
+                    error: message,
+                    items: snapshotWithProposedLocked(mapping, error: message, ownerInstance: existing.mapping.instance)
+                )
+            }
             existing.listener.stop()
             active.removeValue(forKey: mapping.hostPort)
         }
@@ -63,6 +79,22 @@ final class PortForwardingManager {
         lock.lock()
         defer { lock.unlock() }
 
+        if let existing = active.removeValue(forKey: hostPort) {
+            existing.listener.stop()
+            logger.log("port_forward_listener_stopped", fields: ["hostPort": String(hostPort)])
+        }
+        errors.removeValue(forKey: hostPort)
+        return RuntimeControlResponse(ok: true, error: nil, items: snapshotCurrentLocked())
+    }
+
+    func remove(hostPort: Int, ownerInstance: String) -> RuntimeControlResponse {
+        lock.lock()
+        defer { lock.unlock() }
+
+        if let existing = active[hostPort], existing.mapping.instance != ownerInstance {
+            let message = portConflictMessage(hostPort: hostPort, ownerInstance: existing.mapping.instance)
+            return RuntimeControlResponse(ok: false, error: message, items: snapshotCurrentLocked())
+        }
         if let existing = active.removeValue(forKey: hostPort) {
             existing.listener.stop()
             logger.log("port_forward_listener_stopped", fields: ["hostPort": String(hostPort)])
@@ -128,13 +160,33 @@ final class PortForwardingManager {
         active.removeAll()
     }
 
-    private func snapshotWithProposedLocked(_ proposed: PortMapping? = nil) -> [RuntimePortStatusItem] {
+    private func snapshotWithProposedLocked(
+        _ proposed: PortMapping? = nil,
+        error proposedError: String? = nil,
+        ownerInstance: String? = nil
+    ) -> [RuntimePortStatusItem] {
         var map = active.mapValues { $0.mapping }
         if let proposed {
             map[proposed.hostPort] = proposed
         }
         let mappings = map.values.sorted { $0.hostPort < $1.hostPort }
-        return snapshotFromMappingsLocked(mappings)
+        let externalErrors: [Int: String]
+        if let proposed, let proposedError {
+            externalErrors = [proposed.hostPort: proposedError]
+        } else {
+            externalErrors = [:]
+        }
+        let ownerOverrides: [Int: String]
+        if let proposed, let ownerInstance {
+            ownerOverrides = [proposed.hostPort: ownerInstance]
+        } else {
+            ownerOverrides = [:]
+        }
+        return snapshotFromMappingsLocked(
+            mappings,
+            externalErrors: externalErrors,
+            ownerOverrides: ownerOverrides
+        )
     }
 
     private func snapshotCurrentLocked() -> [RuntimePortStatusItem] {
@@ -142,16 +194,22 @@ final class PortForwardingManager {
         return snapshotFromMappingsLocked(mappings)
     }
 
-    private func snapshotFromMappingsLocked(_ mappings: [PortMapping]) -> [RuntimePortStatusItem] {
+    private func snapshotFromMappingsLocked(
+        _ mappings: [PortMapping],
+        externalErrors: [Int: String] = [:],
+        ownerOverrides: [Int: String] = [:]
+    ) -> [RuntimePortStatusItem] {
         let source: [PortMapping]
         source = mappings.sorted { $0.hostPort < $1.hostPort }
         return source.map { mapping in
             RuntimePortStatusItem(
+                instance: mapping.instance,
                 hostPort: mapping.hostPort,
                 guestPort: mapping.guestPort,
                 bindAddress: mapping.bindAddress,
                 active: active[mapping.hostPort] != nil,
-                error: errors[mapping.hostPort]
+                ownerInstance: ownerOverrides[mapping.hostPort],
+                error: externalErrors[mapping.hostPort] ?? errors[mapping.hostPort]
             )
         }
     }
@@ -163,6 +221,10 @@ final class PortForwardingManager {
             return message
         }
         return "\(message). host port is busy; use \(guestIPHint):\(mapping.guestPort) directly."
+    }
+
+    private func portConflictMessage(hostPort: Int, ownerInstance: String) -> String {
+        "port_conflict host_port=\(hostPort) owner_instance=\(ownerInstance)"
     }
 }
 

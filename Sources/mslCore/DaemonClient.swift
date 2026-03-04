@@ -32,46 +32,39 @@ public final class DaemonClient {
     }
 
     /// Ensure daemon is running and establish a persistent connection.
-    public func ensureConnected(expectedInstanceName: String? = nil, hostShareRoot: String? = nil) throws {
+    public func ensureConnected(
+        expectedInstanceName: String? = nil,
+        hostShareRoot: String? = nil,
+        callerCwd: String? = nil
+    ) throws {
         if client != nil {
-            if let expectedInstanceName,
-               let connectedInstanceName,
-               connectedInstanceName != expectedInstanceName {
-                throw MSLRuntimeError(
-                    "daemon is connected to instance '\(connectedInstanceName)'. run `msl --stop` before switching to '\(expectedInstanceName)'."
-                )
-            }
             return
         }
 
         // Check if daemon is already running
         if let state = try? lock.withExclusiveLock(timeoutSec: 2, { try store.loadState() }),
-           state.vmState == .running,
-           let pid = state.runtimeHostPid, isDaemonAlive(pid: pid) {
-            if let expectedInstanceName,
-               state.distro != expectedInstanceName {
-                throw MSLRuntimeError(
-                    "daemon is running instance '\(state.distro)'. run `msl --stop` before switching to '\(expectedInstanceName)'."
-                )
-            }
+           (state.daemonHostPid ?? state.runtimeHostPid) != nil {
+            let daemonPid = state.daemonHostPid ?? state.runtimeHostPid ?? 0
+            if isDaemonAlive(pid: daemonPid) {
             // Daemon is running, connect
             let socketPath = state.runtimeControlSocket ?? paths.runtimeControlSocketFile.path
             let c = RuntimeControlClient(socketPath: socketPath)
             do {
                 try c.connect()
                 self.client = c
-                self.connectedInstanceName = state.distro
+                self.connectedInstanceName = expectedInstanceName ?? state.distro
                 logger.log("daemon_client_connected_warm")
                 return
             } catch {
                 // Socket exists but connection failed — stale state; restart daemon
                 logger.log("daemon_client_stale_socket", fields: ["error": String(describing: error)])
             }
+            }
         }
 
         // Daemon not running — start it
         fputs("msl: starting VM...\n", stderr)
-        try startDaemon(instanceName: expectedInstanceName, hostShareRoot: hostShareRoot)
+        try startDaemon(instanceName: expectedInstanceName, hostShareRoot: hostShareRoot, callerCwd: callerCwd)
 
         // Wait for control socket to appear and connect
         let socketPath = paths.runtimeControlSocketFile.path
@@ -137,7 +130,7 @@ public final class DaemonClient {
 
     // MARK: - Daemon Startup
 
-    private func startDaemon(instanceName: String?, hostShareRoot: String?) throws {
+    private func startDaemon(instanceName: String?, hostShareRoot: String?, callerCwd: String?) throws {
         logger.log("daemon_client_starting_daemon")
 
         let process = Process()
@@ -148,10 +141,19 @@ public final class DaemonClient {
             arguments.append(instanceName)
         }
         process.arguments = arguments
+        var environment = ProcessInfo.processInfo.environment
+        var hasEnvironmentOverride = false
         if let hostShareRoot = hostShareRoot?.trimmingCharacters(in: .whitespacesAndNewlines),
            !hostShareRoot.isEmpty {
-            var environment = ProcessInfo.processInfo.environment
             environment["MSL_HOST_SHARE_ROOT"] = hostShareRoot
+            hasEnvironmentOverride = true
+        }
+        if let callerCwd = callerCwd?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !callerCwd.isEmpty {
+            environment["MSL_DAEMON_LAUNCH_CWD"] = callerCwd
+            hasEnvironmentOverride = true
+        }
+        if hasEnvironmentOverride {
             process.environment = environment
         }
 

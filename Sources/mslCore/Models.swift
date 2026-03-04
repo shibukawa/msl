@@ -37,10 +37,15 @@ public struct RuntimeState: Codable {
     public var runtimeControlSocket: String?
     public var initChannel: InitChannelState?
     public var runtimeUser: RuntimeUserState?
+    // Step24 schema v2 fields (legacy fields stay for compatibility during migration).
+    public var daemonHostPid: Int32?
+    public var daemonControlSocket: String?
+    public var daemonEventSocket: String?
+    public var instances: [RuntimeInstanceState]?
 
     public static func initial(nowMs: Int64) -> RuntimeState {
         RuntimeState(
-            schemaVersion: 1,
+            schemaVersion: 2,
             distro: "default",
             vmState: .stopped,
             activeSessionCount: 0,
@@ -50,9 +55,132 @@ public struct RuntimeState: Codable {
             runtimeHostPid: nil,
             runtimeControlSocket: nil,
             initChannel: nil,
-            runtimeUser: nil
+            runtimeUser: nil,
+            daemonHostPid: nil,
+            daemonControlSocket: nil,
+            daemonEventSocket: nil,
+            instances: [
+                RuntimeInstanceState(
+                    instance: "default",
+                    vmState: .stopped,
+                    activeSessionCount: 0,
+                    idleTimer: IdleTimerState(),
+                    runtimeUser: nil,
+                    initChannel: nil,
+                    runtimeHostPid: nil,
+                    runtimeControlSocket: nil,
+                    lastError: nil,
+                    lastTransitionEpochMs: nowMs
+                )
+            ]
         )
     }
+
+    @discardableResult
+    public mutating func normalizeSchemaV2(nowMs: Int64) -> Bool {
+        var changed = false
+        if schemaVersion < 2 {
+            schemaVersion = 2
+            changed = true
+        }
+        if instances == nil || instances?.isEmpty == true {
+            instances = [
+                RuntimeInstanceState(
+                    instance: distro,
+                    vmState: vmState,
+                    activeSessionCount: activeSessionCount,
+                    idleTimer: idleTimer,
+                    runtimeUser: runtimeUser,
+                    initChannel: initChannel,
+                    runtimeHostPid: runtimeHostPid,
+                    runtimeControlSocket: runtimeControlSocket,
+                    lastError: nil,
+                    lastTransitionEpochMs: lastTransitionEpochMs
+                )
+            ]
+            changed = true
+        } else if let currentEntries = instances {
+            var merged: [String: RuntimeInstanceState] = [:]
+            for entry in currentEntries {
+                if let existing = merged[entry.instance] {
+                    if entry.lastTransitionEpochMs > existing.lastTransitionEpochMs {
+                        merged[entry.instance] = entry
+                    } else if entry.lastTransitionEpochMs == existing.lastTransitionEpochMs,
+                              entry.vmState == .running,
+                              existing.vmState != .running {
+                        merged[entry.instance] = entry
+                    }
+                } else {
+                    merged[entry.instance] = entry
+                }
+            }
+
+            // Keep legacy single-instance fields and v2 primary instance in sync.
+            merged[distro] = RuntimeInstanceState(
+                instance: distro,
+                vmState: vmState,
+                activeSessionCount: activeSessionCount,
+                idleTimer: idleTimer,
+                runtimeUser: runtimeUser,
+                initChannel: initChannel,
+                runtimeHostPid: runtimeHostPid,
+                runtimeControlSocket: runtimeControlSocket,
+                lastError: merged[distro]?.lastError,
+                lastTransitionEpochMs: lastTransitionEpochMs
+            )
+
+            var normalized: [RuntimeInstanceState] = []
+            if let primary = merged[distro] {
+                normalized.append(primary)
+                merged.removeValue(forKey: distro)
+            }
+            normalized.append(contentsOf: merged.keys.sorted().compactMap { merged[$0] })
+
+            if normalized.count != currentEntries.count {
+                changed = true
+            } else {
+                for (lhs, rhs) in zip(normalized, currentEntries) {
+                    if lhs.instance != rhs.instance
+                        || lhs.vmState != rhs.vmState
+                        || lhs.activeSessionCount != rhs.activeSessionCount
+                        || lhs.idleTimer.armed != rhs.idleTimer.armed
+                        || lhs.idleTimer.deadlineEpochMs != rhs.idleTimer.deadlineEpochMs
+                        || lhs.runtimeHostPid != rhs.runtimeHostPid
+                        || lhs.runtimeControlSocket != rhs.runtimeControlSocket {
+                        changed = true
+                        break
+                    }
+                }
+            }
+            instances = normalized
+        }
+        if daemonHostPid != runtimeHostPid {
+            daemonHostPid = runtimeHostPid
+            changed = true
+        }
+        if daemonControlSocket != runtimeControlSocket {
+            daemonControlSocket = runtimeControlSocket
+            changed = true
+        }
+        if lastTransitionEpochMs <= 0 {
+            lastTransitionEpochMs = nowMs
+            changed = true
+        }
+        return changed
+    }
+}
+
+public struct RuntimeInstanceState: Codable {
+    public var instance: String
+    public var vmState: VMState
+    public var activeSessionCount: Int
+    public var idleTimer: IdleTimerState
+    public var runtimeUser: RuntimeUserState?
+    public var initChannel: InitChannelState?
+    public var runtimeHostPid: Int32?
+    public var runtimeControlSocket: String?
+    public var lastError: String?
+    public var lastTransitionEpochMs: Int64
 }
 
 public struct RuntimeUserState: Codable {
@@ -95,13 +223,40 @@ public struct InitChannelState: Codable {
 
 public struct SessionEntry: Codable {
     public var id: String
+    public var instance: String
+    public var logPath: String?
     public var pid: Int32
     public var startedAtEpochMs: Int64
 
-    public init(id: String, pid: Int32, startedAtEpochMs: Int64) {
+    public init(
+        id: String,
+        instance: String = "default",
+        logPath: String? = nil,
+        pid: Int32,
+        startedAtEpochMs: Int64
+    ) {
         self.id = id
+        self.instance = instance
+        self.logPath = logPath
         self.pid = pid
         self.startedAtEpochMs = startedAtEpochMs
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case instance
+        case logPath
+        case pid
+        case startedAtEpochMs
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        instance = try c.decodeIfPresent(String.self, forKey: .instance) ?? "default"
+        logPath = try c.decodeIfPresent(String.self, forKey: .logPath)
+        pid = try c.decode(Int32.self, forKey: .pid)
+        startedAtEpochMs = try c.decode(Int64.self, forKey: .startedAtEpochMs)
     }
 }
 
@@ -122,16 +277,46 @@ public enum BootstrapContext {
 }
 
 public struct PortMapping: Codable, Equatable {
+    public var instance: String
     public var hostPort: Int
     public var guestPort: Int
     public var bindAddress: String
+    public var source: String
     public var createdAtEpochMs: Int64
 
-    public init(hostPort: Int, guestPort: Int, bindAddress: String = "127.0.0.1", createdAtEpochMs: Int64 = nowEpochMs()) {
+    public init(
+        hostPort: Int,
+        guestPort: Int,
+        bindAddress: String = "127.0.0.1",
+        createdAtEpochMs: Int64 = nowEpochMs(),
+        instance: String = "default",
+        source: String = "manual"
+    ) {
+        self.instance = instance
         self.hostPort = hostPort
         self.guestPort = guestPort
         self.bindAddress = bindAddress
+        self.source = source
         self.createdAtEpochMs = createdAtEpochMs
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case instance
+        case hostPort
+        case guestPort
+        case bindAddress
+        case source
+        case createdAtEpochMs
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        instance = try c.decodeIfPresent(String.self, forKey: .instance) ?? "default"
+        hostPort = try c.decode(Int.self, forKey: .hostPort)
+        guestPort = try c.decode(Int.self, forKey: .guestPort)
+        bindAddress = try c.decodeIfPresent(String.self, forKey: .bindAddress) ?? "127.0.0.1"
+        source = try c.decodeIfPresent(String.self, forKey: .source) ?? "manual"
+        createdAtEpochMs = try c.decodeIfPresent(Int64.self, forKey: .createdAtEpochMs) ?? nowEpochMs()
     }
 }
 
@@ -139,7 +324,7 @@ public struct PortMappingsState: Codable {
     public var schemaVersion: Int
     public var mappings: [PortMapping]
 
-    public init(schemaVersion: Int = 1, mappings: [PortMapping] = []) {
+    public init(schemaVersion: Int = 2, mappings: [PortMapping] = []) {
         self.schemaVersion = schemaVersion
         self.mappings = mappings
     }

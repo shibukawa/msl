@@ -35,12 +35,14 @@ final class AutoPortForwardingTests: XCTestCase {
 
         let effective = AutoPortForwardingPlanner.merge(
             manualMappings: manual,
-            autoHostPorts: Set([8080, 3000])
+            autoHostPorts: Set([8080, 3000]),
+            instanceName: "ubuntu"
         )
 
         XCTAssertEqual(effective.manualHostPorts, Set([8080, 9000]))
         XCTAssertEqual(effective.autoHostPorts, Set([3000]))
         XCTAssertEqual(effective.mappings.map { $0.hostPort }, [3000, 8080, 9000])
+        XCTAssertEqual(effective.mappings.first(where: { $0.hostPort == 3000 })?.instance, "ubuntu")
         XCTAssertEqual(effective.mappings.first(where: { $0.hostPort == 8080 })?.guestPort, 80)
     }
 }

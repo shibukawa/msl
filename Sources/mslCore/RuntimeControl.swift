@@ -3,6 +3,9 @@ import Darwin
 
 public struct RuntimeControlRequest: Codable {
     public var op: String
+    public var instance: String?
+    public var all: Bool?
+    public var callerCwd: String?
     public var hostPort: Int?
     public var guestPort: Int?
     // exec / pty / session ops
@@ -19,17 +22,49 @@ public struct RuntimeControlRequest: Codable {
 }
 
 public struct RuntimePortStatusItem: Codable {
+    public var instance: String?
     public var hostPort: Int
     public var guestPort: Int
     public var bindAddress: String
     public var active: Bool
+    public var ownerInstance: String?
     public var error: String?
+
+    public init(
+        instance: String? = nil,
+        hostPort: Int,
+        guestPort: Int,
+        bindAddress: String,
+        active: Bool,
+        ownerInstance: String? = nil,
+        error: String?
+    ) {
+        self.instance = instance
+        self.hostPort = hostPort
+        self.guestPort = guestPort
+        self.bindAddress = bindAddress
+        self.active = active
+        self.ownerInstance = ownerInstance
+        self.error = error
+    }
+}
+
+public struct RuntimeInstanceStatusItem: Codable {
+    public var instance: String
+    public var vmState: String
+    public var activeSessionCount: Int
+    public var idleTimerArmed: Bool
+    public var idleDeadlineEpochMs: Int64?
+    public var runtimeHostPid: Int32?
+    public var lastError: String?
+    public var lastTransitionEpochMs: Int64
 }
 
 public struct RuntimeControlResponse: Codable {
     public var ok: Bool
     public var error: String?
     public var items: [RuntimePortStatusItem]?
+    public var instances: [RuntimeInstanceStatusItem]?
     // exec / pty / session responses
     public var stdout: String?
     public var stderr: String?
