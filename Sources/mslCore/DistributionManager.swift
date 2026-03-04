@@ -182,7 +182,7 @@ final class DistributionManager {
         if let explicit = explicitInstanceName?.trimmingCharacters(in: .whitespacesAndNewlines),
            !explicit.isEmpty {
             guard let metadata = runtimeMetadataURLIfBootable(instanceName: explicit) else {
-                throw MSLRuntimeError("instance '\(explicit)' not found. use `msl --list` to inspect installed instances.")
+                throw MSLRuntimeError("instance '\(explicit)' not found. use `msl list` to inspect installed instances.")
             }
             return metadata
         }
@@ -198,7 +198,7 @@ final class DistributionManager {
         }
 
         throw MSLRuntimeError(
-            "no bootable instance found. run `msl install --list` and install one with `msl install <distribution>`."
+            "no bootable instance found. run `msl install --list` and install one with `msl install <distribution>`; use `msl list` to inspect installed instances."
         )
     }
 

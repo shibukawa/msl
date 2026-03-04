@@ -86,7 +86,7 @@ fi
 
 MSL_RUNTIME_USER_ROOT=1 msl_retry --instance "$INSTANCE" run true >/dev/null
 
-MSL_RUNTIME_USER_ROOT=1 msl_retry --instance "$INSTANCE" run sh -lc '
+MSL_RUNTIME_USER_ROOT=1 msl_retry --instance "$INSTANCE" run -- sh -lc '
 set -eu
 pkgs="$1"
 

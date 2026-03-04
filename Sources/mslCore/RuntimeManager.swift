@@ -430,7 +430,7 @@ public final class RuntimeManager {
         let result: DistributionUninstallResult = try lock.withExclusiveLock {
             let state = try store.loadState()
             if state.vmState == .running, state.distro == name {
-                throw MSLRuntimeError("instance '\(name)' is running. run `msl --stop` first.")
+                throw MSLRuntimeError("instance '\(name)' is running. run `msl stop` first.")
             }
 
             let uninstallResult = try distributionManager.uninstallInstance(name: name, keepCache: keepCache)

@@ -386,6 +386,8 @@ public struct CacheSharingConfig: Codable, Equatable {
     public var enabled: Bool?
     public var apt: Bool?
     public var apk: Bool?
+    public var zypper: Bool?
+    public var dnf: Bool?
     public var go: Bool?
     public var python: Bool?
     public var npm: Bool?
@@ -405,6 +407,8 @@ public struct CacheSharingConfig: Codable, Equatable {
         enabled: Bool? = nil,
         apt: Bool? = nil,
         apk: Bool? = nil,
+        zypper: Bool? = nil,
+        dnf: Bool? = nil,
         go: Bool? = nil,
         python: Bool? = nil,
         npm: Bool? = nil,
@@ -423,6 +427,8 @@ public struct CacheSharingConfig: Codable, Equatable {
         self.enabled = enabled
         self.apt = apt
         self.apk = apk
+        self.zypper = zypper
+        self.dnf = dnf
         self.go = go
         self.python = python
         self.npm = npm

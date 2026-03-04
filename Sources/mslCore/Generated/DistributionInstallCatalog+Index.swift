@@ -3,19 +3,39 @@ import Foundation
 enum EmbeddedDistributionInstallCatalog {
     static let descriptors: [DistributionInstallDescriptor] = [
         DistributionInstallDescriptor(
-            canonicalName: "alpine",
-            aliases: [],
-            manifestId: "alpine-latest-aarch64"
+            canonicalName: "amazonlinux-2",
+            aliases: ["amazonlinux"],
+            manifestId: "amazonlinux-2-arm64"
         ),
         DistributionInstallDescriptor(
-            canonicalName: "ubuntu-24.04",
-            aliases: ["ubuntu", "ubuntu-lts", "ubuntu-noble"],
-            manifestId: "ubuntu-24.04-arm64"
+            canonicalName: "alpine-3.23",
+            aliases: ["alpine"],
+            manifestId: "alpine-3.23-arm64"
         ),
         DistributionInstallDescriptor(
-            canonicalName: "ubuntu-25.10",
-            aliases: ["ubuntu-latest", "ubuntu-questing"],
-            manifestId: "ubuntu-25.10-arm64"
+            canonicalName: "debian-trixie",
+            aliases: ["debian", "debian-latest"],
+            manifestId: "debian-trixie-arm64"
+        ),
+        DistributionInstallDescriptor(
+            canonicalName: "ubuntu-noble",
+            aliases: ["ubuntu", "ubuntu-lts"],
+            manifestId: "ubuntu-noble-arm64"
+        ),
+        DistributionInstallDescriptor(
+            canonicalName: "ubuntu-questing",
+            aliases: ["ubuntu-latest"],
+            manifestId: "ubuntu-questing-arm64"
+        ),
+        DistributionInstallDescriptor(
+            canonicalName: "fedora-43",
+            aliases: ["fedora", "fedora-latest"],
+            manifestId: "fedora-43-arm64"
+        ),
+        DistributionInstallDescriptor(
+            canonicalName: "opensuse-16.0",
+            aliases: ["opensuse"],
+            manifestId: "opensuse-16.0-arm64"
         )
     ]
 }

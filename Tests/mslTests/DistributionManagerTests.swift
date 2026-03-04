@@ -4,9 +4,9 @@ import XCTest
 final class DistributionManagerTests: XCTestCase {
     func testManifestAliasResolution() throws {
         let entry = DistributionManifestEntry(
-            id: "ubuntu-24.04-arm64",
+            id: "ubuntu-noble-arm64",
             distro: "ubuntu",
-            version: "24.04",
+            version: "noble",
             arch: "arm64",
             tarballURL: "https://example.com/rootfs.tar.xz",
             sha256: "abc",
@@ -16,9 +16,14 @@ final class DistributionManagerTests: XCTestCase {
             keyFingerprint: "001122",
             supportState: .supported
         )
-        let store = DistributionManifestStore(entries: [entry])
-        XCTAssertEqual(store.resolve(alias: "ubuntu-24.04")?.id, entry.id)
+        let descriptor = DistributionInstallDescriptor(
+            canonicalName: "ubuntu-noble",
+            aliases: ["ubuntu", "ubuntu-lts", "ubuntu-noble"],
+            manifestId: entry.id
+        )
+        let store = DistributionManifestStore(entries: [entry], installDescriptors: [descriptor])
         XCTAssertEqual(store.resolve(alias: "ubuntu-noble")?.id, entry.id)
+        XCTAssertEqual(store.resolve(alias: "ubuntu")?.id, entry.id)
         XCTAssertNil(store.resolve(alias: "alpine"))
     }
 
@@ -119,10 +124,10 @@ final class DistributionManagerTests: XCTestCase {
     func testInstallableNames() {
         let entries = [
             DistributionManifestEntry(
-                id: "alpine-latest-aarch64",
+                id: "alpine-3.23-arm64",
                 distro: "alpine",
-                version: "latest",
-                arch: "aarch64",
+                version: "3.23",
+                arch: "arm64",
                 tarballURL: "https://example.com/alpine.tar.gz",
                 sha256: "a",
                 signatureURL: "https://example.com/alpine.sig",
@@ -132,9 +137,9 @@ final class DistributionManagerTests: XCTestCase {
                 supportState: .supported
             ),
             DistributionManifestEntry(
-                id: "ubuntu-24.04-arm64",
+                id: "ubuntu-noble-arm64",
                 distro: "ubuntu",
-                version: "24.04",
+                version: "noble",
                 arch: "arm64",
                 tarballURL: "https://example.com/u2404.tar.xz",
                 sha256: "b",
@@ -145,9 +150,9 @@ final class DistributionManagerTests: XCTestCase {
                 supportState: .supported
             ),
             DistributionManifestEntry(
-                id: "ubuntu-25.10-arm64",
+                id: "ubuntu-questing-arm64",
                 distro: "ubuntu",
-                version: "25.10",
+                version: "questing",
                 arch: "arm64",
                 tarballURL: "https://example.com/u2510.tar.xz",
                 sha256: "c",
@@ -158,8 +163,13 @@ final class DistributionManagerTests: XCTestCase {
                 supportState: .supported
             )
         ]
-        let store = DistributionManifestStore(entries: entries)
-        XCTAssertEqual(store.installableNames(), ["alpine", "ubuntu-24.04", "ubuntu-25.10"])
+        let descriptors = [
+            DistributionInstallDescriptor(canonicalName: "alpine-3.23", aliases: ["alpine"], manifestId: "alpine-3.23-arm64"),
+            DistributionInstallDescriptor(canonicalName: "ubuntu-noble", aliases: ["ubuntu", "ubuntu-lts"], manifestId: "ubuntu-noble-arm64"),
+            DistributionInstallDescriptor(canonicalName: "ubuntu-questing", aliases: ["ubuntu-latest"], manifestId: "ubuntu-questing-arm64"),
+        ]
+        let store = DistributionManifestStore(entries: entries, installDescriptors: descriptors)
+        XCTAssertEqual(store.installableNames(), ["alpine-3.23", "ubuntu-noble", "ubuntu-questing"])
     }
 
     func testInstallableDescriptorsExposeAliases() {
@@ -189,9 +199,9 @@ final class DistributionManagerTests: XCTestCase {
 
     func testInstallCatalogContainsUbuntuQuestingAlias() {
         let descriptor = EmbeddedDistributionInstallCatalog.descriptors
-            .first { $0.canonicalName == "ubuntu-25.10" }
+            .first { $0.canonicalName == "ubuntu-questing" }
         XCTAssertNotNil(descriptor)
-        XCTAssertTrue(descriptor?.aliases.contains("ubuntu-questing") == true)
+        XCTAssertTrue(descriptor?.aliases.contains("ubuntu-latest") == true)
     }
 
     func testRuntimeMetadataURLPrefersConfiguredDefaultInstance() throws {

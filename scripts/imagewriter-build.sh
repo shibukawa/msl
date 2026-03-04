@@ -332,7 +332,7 @@ packages="$7"
 apk_cache="$8"
 guest_tmp_image="$9"
 
-MSL_RUNTIME_USER_ROOT=1 "$MSL_BIN" --instance "$INSTANCE" run --timeout "$RUN_TIMEOUT" sh -lc '
+MSL_RUNTIME_USER_ROOT=1 "$MSL_BIN" --instance "$INSTANCE" run --timeout "$RUN_TIMEOUT" -- sh -lc '
 set -eu
 worker_b64="$1"
 mode="$2"

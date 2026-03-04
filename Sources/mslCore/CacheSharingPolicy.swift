@@ -4,6 +4,8 @@ public struct ResolvedCacheSharingPolicy: Equatable {
     public var enabled: Bool
     public var apt: Bool
     public var apk: Bool
+    public var zypper: Bool
+    public var dnf: Bool
     public var go: Bool
     public var python: Bool
     public var npm: Bool
@@ -23,6 +25,8 @@ public struct ResolvedCacheSharingPolicy: Equatable {
         enabled: false,
         apt: false,
         apk: false,
+        zypper: false,
+        dnf: false,
         go: false,
         python: false,
         npm: false,
@@ -50,6 +54,8 @@ public enum CacheSharingPolicyResolver {
             enabled: true,
             apt: config?.apt ?? true,
             apk: config?.apk ?? true,
+            zypper: config?.zypper ?? false,
+            dnf: config?.dnf ?? false,
             go: config?.go ?? false,
             python: config?.python ?? false,
             npm: config?.npm ?? false,
@@ -76,6 +82,12 @@ public enum CacheSharingPolicyResolver {
             return CacheSharingConfig(enabled: true, apt: false, apk: true)
         case "ubuntu":
             return CacheSharingConfig(enabled: true, apt: true, apk: false)
+        case "debian":
+            return CacheSharingConfig(enabled: true, apt: true, apk: false)
+        case "opensuse":
+            return CacheSharingConfig(enabled: true, apt: false, apk: false, zypper: true)
+        case "fedora":
+            return CacheSharingConfig(enabled: true, apt: false, apk: false, dnf: true)
         default:
             return CacheSharingConfig(enabled: true)
         }
@@ -117,6 +129,8 @@ public enum CacheSharingPolicyResolver {
         [
             "apt": policy.apt,
             "apk": policy.apk,
+            "zypper": policy.zypper,
+            "dnf": policy.dnf,
             "go": policy.go,
             "python": policy.python,
             "npm": policy.npm,
