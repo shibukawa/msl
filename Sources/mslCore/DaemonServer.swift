@@ -122,6 +122,8 @@ public final class DaemonServer {
     host_home_guest="$1"; shift
     enable_apt="$1"; shift
     enable_apk="$1"; shift
+    enable_zypper="$1"; shift
+    enable_dnf="$1"; shift
     enable_go="$1"; shift
     enable_python="$1"; shift
     enable_npm="$1"; shift
@@ -230,6 +232,18 @@ public final class DaemonServer {
       apk_src="$cache_root/apk/cache"
       mkdir -p "$apk_src" 2>/dev/null || true
       ensure_bind_mount "$apk_src" "/var/cache/apk"
+    fi
+
+    if [ "$enable_zypper" = "1" ] && command -v zypper >/dev/null 2>&1; then
+      zypper_src="$cache_root/zypper/cache"
+      mkdir -p "$zypper_src" 2>/dev/null || true
+      ensure_bind_mount "$zypper_src" "/var/cache/zypp"
+    fi
+
+    if [ "$enable_dnf" = "1" ] && command -v dnf >/dev/null 2>&1; then
+      dnf_src="$cache_root/dnf/cache"
+      mkdir -p "$dnf_src" 2>/dev/null || true
+      ensure_bind_mount "$dnf_src" "/var/cache/dnf"
     fi
 
     if [ "$enable_go" = "1" ]; then
@@ -1226,6 +1240,8 @@ public final class DaemonServer {
             guestHostHome,
             flags["apt"] == true ? "1" : "0",
             flags["apk"] == true ? "1" : "0",
+            flags["zypper"] == true ? "1" : "0",
+            flags["dnf"] == true ? "1" : "0",
             flags["go"] == true ? "1" : "0",
             flags["python"] == true ? "1" : "0",
             flags["npm"] == true ? "1" : "0",

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import json
 import os
 import re
 import subprocess
@@ -13,30 +14,53 @@ ROOT = Path(__file__).resolve().parents[1]
 GEN_DIR = ROOT / "Sources" / "mslCore" / "Generated"
 SECURITY_DIR = ROOT / "Sources" / "mslCore" / "Security"
 
-ALPINE_INDEX = "https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/aarch64/"
-ALPINE_KEYS_INDEX = "https://alpinelinux.org/keys/"
-ALPINE_DEFAULT_KEY = "https://alpinelinux.org/keys/ncopa.asc"
-UBUNTU_KEYRING_URL = "https://archive.ubuntu.com/ubuntu/project/ubuntu-archive-keyring.gpg"
+LINUXCONTAINERS_BASE_URL = "https://images.linuxcontainers.org/"
+LINUXCONTAINERS_STREAMS_URL = "https://images.linuxcontainers.org/streams/v1/images.json"
 OPENPGP_VKS_FPR_URL = "https://keys.openpgp.org/vks/v1/by-fingerprint/{fpr}"
 UBUNTU_KEYSERVER_LOOKUP_URL = "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x{fpr}"
 
-ALPINE_RELEASE = {
-    "canonicalName": "alpine",
-    "aliases": [],
-}
-
-UBUNTU_RELEASES = [
+TARGET_RELEASES = [
     {
-        "version": "24.04",
-        "releaseURL": "https://cloud-images.ubuntu.com/minimal/releases/noble/release/",
-        "canonicalName": "ubuntu-24.04",
-        "aliases": ["ubuntu", "ubuntu-lts", "ubuntu-noble"],
+        "distro": "amazonlinux",
+        "release": "2",
+        "canonicalName": "amazonlinux-2",
+        "aliases": ["amazonlinux"],
     },
     {
-        "version": "25.10",
-        "releaseURL": "https://cloud-images.ubuntu.com/minimal/releases/questing/release/",
-        "canonicalName": "ubuntu-25.10",
-        "aliases": ["ubuntu-latest", "ubuntu-questing"],
+        "distro": "alpine",
+        "release": "3.23",
+        "canonicalName": "alpine-3.23",
+        "aliases": ["alpine"],
+    },
+    {
+        "distro": "debian",
+        "release": "trixie",
+        "canonicalName": "debian-trixie",
+        "aliases": ["debian", "debian-latest"],
+    },
+    {
+        "distro": "ubuntu",
+        "release": "noble",
+        "canonicalName": "ubuntu-noble",
+        "aliases": ["ubuntu", "ubuntu-lts"],
+    },
+    {
+        "distro": "ubuntu",
+        "release": "questing",
+        "canonicalName": "ubuntu-questing",
+        "aliases": ["ubuntu-latest"],
+    },
+    {
+        "distro": "fedora",
+        "release": "43",
+        "canonicalName": "fedora-43",
+        "aliases": ["fedora", "fedora-latest"],
+    },
+    {
+        "distro": "opensuse",
+        "release": "16.0",
+        "canonicalName": "opensuse-16.0",
+        "aliases": ["opensuse"],
     },
 ]
 
@@ -201,6 +225,181 @@ def parse_sha_line(text: str, filename: str) -> str:
             if tail == filename or tail.endswith("/" + filename):
                 return digest
     raise RuntimeError(f"sha256 for {filename} not found")
+
+
+def fetch_linuxcontainers_streams():
+    text = fetch_text(LINUXCONTAINERS_STREAMS_URL)
+    data = json.loads(text)
+    products = data.get("products")
+    if not isinstance(products, dict):
+        raise RuntimeError("invalid linuxcontainers streams payload: missing products")
+    return products
+
+
+def latest_version_key(versions: dict, context: str) -> str:
+    keys = sorted(versions.keys())
+    if not keys:
+        raise RuntimeError(f"no build versions found: {context}")
+    return keys[-1]
+
+
+def parse_packages_manager(image_yaml_text: str) -> str:
+    in_packages = False
+    for line in image_yaml_text.splitlines():
+        stripped = line.strip()
+        if stripped == "packages:":
+            in_packages = True
+            continue
+        if not in_packages:
+            continue
+        if stripped and not line.startswith((" ", "\t")):
+            break
+        m = re.match(r"\s*manager:\s*([^\s#]+)", line)
+        if m:
+            return m.group(1).strip().lower()
+    return ""
+
+
+def normalize_package_manager(raw: str) -> str:
+    value = (raw or "").strip().lower()
+    if value in ("apt", "apk", "zypper", "dnf"):
+        return value
+    if value == "yum":
+        return "dnf"
+    return ""
+
+
+def service_manager_for_distro(distro: str) -> str:
+    if distro == "alpine":
+        return "openrc"
+    return "systemd"
+
+
+def user_convergence_template_for_distro(distro: str):
+    if distro == "alpine":
+        return {
+            "templateId": "alpine-busybox-v1",
+            "commandFamily": "busybox_adduser",
+            "adminGroup": "wheel",
+            "sudoPolicy": {
+                "enabled": True,
+                "requireSudoBinary": False,
+                "dropInPath": "/etc/sudoers.d/msl-user",
+                "passwordless": True,
+            },
+            "suPolicy": {
+                "enabled": True,
+                "passwordless": True,
+            },
+            "shellFallbacks": ["/bin/ash", "/bin/sh"],
+            "welcomePolicy": {
+                "enabled": True,
+                "frequency": "daily",
+                "respectHushlogin": True,
+            },
+            "editable": False,
+        }
+    admin_group = "sudo" if distro in ("ubuntu", "debian") else "wheel"
+    return {
+        "templateId": f"{distro}-useradd-v1",
+        "commandFamily": "useradd",
+        "adminGroup": admin_group,
+        "sudoPolicy": {
+            "enabled": True,
+            "requireSudoBinary": False,
+            "dropInPath": "/etc/sudoers.d/msl-user",
+            "passwordless": True,
+        },
+        "suPolicy": {
+            "enabled": False,
+            "passwordless": False,
+        },
+        "shellFallbacks": ["/bin/bash", "/bin/sh"],
+        "welcomePolicy": {
+            "enabled": True,
+            "frequency": "daily",
+            "respectHushlogin": True,
+        },
+        "editable": False,
+    }
+
+
+def cache_sharing_defaults_for_manager(normalized_manager: str):
+    return {
+        "enabled": True,
+        "apt": normalized_manager == "apt",
+        "apk": normalized_manager == "apk",
+        "zypper": normalized_manager == "zypper",
+        "dnf": normalized_manager == "dnf",
+    }
+
+
+def linuxcontainers_entry(target: dict, products: dict, tmp_dir: Path):
+    distro = target["distro"]
+    release = target["release"]
+    product_key = f"{distro}:{release}:arm64:default"
+    product = products.get(product_key)
+    if not product:
+        raise RuntimeError(f"linuxcontainers product not found: {product_key}")
+
+    versions = product.get("versions")
+    if not isinstance(versions, dict):
+        raise RuntimeError(f"invalid versions map for product {product_key}")
+    build_key = latest_version_key(versions, product_key)
+    build = versions.get(build_key) or {}
+    items = build.get("items") or {}
+    root_item = items.get("root.tar.xz")
+    if not isinstance(root_item, dict):
+        raise RuntimeError(f"root.tar.xz item not found for product {product_key} build {build_key}")
+
+    root_path = root_item.get("path", "").strip()
+    sha256 = root_item.get("sha256", "").strip()
+    if not root_path or not sha256:
+        raise RuntimeError(f"root.tar.xz path/sha256 missing for product {product_key} build {build_key}")
+
+    tar_url = urllib.parse.urljoin(LINUXCONTAINERS_BASE_URL, root_path)
+    file_name = Path(root_path).name
+    build_dir = root_path.rsplit("/", 1)[0] + "/"
+    build_url = urllib.parse.urljoin(LINUXCONTAINERS_BASE_URL, build_dir)
+    checksum_url = urllib.parse.urljoin(build_url, "SHA256SUMS")
+    signature_url = urllib.parse.urljoin(build_url, "SHA256SUMS.asc")
+
+    sums = tmp_dir / f"lc-{distro}-{release}-{build_key}-SHA256SUMS"
+    sums_sig = tmp_dir / f"lc-{distro}-{release}-{build_key}-SHA256SUMS.asc"
+    sums_text = fetch_text(checksum_url)
+    write_bytes(sums, sums_text.encode("utf-8"))
+    write_bytes(sums_sig, fetch_bytes(signature_url))
+
+    parsed = parse_sha_line(sums_text, file_name)
+    if parsed.lower() != sha256.lower():
+        raise RuntimeError(
+            f"sha256 mismatch for {product_key} build {build_key}: streams={sha256}, sums={parsed}"
+        )
+
+    gpg_home = create_gpg_home(tmp_dir, f"gpg-lc-{distro}-{release}-{build_key}".replace(":", "-"))
+    discovered_fp = verify_with_key_recovery(gpg_home, sums_sig, sums, tmp_dir)
+    armored = export_armored_key(gpg_home, discovered_fp)
+
+    image_yaml_url = urllib.parse.urljoin(build_url, "image.yaml")
+    image_yaml = fetch_text(image_yaml_url)
+    normalized_manager = normalize_package_manager(parse_packages_manager(image_yaml))
+
+    entry = {
+        "id": f"{distro}-{release}-arm64",
+        "distro": distro,
+        "version": release,
+        "arch": "arm64",
+        "tarballURL": tar_url,
+        "sha256": sha256,
+        "signatureURL": signature_url,
+        "checksumURL": checksum_url,
+        "signatureTarget": "checksum",
+        "keyFingerprint": discovered_fp,
+        "serviceManager": service_manager_for_distro(distro),
+        "userConvergenceTemplate": user_convergence_template_for_distro(distro),
+        "cacheSharingDefaults": cache_sharing_defaults_for_manager(normalized_manager),
+    }
+    return entry, discovered_fp, armored
 
 
 def discover_alpine_keys(tmp_dir: Path):
@@ -497,7 +696,9 @@ def render_entry(entry):
             "CacheSharingConfig(\n"
             f"                enabled: {'true' if cache_sharing_defaults.get('enabled', False) else 'false'},\n"
             f"                apt: {'true' if cache_sharing_defaults.get('apt', True) else 'false'},\n"
-            f"                apk: {'true' if cache_sharing_defaults.get('apk', True) else 'false'}\n"
+            f"                apk: {'true' if cache_sharing_defaults.get('apk', True) else 'false'},\n"
+            f"                zypper: {'true' if cache_sharing_defaults.get('zypper', False) else 'false'},\n"
+            f"                dnf: {'true' if cache_sharing_defaults.get('dnf', False) else 'false'}\n"
             "            )"
         )
     else:
@@ -535,26 +736,20 @@ def render_install_descriptor(item):
     )
 
 
-def build_install_catalog(alpine_entry_data, ubuntu_entries):
+def build_install_catalog(targets, entries):
     install_items = []
-    install_items.append(
-        {
-            "canonicalName": ALPINE_RELEASE["canonicalName"],
-            "aliases": ALPINE_RELEASE["aliases"],
-            "manifestId": alpine_entry_data["id"],
-        }
-    )
-
-    ubuntu_by_version = {entry["version"]: entry for entry in ubuntu_entries}
-    for release in UBUNTU_RELEASES:
-        version = release["version"]
-        manifest = ubuntu_by_version.get(version)
+    entry_by_key = {
+        f"{entry['distro']}:{entry['version']}": entry for entry in entries
+    }
+    for target in targets:
+        key = f"{target['distro']}:{target['release']}"
+        manifest = entry_by_key.get(key)
         if not manifest:
-            raise RuntimeError(f"missing ubuntu entry for install catalog version {version}")
+            raise RuntimeError(f"missing manifest entry for install catalog target {key}")
         install_items.append(
             {
-                "canonicalName": release["canonicalName"],
-                "aliases": release["aliases"],
+                "canonicalName": target["canonicalName"],
+                "aliases": target["aliases"],
                 "manifestId": manifest["id"],
             }
         )
@@ -576,25 +771,24 @@ def build_install_catalog(alpine_entry_data, ubuntu_entries):
     return install_items
 
 
-def write_generated_swift(alpine, ubuntu_entries, install_catalog):
+def write_generated_swift(entries, install_catalog):
     GEN_DIR.mkdir(parents=True, exist_ok=True)
     alpine_path = GEN_DIR / "DistributionManifest+Alpine.swift"
     alpine_code = (
         "import Foundation\n\n"
         "enum EmbeddedDistributionManifestAlpine {\n"
-        "    static let entries: [DistributionManifestEntry] = [\n"
-        + render_entry(alpine)
-        + "\n    ]\n}\n"
+        "    static let entries: [DistributionManifestEntry] = []\n"
+        "}\n"
     )
     alpine_path.write_text(alpine_code, encoding="utf-8")
 
-    ubuntu_items = ",\n".join(render_entry(e) for e in ubuntu_entries)
+    manifest_items = ",\n".join(render_entry(e) for e in entries)
     ubuntu_path = GEN_DIR / "DistributionManifest+Ubuntu.swift"
     ubuntu_code = (
         "import Foundation\n\n"
         "enum EmbeddedDistributionManifestUbuntu {\n"
         "    static let entries: [DistributionManifestEntry] = [\n"
-        + ubuntu_items
+        + manifest_items
         + "\n    ]\n}\n"
     )
     ubuntu_path.write_text(ubuntu_code, encoding="utf-8")
@@ -645,18 +839,16 @@ def write_trusted_keys(keys_by_fp):
 def main():
     with tempfile.TemporaryDirectory(prefix="msl-manifest-update-") as tmp:
         tmp_dir = Path(tmp)
-        alpine, alpine_fp, alpine_key = alpine_entry(tmp_dir)
-        ubuntu_entries = []
-        keys = {alpine_fp: alpine_key}
-        for release in UBUNTU_RELEASES:
-            version = release["version"]
-            release_url = release["releaseURL"]
-            entry, fp, key = ubuntu_entry(version, release_url, tmp_dir)
-            ubuntu_entries.append(entry)
+        products = fetch_linuxcontainers_streams()
+        entries = []
+        keys = {}
+        for target in TARGET_RELEASES:
+            entry, fp, key = linuxcontainers_entry(target, products, tmp_dir)
+            entries.append(entry)
             keys[fp] = key
 
-        install_catalog = build_install_catalog(alpine, ubuntu_entries)
-        generated_paths = write_generated_swift(alpine, ubuntu_entries, install_catalog)
+        install_catalog = build_install_catalog(TARGET_RELEASES, entries)
+        generated_paths = write_generated_swift(entries, install_catalog)
         trusted_keys_path = write_trusted_keys(keys)
 
     print("updated embedded distribution manifest")

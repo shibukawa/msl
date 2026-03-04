@@ -33,7 +33,7 @@ public enum MSLCLIOptionsParser {
         var instanceName: String?
         var remaining: [String] = []
         let subcommands: Set<String> = [
-            "run", "install", "uninstall", "cache", "config", "init",
+            "run", "list", "install", "uninstall", "cache", "config", "init",
             "memory", "port", "network", "status", "stop"
         ]
 

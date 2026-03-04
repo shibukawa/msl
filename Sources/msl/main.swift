@@ -51,46 +51,6 @@ func withRuntimeManager(_ action: (RuntimeManager) throws -> Void) {
     }
 }
 
-func emitLegacyWarning(_ warning: String?) {
-    guard let warning else { return }
-    fputs("warning: \(warning)\n", stderr)
-}
-
-func rewriteLegacyStatusStopArguments(_ raw: [String]) throws -> ([String], String?) {
-    let parsed = try MSLCLIOptionsParser.parseGlobalRuntimeOptions(raw)
-    if parsed.remainingArguments.count == 2,
-       parsed.remainingArguments[0] == "run",
-       parsed.remainingArguments[1] == "--help" || parsed.remainingArguments[1] == "-h" {
-        var rewritten: [String] = []
-        if let instance = parsed.instanceName {
-            rewritten.append("--instance")
-            rewritten.append(instance)
-        }
-        rewritten.append(contentsOf: ["help", "run"])
-        return (rewritten, nil)
-    }
-
-    guard let first = parsed.remainingArguments.first, first == "--status" || first == "--stop" else {
-        return (raw, nil)
-    }
-
-    let replacement = (first == "--status") ? "status" : "stop"
-    let tail = Array(parsed.remainingArguments.dropFirst())
-
-    var rewritten: [String] = []
-    if let instance = parsed.instanceName {
-        rewritten.append("--instance")
-        rewritten.append(instance)
-    }
-    rewritten.append(replacement)
-    rewritten.append(contentsOf: tail)
-
-    return (
-        rewritten,
-        "`msl \(first)` is deprecated; use `msl \(replacement)` instead"
-    )
-}
-
 func handleInternalRuntimeFlags(_ parsed: MSLGlobalRuntimeOptions) -> Bool {
     let instanceName = parsed.instanceName
     let args = parsed.remainingArguments
@@ -185,6 +145,7 @@ struct MSLCommand: ParsableCommand {
         version: "dev",
         subcommands: [
             RunCommand.self,
+            ListCommand.self,
             StatusCommand.self,
             StopCommand.self,
             InstallCommand.self,
@@ -202,9 +163,6 @@ struct MSLCommand: ParsableCommand {
     @Option(name: [.short, .long], help: "Target instance name.")
     var instance: String?
 
-    @Flag(name: [.customLong("list")], help: "List installed instances.")
-    var list = false
-
     @Option(name: [.customLong("set-default")], help: "Set default instance name.")
     var setDefault: String?
 
@@ -215,19 +173,15 @@ struct MSLCommand: ParsableCommand {
         CLIInvocationContext.instanceName = instance
 
         var modeCount = 0
-        if list { modeCount += 1 }
         if setDefault != nil { modeCount += 1 }
         if serialConsole { modeCount += 1 }
         if modeCount > 1 {
-            throw ValidationError("Use only one of --list, --set-default, or --serial-console")
+            throw ValidationError("Use only one of --set-default or --serial-console")
         }
     }
 
     mutating func run() throws {
         withRuntimeManager { manager in
-            if list {
-                try manager.listInstalledInstances()
-            }
             if let setDefault {
                 try manager.setDefaultInstance(name: setDefault)
             }
@@ -268,6 +222,19 @@ struct RunCommand: ParsableCommand {
                 timeoutSec: timeout ?? 0,
                 instanceName: CLIInvocationContext.instanceName
             )
+        }
+    }
+}
+
+struct ListCommand: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "list",
+        abstract: "List installed instances."
+    )
+
+    mutating func run() throws {
+        withRuntimeManager { manager in
+            try manager.listInstalledInstances()
         }
     }
 }
@@ -665,17 +632,14 @@ func runMSLCLI() {
     let raw = Array(CommandLine.arguments.dropFirst())
 
     do {
-        let rewritten = try rewriteLegacyStatusStopArguments(raw)
-        emitLegacyWarning(rewritten.1)
-
-        let globalParsed = try MSLCLIOptionsParser.parseGlobalRuntimeOptions(rewritten.0)
+        let globalParsed = try MSLCLIOptionsParser.parseGlobalRuntimeOptions(raw)
         CLIInvocationContext.instanceName = globalParsed.instanceName
 
         if handleInternalRuntimeFlags(globalParsed) {
             return
         }
 
-        MSLCommand.main(rewritten.0)
+        MSLCommand.main(raw)
     } catch let error as MSLCLIParseError {
         fail(error.errorDescription ?? String(describing: error))
     } catch {

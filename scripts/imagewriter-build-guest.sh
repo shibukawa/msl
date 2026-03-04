@@ -332,6 +332,13 @@ install_packages() {
   if [ -z "$PACKAGES" ]; then
     return
   fi
+  # The source rootfs may be Debian/Ubuntu/Fedora/openSUSE and must not be
+  # mutated with Alpine packages. Keep package installation scoped to Alpine
+  # rootfs only (imagewriter runtime dependencies are prepared separately).
+  if [ ! -f "$ROOTFS_DIR/etc/alpine-release" ]; then
+    echo "imagewriter_guest_skip_apk_root_install reason=non_alpine_rootfs"
+    return
+  fi
   if ! command -v apk >/dev/null 2>&1; then
     echo "error: apk command not found in guest worker environment" >&2
     exit 1

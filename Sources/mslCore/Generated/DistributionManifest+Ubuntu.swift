@@ -3,23 +3,23 @@ import Foundation
 enum EmbeddedDistributionManifestUbuntu {
     static let entries: [DistributionManifestEntry] = [
         DistributionManifestEntry(
-            id: "ubuntu-24.04-arm64",
-            distro: "ubuntu",
-            version: "24.04",
+            id: "amazonlinux-2-arm64",
+            distro: "amazonlinux",
+            version: "2",
             arch: "arm64",
-            tarballURL: "https://cloud-images.ubuntu.com/minimal/releases/noble/release/ubuntu-24.04-minimal-cloudimg-arm64-root.tar.xz",
-            sha256: "eb50d09466a96381bd1bd68d2a78f2c55be2b6d0256c5df323a35992c180e8ff",
-            signatureURL: "https://cloud-images.ubuntu.com/minimal/releases/noble/release/SHA256SUMS.gpg",
-            checksumURL: "https://cloud-images.ubuntu.com/minimal/releases/noble/release/SHA256SUMS",
+            tarballURL: "https://images.linuxcontainers.org/images/amazonlinux/2/arm64/default/20260304_05:22/rootfs.tar.xz",
+            sha256: "ef3bbb596b90715eb3efdae7d8d5dd466fb1ad8ed62f0504009bcbf221e0cce1",
+            signatureURL: "https://images.linuxcontainers.org/images/amazonlinux/2/arm64/default/20260304_05:22/SHA256SUMS.asc",
+            checksumURL: "https://images.linuxcontainers.org/images/amazonlinux/2/arm64/default/20260304_05:22/SHA256SUMS",
             signatureTarget: "checksum",
-            keyFingerprint: "D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81",
+            keyFingerprint: "E7FB0CAEC8173D669066514CBAEFF88C22F6E216",
             supportState: .supported,
             serviceManager: "systemd",
             defaultInitMode: nil,
             userConvergenceTemplate: UserConvergencePolicyTemplate(
-                templateId: "ubuntu-useradd-v1",
+                templateId: "amazonlinux-useradd-v1",
                 commandFamily: "useradd",
-                adminGroup: "sudo",
+                adminGroup: "wheel",
                 sudoPolicy: SudoPolicyTemplate(
                     enabled: true,
                     requireSudoBinary: false,
@@ -40,21 +40,111 @@ enum EmbeddedDistributionManifestUbuntu {
             ),
             cacheSharingDefaults: CacheSharingConfig(
                 enabled: true,
-                apt: true,
-                apk: false
+                apt: false,
+                apk: false,
+                zypper: false,
+                dnf: true
             )
         ),
         DistributionManifestEntry(
-            id: "ubuntu-25.10-arm64",
-            distro: "ubuntu",
-            version: "25.10",
+            id: "alpine-3.23-arm64",
+            distro: "alpine",
+            version: "3.23",
             arch: "arm64",
-            tarballURL: "https://cloud-images.ubuntu.com/minimal/releases/questing/release/ubuntu-25.10-minimal-cloudimg-arm64-root.tar.xz",
-            sha256: "a07a41510882f8c043ad85e8499859c7129ebdb0a72f166372cc31c365b279a9",
-            signatureURL: "https://cloud-images.ubuntu.com/minimal/releases/questing/release/SHA256SUMS.gpg",
-            checksumURL: "https://cloud-images.ubuntu.com/minimal/releases/questing/release/SHA256SUMS",
+            tarballURL: "https://images.linuxcontainers.org/images/alpine/3.23/arm64/default/20260304_02:43/rootfs.tar.xz",
+            sha256: "db0a56e8b7499b4b496546e04e3859c7f4eeda38c79d5e848e381455ccb585f1",
+            signatureURL: "https://images.linuxcontainers.org/images/alpine/3.23/arm64/default/20260304_02:43/SHA256SUMS.asc",
+            checksumURL: "https://images.linuxcontainers.org/images/alpine/3.23/arm64/default/20260304_02:43/SHA256SUMS",
             signatureTarget: "checksum",
-            keyFingerprint: "D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81",
+            keyFingerprint: "E7FB0CAEC8173D669066514CBAEFF88C22F6E216",
+            supportState: .supported,
+            serviceManager: "openrc",
+            defaultInitMode: nil,
+            userConvergenceTemplate: UserConvergencePolicyTemplate(
+                templateId: "alpine-busybox-v1",
+                commandFamily: "busybox_adduser",
+                adminGroup: "wheel",
+                sudoPolicy: SudoPolicyTemplate(
+                    enabled: true,
+                    requireSudoBinary: false,
+                    dropInPath: "/etc/sudoers.d/msl-user",
+                    passwordless: true
+                ),
+                suPolicy: SuPolicyTemplate(
+                    enabled: true,
+                    passwordless: true
+                ),
+                shellFallbacks: ["/bin/ash", "/bin/sh"],
+                welcomePolicy: WelcomePolicyTemplate(
+                    enabled: true,
+                    frequency: "daily",
+                    respectHushlogin: true
+                ),
+                editable: false
+            ),
+            cacheSharingDefaults: CacheSharingConfig(
+                enabled: true,
+                apt: false,
+                apk: true,
+                zypper: false,
+                dnf: false
+            )
+        ),
+        DistributionManifestEntry(
+            id: "debian-trixie-arm64",
+            distro: "debian",
+            version: "trixie",
+            arch: "arm64",
+            tarballURL: "https://images.linuxcontainers.org/images/debian/trixie/arm64/default/20260304_05:24/rootfs.tar.xz",
+            sha256: "69c5535ddd7f89799dbd1138d5851a4ae53492d706624c553900d7c2ca0ab89a",
+            signatureURL: "https://images.linuxcontainers.org/images/debian/trixie/arm64/default/20260304_05:24/SHA256SUMS.asc",
+            checksumURL: "https://images.linuxcontainers.org/images/debian/trixie/arm64/default/20260304_05:24/SHA256SUMS",
+            signatureTarget: "checksum",
+            keyFingerprint: "E7FB0CAEC8173D669066514CBAEFF88C22F6E216",
+            supportState: .supported,
+            serviceManager: "systemd",
+            defaultInitMode: nil,
+            userConvergenceTemplate: UserConvergencePolicyTemplate(
+                templateId: "debian-useradd-v1",
+                commandFamily: "useradd",
+                adminGroup: "sudo",
+                sudoPolicy: SudoPolicyTemplate(
+                    enabled: true,
+                    requireSudoBinary: false,
+                    dropInPath: "/etc/sudoers.d/msl-user",
+                    passwordless: true
+                ),
+                suPolicy: SuPolicyTemplate(
+                    enabled: false,
+                    passwordless: false
+                ),
+                shellFallbacks: ["/bin/bash", "/bin/sh"],
+                welcomePolicy: WelcomePolicyTemplate(
+                    enabled: true,
+                    frequency: "daily",
+                    respectHushlogin: true
+                ),
+                editable: false
+            ),
+            cacheSharingDefaults: CacheSharingConfig(
+                enabled: true,
+                apt: true,
+                apk: false,
+                zypper: false,
+                dnf: false
+            )
+        ),
+        DistributionManifestEntry(
+            id: "ubuntu-noble-arm64",
+            distro: "ubuntu",
+            version: "noble",
+            arch: "arm64",
+            tarballURL: "https://images.linuxcontainers.org/images/ubuntu/noble/arm64/default/20260304_07:42/rootfs.tar.xz",
+            sha256: "60bd727dd135eacd6a43b66186b071430ede922a309f7a2ad67ed02a4675294d",
+            signatureURL: "https://images.linuxcontainers.org/images/ubuntu/noble/arm64/default/20260304_07:42/SHA256SUMS.asc",
+            checksumURL: "https://images.linuxcontainers.org/images/ubuntu/noble/arm64/default/20260304_07:42/SHA256SUMS",
+            signatureTarget: "checksum",
+            keyFingerprint: "E7FB0CAEC8173D669066514CBAEFF88C22F6E216",
             supportState: .supported,
             serviceManager: "systemd",
             defaultInitMode: nil,
@@ -83,7 +173,141 @@ enum EmbeddedDistributionManifestUbuntu {
             cacheSharingDefaults: CacheSharingConfig(
                 enabled: true,
                 apt: true,
-                apk: false
+                apk: false,
+                zypper: false,
+                dnf: false
+            )
+        ),
+        DistributionManifestEntry(
+            id: "ubuntu-questing-arm64",
+            distro: "ubuntu",
+            version: "questing",
+            arch: "arm64",
+            tarballURL: "https://images.linuxcontainers.org/images/ubuntu/questing/arm64/default/20260304_07:42/rootfs.tar.xz",
+            sha256: "2cb1040a6263e9af0fcbb14de92e20813019ba427801de9a3b197e75f7b17559",
+            signatureURL: "https://images.linuxcontainers.org/images/ubuntu/questing/arm64/default/20260304_07:42/SHA256SUMS.asc",
+            checksumURL: "https://images.linuxcontainers.org/images/ubuntu/questing/arm64/default/20260304_07:42/SHA256SUMS",
+            signatureTarget: "checksum",
+            keyFingerprint: "E7FB0CAEC8173D669066514CBAEFF88C22F6E216",
+            supportState: .supported,
+            serviceManager: "systemd",
+            defaultInitMode: nil,
+            userConvergenceTemplate: UserConvergencePolicyTemplate(
+                templateId: "ubuntu-useradd-v1",
+                commandFamily: "useradd",
+                adminGroup: "sudo",
+                sudoPolicy: SudoPolicyTemplate(
+                    enabled: true,
+                    requireSudoBinary: false,
+                    dropInPath: "/etc/sudoers.d/msl-user",
+                    passwordless: true
+                ),
+                suPolicy: SuPolicyTemplate(
+                    enabled: false,
+                    passwordless: false
+                ),
+                shellFallbacks: ["/bin/bash", "/bin/sh"],
+                welcomePolicy: WelcomePolicyTemplate(
+                    enabled: true,
+                    frequency: "daily",
+                    respectHushlogin: true
+                ),
+                editable: false
+            ),
+            cacheSharingDefaults: CacheSharingConfig(
+                enabled: true,
+                apt: true,
+                apk: false,
+                zypper: false,
+                dnf: false
+            )
+        ),
+        DistributionManifestEntry(
+            id: "fedora-43-arm64",
+            distro: "fedora",
+            version: "43",
+            arch: "arm64",
+            tarballURL: "https://images.linuxcontainers.org/images/fedora/43/arm64/default/20260304_01:55/rootfs.tar.xz",
+            sha256: "ebc18508d312cc6849658ee09d2e4ab1f9c18b01fc4bd2a80678d5d8c2d2031c",
+            signatureURL: "https://images.linuxcontainers.org/images/fedora/43/arm64/default/20260304_01:55/SHA256SUMS.asc",
+            checksumURL: "https://images.linuxcontainers.org/images/fedora/43/arm64/default/20260304_01:55/SHA256SUMS",
+            signatureTarget: "checksum",
+            keyFingerprint: "E7FB0CAEC8173D669066514CBAEFF88C22F6E216",
+            supportState: .supported,
+            serviceManager: "systemd",
+            defaultInitMode: nil,
+            userConvergenceTemplate: UserConvergencePolicyTemplate(
+                templateId: "fedora-useradd-v1",
+                commandFamily: "useradd",
+                adminGroup: "wheel",
+                sudoPolicy: SudoPolicyTemplate(
+                    enabled: true,
+                    requireSudoBinary: false,
+                    dropInPath: "/etc/sudoers.d/msl-user",
+                    passwordless: true
+                ),
+                suPolicy: SuPolicyTemplate(
+                    enabled: false,
+                    passwordless: false
+                ),
+                shellFallbacks: ["/bin/bash", "/bin/sh"],
+                welcomePolicy: WelcomePolicyTemplate(
+                    enabled: true,
+                    frequency: "daily",
+                    respectHushlogin: true
+                ),
+                editable: false
+            ),
+            cacheSharingDefaults: CacheSharingConfig(
+                enabled: true,
+                apt: false,
+                apk: false,
+                zypper: false,
+                dnf: true
+            )
+        ),
+        DistributionManifestEntry(
+            id: "opensuse-16.0-arm64",
+            distro: "opensuse",
+            version: "16.0",
+            arch: "arm64",
+            tarballURL: "https://images.linuxcontainers.org/images/opensuse/16.0/arm64/default/20260304_04:20/rootfs.tar.xz",
+            sha256: "e5ac9ae4de4462f530704b46ffc1beb69d9b9cd1897ccd4d03327f6df8fad042",
+            signatureURL: "https://images.linuxcontainers.org/images/opensuse/16.0/arm64/default/20260304_04:20/SHA256SUMS.asc",
+            checksumURL: "https://images.linuxcontainers.org/images/opensuse/16.0/arm64/default/20260304_04:20/SHA256SUMS",
+            signatureTarget: "checksum",
+            keyFingerprint: "E7FB0CAEC8173D669066514CBAEFF88C22F6E216",
+            supportState: .supported,
+            serviceManager: "systemd",
+            defaultInitMode: nil,
+            userConvergenceTemplate: UserConvergencePolicyTemplate(
+                templateId: "opensuse-useradd-v1",
+                commandFamily: "useradd",
+                adminGroup: "wheel",
+                sudoPolicy: SudoPolicyTemplate(
+                    enabled: true,
+                    requireSudoBinary: false,
+                    dropInPath: "/etc/sudoers.d/msl-user",
+                    passwordless: true
+                ),
+                suPolicy: SuPolicyTemplate(
+                    enabled: false,
+                    passwordless: false
+                ),
+                shellFallbacks: ["/bin/bash", "/bin/sh"],
+                welcomePolicy: WelcomePolicyTemplate(
+                    enabled: true,
+                    frequency: "daily",
+                    respectHushlogin: true
+                ),
+                editable: false
+            ),
+            cacheSharingDefaults: CacheSharingConfig(
+                enabled: true,
+                apt: false,
+                apk: false,
+                zypper: true,
+                dnf: false
             )
         )
     ]
