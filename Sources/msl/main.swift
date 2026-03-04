@@ -1,3 +1,4 @@
+import ArgumentParser
 import Foundation
 import mslCore
 
@@ -6,43 +7,20 @@ func fail(_ message: String, code: Int32 = 1) -> Never {
     Foundation.exit(code)
 }
 
-func parseCacheFetchArgs(_ raw: [String]) -> (targetAlias: String?, localFilePath: String?, force: Bool) {
-    var i = 0
-    var targetAlias: String?
-    var localFilePath: String?
-    var force = false
-
-    while i < raw.count {
-        let token = raw[i]
-        switch token {
-        case "--rootfs", "--file":
-            guard i + 1 < raw.count else { fail("missing value for \(token)") }
-            localFilePath = raw[i + 1]
-            i += 2
-        case "--force":
-            force = true
-            i += 1
-        default:
-            if token.hasPrefix("--") {
-                fail("unknown option for cache fetch: \(token)")
-            }
-            if targetAlias != nil {
-                fail("cache fetch accepts only one distro target")
-            }
-            targetAlias = token
-            i += 1
-        }
-    }
-    if targetAlias == nil && localFilePath == nil {
-        fail("usage: msl cache fetch <distro> [--force] | msl cache fetch --rootfs <path> [--force]")
-    }
-    if targetAlias != nil && localFilePath != nil {
-        fail("use either distro target or --rootfs, not both")
-    }
-    return (targetAlias, localFilePath, force)
+enum CLIInvocationContext {
+    static var instanceName: String?
 }
 
-func defaultInstallName(targetAlias: String?, localFilePath: String?) -> String {
+struct InstallInvocation {
+    let name: String
+    let targetAlias: String?
+    let localFilePath: String?
+    let rawDiskPath: String?
+    let rebuild: Bool
+    let diskSizeGB: Int?
+}
+
+func defaultInstallName(targetAlias: String?, localFilePath: String?, rawDiskPath: String?) -> String {
     if let targetAlias, !targetAlias.isEmpty {
         return targetAlias
     }
@@ -56,406 +34,653 @@ func defaultInstallName(targetAlias: String?, localFilePath: String?) -> String 
         }
         return name
     }
+    if let rawDiskPath, !rawDiskPath.isEmpty {
+        return URL(fileURLWithPath: rawDiskPath).deletingPathExtension().lastPathComponent
+    }
     return "default"
 }
 
-func parseInstallArgs(_ raw: [String]) -> (
-    name: String,
-    targetAlias: String?,
-    localFilePath: String?,
-    rebuild: Bool,
-    diskSizeGB: Int?
-) {
-    var i = 0
-    var name: String?
-    var targetAlias: String?
-    var localFilePath: String?
-    var rebuild = false
-    var diskSizeGB: Int?
+func withRuntimeManager(_ action: (RuntimeManager) throws -> Void) {
+    do {
+        let manager = try RuntimeManager(executablePath: CommandLine.arguments[0])
+        try action(manager)
+    } catch let err as MSLRuntimeError {
+        fail(err.message, code: err.exitCode)
+    } catch {
+        fail(String(describing: error))
+    }
+}
 
-    while i < raw.count {
-        let token = raw[i]
-        switch token {
-        case "--name":
-            guard i + 1 < raw.count else { fail("missing value for --name") }
-            name = raw[i + 1]
-            i += 2
-        case "--distro": // compatibility alias
-            guard i + 1 < raw.count else { fail("missing value for \(token)") }
-            targetAlias = raw[i + 1]
-            i += 2
-        case "--rootfs", "--file":
-            guard i + 1 < raw.count else { fail("missing value for \(token)") }
-            localFilePath = raw[i + 1]
-            i += 2
-        case "--rebuild":
-            rebuild = true
-            i += 1
-        case "--disk-size-gb":
-            guard i + 1 < raw.count else { fail("missing value for --disk-size-gb") }
-            guard let value = Int(raw[i + 1]), value > 0 else {
-                fail("--disk-size-gb must be a positive integer")
-            }
-            diskSizeGB = value
-            i += 2
-        default:
-            if token.hasPrefix("--") {
-                fail("unknown option for install: \(token)")
-            }
-            if targetAlias != nil {
-                fail("install accepts only one distribution positional argument")
-            }
-            targetAlias = token
-            i += 1
+func emitLegacyWarning(_ warning: String?) {
+    guard let warning else { return }
+    fputs("warning: \(warning)\n", stderr)
+}
+
+func rewriteLegacyStatusStopArguments(_ raw: [String]) throws -> ([String], String?) {
+    let parsed = try MSLCLIOptionsParser.parseGlobalRuntimeOptions(raw)
+    if parsed.remainingArguments.count == 2,
+       parsed.remainingArguments[0] == "run",
+       parsed.remainingArguments[1] == "--help" || parsed.remainingArguments[1] == "-h" {
+        var rewritten: [String] = []
+        if let instance = parsed.instanceName {
+            rewritten.append("--instance")
+            rewritten.append(instance)
         }
+        rewritten.append(contentsOf: ["help", "run"])
+        return (rewritten, nil)
     }
 
-    if targetAlias == nil && localFilePath == nil {
-        fail("install requires <distribution-name> or --rootfs <path>")
+    guard let first = parsed.remainingArguments.first, first == "--status" || first == "--stop" else {
+        return (raw, nil)
     }
-    if targetAlias != nil && localFilePath != nil {
-        fail("use either distribution-name or --rootfs, not both")
+
+    let replacement = (first == "--status") ? "status" : "stop"
+    let tail = Array(parsed.remainingArguments.dropFirst())
+
+    var rewritten: [String] = []
+    if let instance = parsed.instanceName {
+        rewritten.append("--instance")
+        rewritten.append(instance)
     }
+    rewritten.append(replacement)
+    rewritten.append(contentsOf: tail)
+
     return (
-        name ?? defaultInstallName(targetAlias: targetAlias, localFilePath: localFilePath),
-        targetAlias,
-        localFilePath,
-        rebuild,
-        diskSizeGB
+        rewritten,
+        "`msl \(first)` is deprecated; use `msl \(replacement)` instead"
     )
 }
 
-func parseUninstallArgs(_ raw: [String]) -> (name: String, keepCache: Bool) {
-    var i = 0
-    var keepCache = false
-    var name: String?
-
-    while i < raw.count {
-        let token = raw[i]
-        switch token {
-        case "--keep-cache":
-            keepCache = true
-            i += 1
-        default:
-            if token.hasPrefix("--") {
-                fail("unknown option for uninstall: \(token)")
-            }
-            if name != nil {
-                fail("uninstall accepts only one instance name")
-            }
-            name = token
-            i += 1
-        }
-    }
-
-    guard let name else {
-        fail("usage: msl uninstall <instance-name> [--keep-cache]")
-    }
-    return (name, keepCache)
-}
-
-func parseInitWorkspaceArgs(_ raw: [String]) -> Bool {
-    var i = 0
-    var force = false
-
-    while i < raw.count {
-        let token = raw[i]
-        switch token {
-        case "--force":
-            force = true
-            i += 1
-        default:
-            fail("unknown option for init workspace: \(token)")
-        }
-    }
-    return force
-}
-
-func parseImageBuildArgs(_ raw: [String]) -> (profile: String, config: String, output: String, force: Bool) {
-    var i = 0
-    var profile = "default"
-    var config: String?
-    var output: String?
-    var force = false
-
-    while i < raw.count {
-        let token = raw[i]
-        switch token {
-        case "--profile":
-            guard i + 1 < raw.count else { fail("missing value for --profile") }
-            profile = raw[i + 1]
-            i += 2
-        case "--config":
-            guard i + 1 < raw.count else { fail("missing value for --config") }
-            config = raw[i + 1]
-            i += 2
-        case "--output":
-            guard i + 1 < raw.count else { fail("missing value for --output") }
-            output = raw[i + 1]
-            i += 2
-        case "--force":
-            force = true
-            i += 1
-        default:
-            fail("unknown option for image build: \(token)")
-        }
-    }
-
-    guard let config, !config.isEmpty else {
-        fail("usage: msl image build --profile <name> --config <path> --output <path> [--force]")
-    }
-    guard let output, !output.isEmpty else {
-        fail("usage: msl image build --profile <name> --config <path> --output <path> [--force]")
-    }
-    return (profile, config, output, force)
-}
-
-do {
-    let parsed: MSLGlobalRuntimeOptions
-    do {
-        parsed = try MSLCLIOptionsParser.parseGlobalRuntimeOptions(Array(CommandLine.arguments.dropFirst()))
-    } catch let error as MSLCLIParseError {
-        fail(error.errorDescription ?? String(describing: error))
-    }
+func handleInternalRuntimeFlags(_ parsed: MSLGlobalRuntimeOptions) -> Bool {
     let instanceName = parsed.instanceName
     let args = parsed.remainingArguments
-    let manager = try RuntimeManager(executablePath: CommandLine.arguments[0])
 
-    if args.isEmpty {
-        try manager.runDefaultShell(instanceName: instanceName)
-    }
-
-    if args.count == 1, args[0] == "--serial-console" {
-        setenv("MSL_ATTACH_SERIAL", "1", 1)
-        try manager.runDefaultShell(instanceName: instanceName)
-    }
-
-    if !args.isEmpty, args[0] == "--status" {
-        let tail = Array(args.dropFirst())
-        var all = false
-        for token in tail {
-            if token == "--all" {
-                all = true
-                continue
-            }
-            fail("unknown option for --status: \(token)")
-        }
-        try manager.printStatus(instanceName: instanceName, all: all)
-        Foundation.exit(0)
-    }
-
-    if !args.isEmpty, args[0] == "--stop" {
-        let tail = Array(args.dropFirst())
-        var all = false
-        for token in tail {
-            if token == "--all" {
-                all = true
-                continue
-            }
-            fail("unknown option for --stop: \(token)")
-        }
-        try manager.stopVM(instanceName: instanceName, all: all)
-        Foundation.exit(0)
-    }
-
-    if args.count == 1, args[0] == "--list" {
-        try manager.listInstalledInstances()
-    }
-
-    if args.count == 2, args[0] == "--set-default" {
-        try manager.setDefaultInstance(name: args[1])
-    }
-
-    // --- msl --_daemon (internal: daemon process) ---
     if args.count == 1, args[0] == "--_daemon" {
-        try manager.runDaemon(instanceName: instanceName)
-    }
-
-    // --- msl run [--timeout N] <cmd> [args...] ---
-    if args.first == "run" {
-        var timeoutSec = 0
-        var runArgs = Array(args.dropFirst())
-        if runArgs.count >= 2, runArgs[0] == "--timeout", let t = Int(runArgs[1]), t > 0 {
-            timeoutSec = t
-            runArgs = Array(runArgs.dropFirst(2))
+        withRuntimeManager { manager in
+            try manager.runDaemon(instanceName: instanceName)
         }
-        if runArgs.isEmpty {
-            fail("usage: msl run [--timeout N] <command> [args...]")
-        }
-        try manager.runCommand(argv: runArgs, timeoutSec: timeoutSec, instanceName: instanceName)
-    }
-
-    // --- msl cache fetch <distro> [--force]
-    // --- msl cache fetch --rootfs <path> [--force]
-    if args.count >= 2, args[0] == "cache" {
-        let sub = args[1]
-        if sub == "fetch" {
-            let parsed = parseCacheFetchArgs(Array(args.dropFirst(2)))
-            try manager.runCacheFetch(
-                targetAlias: parsed.targetAlias,
-                localFilePath: parsed.localFilePath,
-                force: parsed.force
-            )
-        }
-        if sub == "status" {
-            try manager.runCacheSharingStatus()
-        }
-        fail("unsupported cache command. use: msl cache fetch <distro>|--rootfs <path> [--force] | msl cache status")
-    }
-
-    if args.count >= 2, args[0] == "init" {
-        let sub = args[1]
-        if sub == "workspace" {
-            let force = parseInitWorkspaceArgs(Array(args.dropFirst(2)))
-            try manager.runInitWorkspace(force: force)
-        }
-        fail("unsupported init command. use: msl init workspace [--force]")
-    }
-
-    if args.count >= 2, args[0] == "config" {
-        let sub = args[1]
-        if sub == "set" {
-            if args.count != 4 {
-                fail("usage: msl config set storageCacheToggles.<name> <true|false> | network.dns.mode <host|manual|unmanaged> | network.dns.manualNameservers <ip[,ip...]> | network.dns.manualSearchDomains <domain[,domain...]>")
-            }
-            try manager.runSetConfig(path: args[2], value: args[3])
-        }
-
-        if sub == "cache" {
-            if args.count == 3, args[2] == "ls" {
-                try manager.runListStorageCacheToggles()
-            }
-            fail("unsupported config cache command. use: msl config cache ls")
-        }
-
-        if sub == "cache-sharing" {
-            if args.count == 3, args[2] == "ls" {
-                try manager.runCacheSharingStatus()
-            }
-            fail("unsupported config cache-sharing command. use: msl config cache-sharing ls")
-        }
-
-        fail("unsupported config command. use: msl config set storageCacheToggles.<name> <true|false> | network.dns.mode <host|manual|unmanaged> | network.dns.manualNameservers <ip[,ip...]> | network.dns.manualSearchDomains <domain[,domain...]> | msl config cache ls | msl config cache-sharing ls")
-    }
-
-    if args.first == "memory" {
-        if args.count == 1 || (args.count == 2 && args[1] == "status") {
-            try manager.printMemoryStatus(instanceName: instanceName)
-            Foundation.exit(0)
-        }
-        fail("unsupported memory command. use: msl memory [status]")
-    }
-
-    // --- msl install <distribution-name> [--name <instance>] [--rootfs <path>] [--rebuild] [--disk-size-gb <n>]
-    if args.first == "install" {
-        if args.count == 2, args[1] == "--list" {
-            manager.listInstallableDistributions()
-        }
-        let parsed = parseInstallArgs(Array(args.dropFirst()))
-        try manager.runInstall(
-            name: parsed.name,
-            targetAlias: parsed.targetAlias,
-            localFilePath: parsed.localFilePath,
-            rebuild: parsed.rebuild,
-            diskSizeGB: parsed.diskSizeGB
-        )
-    }
-
-    // --- msl _bootstrap-install ... (internal compatibility: legacy ext4 install path)
-    if args.first == "_bootstrap-install" {
-        let parsed = parseInstallArgs(Array(args.dropFirst()))
-        try manager.runBootstrapInstall(
-            name: parsed.name,
-            targetAlias: parsed.targetAlias,
-            localFilePath: parsed.localFilePath,
-            rebuild: parsed.rebuild,
-            diskSizeGB: parsed.diskSizeGB
-        )
-    }
-
-    // --- msl uninstall <instance-name> [--keep-cache]
-    if args.first == "uninstall" {
-        let parsed = parseUninstallArgs(Array(args.dropFirst()))
-        try manager.runUninstall(name: parsed.name, keepCache: parsed.keepCache)
-    }
-
-    // --- compatibility: msl image create --name <instance> (--distro <id> | --rootfs <path>) [--rebuild]
-    if args.count >= 2, args[0] == "image" {
-        let sub = args[1]
-        if sub == "build" {
-            let parsed = parseImageBuildArgs(Array(args.dropFirst(2)))
-            try manager.runBuildStorageImage(
-                profileName: parsed.profile,
-                configPath: parsed.config,
-                outputPath: parsed.output,
-                force: parsed.force
-            )
-        }
-        if sub == "create" {
-            let parsed = parseInstallArgs(Array(args.dropFirst(2)))
-            try manager.runBootstrapInstall(
-                name: parsed.name,
-                targetAlias: parsed.targetAlias,
-                localFilePath: parsed.localFilePath,
-                rebuild: parsed.rebuild,
-                diskSizeGB: parsed.diskSizeGB
-            )
-        }
-        fail("unsupported image command. use: msl image build --profile <name> --config <path> --output <path> [--force] | msl image create --name <instance> <distribution-name>|--rootfs <path> [--rebuild]")
-    }
-
-    if args.first == "port" {
-        if args.count == 1 {
-            try manager.listPortMappings(instanceName: instanceName)
-            Foundation.exit(0)
-        }
-        let sub = args[1]
-        if sub == "add", args.count == 3 {
-            let mapping = String(args[2])
-            try manager.addPortMapping(mapping, instanceName: instanceName)
-            Foundation.exit(0)
-        }
-        if sub == "ls", args.count == 2 {
-            try manager.listPortMappings(instanceName: instanceName)
-            Foundation.exit(0)
-        }
-        if sub == "rm", args.count == 3 {
-            let hostPortArg = String(args[2])
-            try manager.removePortMapping(hostPortArg, instanceName: instanceName)
-            Foundation.exit(0)
-        }
-        fail("unsupported port command. use: msl port [ls] | msl port add <hostPort>:<guestPort> | msl port rm <hostPort>")
-    }
-
-    if args.first == "network" {
-        if args.count == 1 || (args.count == 2 && args[1] == "status") {
-            try manager.printNetworkDNSStatus(instanceName: instanceName)
-            Foundation.exit(0)
-        }
-        if args.count == 2, args[1] == "reconcile" {
-            try manager.runNetworkDNSReconcile(instanceName: instanceName)
-            Foundation.exit(0)
-        }
-        fail("unsupported network command. use: msl network [status] | msl network reconcile")
+        return true
     }
 
     if args.count == 2, args[0] == "--_idle-expire", let deadline = Int64(args[1]) {
-        try manager.handleIdleExpiry(deadlineEpochMs: deadline)
-        Foundation.exit(0)
+        withRuntimeManager { manager in
+            try manager.handleIdleExpiry(deadlineEpochMs: deadline)
+        }
+        return true
     }
 
     if args.count >= 2, args[0] == "--_init-exec" {
-        var command: [String] = []
-        for arg in args.dropFirst() {
-            command.append(arg)
+        withRuntimeManager { manager in
+            let exitCode = try manager.runInitExec(argv: Array(args.dropFirst()))
+            Foundation.exit(exitCode)
         }
-        let exitCode = try manager.runInitExec(argv: command)
-        Foundation.exit(exitCode)
+        return true
     }
 
-    fail("unsupported arguments. use: msl | msl --list | msl --set-default <name> | msl install ... | msl uninstall ... | msl run <cmd> | msl cache fetch ... | msl cache status | msl config set storageCacheToggles.<name> <true|false> | msl config cache ls | msl config cache-sharing ls | msl init workspace [--force] | msl memory [status] | msl network [status]|reconcile | msl --status [--all] | msl --stop [--all] | msl port [ls]|add|rm")
-} catch let err as MSLRuntimeError {
-    fail(err.message, code: err.exitCode)
-} catch {
-    fail(String(describing: error))
+    return false
 }
+
+struct InstallOptions: ParsableArguments {
+    @Option(name: [.customLong("name")], help: "Instance name to install.")
+    var name: String?
+
+    @Option(name: [.customLong("distro")], help: .hidden)
+    var distroAlias: String?
+
+    @Option(name: [.customLong("rootfs"), .customLong("file")], help: "Local rootfs archive path.")
+    var localFilePath: String?
+
+    @Option(name: [.customLong("raw")], help: "Local raw disk image path.")
+    var rawDiskPath: String?
+
+    @Flag(name: [.customLong("rebuild")], help: "Force rebuild even if cached image exists.")
+    var rebuild = false
+
+    @Option(name: [.customLong("disk-size-gb")], help: "Disk size in GiB.")
+    var diskSizeGB: Int?
+
+    @Argument(help: "Distribution name.")
+    var targetAlias: String?
+
+    func resolve() throws -> InstallInvocation {
+        if let diskSizeGB, diskSizeGB <= 0 {
+            throw ValidationError("--disk-size-gb must be a positive integer")
+        }
+
+        let resolvedTarget = targetAlias ?? distroAlias
+        if targetAlias != nil, distroAlias != nil {
+            throw ValidationError("Use either positional <distribution-name> or --distro, not both")
+        }
+        let sourceCount = [resolvedTarget, localFilePath, rawDiskPath].compactMap { $0 }.count
+        if sourceCount == 0 {
+            throw ValidationError("install requires <distribution-name>, --rootfs <path>, or --raw <path>")
+        }
+        if sourceCount > 1 {
+            throw ValidationError("Use only one of <distribution-name>, --rootfs/--file, or --raw")
+        }
+        if rawDiskPath != nil, diskSizeGB != nil {
+            throw ValidationError("--disk-size-gb cannot be used with --raw")
+        }
+
+        return InstallInvocation(
+            name: name ?? defaultInstallName(
+                targetAlias: resolvedTarget,
+                localFilePath: localFilePath,
+                rawDiskPath: rawDiskPath
+            ),
+            targetAlias: resolvedTarget,
+            localFilePath: localFilePath,
+            rawDiskPath: rawDiskPath,
+            rebuild: rebuild,
+            diskSizeGB: diskSizeGB
+        )
+    }
+}
+
+struct MSLCommand: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "msl",
+        abstract: "Mac Subsystem for Linux",
+        discussion: "Run `msl <command> --help` for command details.",
+        version: "dev",
+        subcommands: [
+            RunCommand.self,
+            StatusCommand.self,
+            StopCommand.self,
+            InstallCommand.self,
+            UninstallCommand.self,
+            CacheCommand.self,
+            ConfigCommand.self,
+            InitCommand.self,
+            MemoryCommand.self,
+            NetworkCommand.self,
+            PortCommand.self,
+            BootstrapInstallCommand.self
+        ]
+    )
+
+    @Option(name: [.short, .long], help: "Target instance name.")
+    var instance: String?
+
+    @Flag(name: [.customLong("list")], help: "List installed instances.")
+    var list = false
+
+    @Option(name: [.customLong("set-default")], help: "Set default instance name.")
+    var setDefault: String?
+
+    @Flag(name: [.customLong("serial-console")], help: "Attach through serial console for diagnostics.")
+    var serialConsole = false
+
+    mutating func validate() throws {
+        CLIInvocationContext.instanceName = instance
+
+        var modeCount = 0
+        if list { modeCount += 1 }
+        if setDefault != nil { modeCount += 1 }
+        if serialConsole { modeCount += 1 }
+        if modeCount > 1 {
+            throw ValidationError("Use only one of --list, --set-default, or --serial-console")
+        }
+    }
+
+    mutating func run() throws {
+        withRuntimeManager { manager in
+            if list {
+                try manager.listInstalledInstances()
+            }
+            if let setDefault {
+                try manager.setDefaultInstance(name: setDefault)
+            }
+            if serialConsole {
+                setenv("MSL_ATTACH_SERIAL", "1", 1)
+            }
+            try manager.runDefaultShell(instanceName: instance)
+        }
+    }
+}
+
+struct RunCommand: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "run",
+        abstract: "Run a command in Linux.",
+        discussion: "Examples:\n  msl run uname -a\n  msl run -t 5 uname -a"
+    )
+
+    @Option(name: [.short, .long], help: "Timeout in seconds.")
+    var timeout: Int?
+
+    @Argument(help: "Command and arguments.")
+    var command: [String] = []
+
+    mutating func validate() throws {
+        if let timeout, timeout <= 0 {
+            throw ValidationError("--timeout must be a positive integer")
+        }
+        if command.isEmpty {
+            throw ValidationError("Missing command. See `msl run --help`.")
+        }
+    }
+
+    mutating func run() throws {
+        withRuntimeManager { manager in
+            try manager.runCommand(
+                argv: command,
+                timeoutSec: timeout ?? 0,
+                instanceName: CLIInvocationContext.instanceName
+            )
+        }
+    }
+}
+
+struct StatusCommand: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "status",
+        abstract: "Show runtime status."
+    )
+
+    @Flag(name: [.short, .long], help: "Show all instances.")
+    var all = false
+
+    @Argument(help: "Instance name.")
+    var instance: String?
+
+    mutating func validate() throws {
+        if all, instance != nil {
+            throw ValidationError("`--all` cannot be combined with an instance argument")
+        }
+        if instance != nil, CLIInvocationContext.instanceName != nil {
+            throw ValidationError("Specify target instance with either global `--instance`/`-i` or `status <instance>`, not both")
+        }
+    }
+
+    mutating func run() throws {
+        let targetInstance = instance ?? CLIInvocationContext.instanceName
+        withRuntimeManager { manager in
+            try manager.printStatus(instanceName: targetInstance, all: all)
+        }
+    }
+}
+
+struct StopCommand: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "stop",
+        abstract: "Stop runtime."
+    )
+
+    @Flag(name: [.short, .long], help: "Stop all running instances.")
+    var all = false
+
+    @Argument(help: "Instance name.")
+    var instance: String?
+
+    mutating func validate() throws {
+        if all, instance != nil {
+            throw ValidationError("`--all` cannot be combined with an instance argument")
+        }
+        if instance != nil, CLIInvocationContext.instanceName != nil {
+            throw ValidationError("Specify target instance with either global `--instance`/`-i` or `stop <instance>`, not both")
+        }
+    }
+
+    mutating func run() throws {
+        let targetInstance = instance ?? CLIInvocationContext.instanceName
+        withRuntimeManager { manager in
+            try manager.stopVM(instanceName: targetInstance, all: all)
+        }
+    }
+}
+
+struct InstallCommand: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "install",
+        abstract: "Install an instance from distro, rootfs, or raw disk."
+    )
+
+    @Flag(name: [.customLong("list")], help: "List installable distributions.")
+    var list = false
+
+    @OptionGroup
+    var options: InstallOptions
+
+    mutating func validate() throws {
+        if list {
+            if options.name != nil ||
+                options.distroAlias != nil ||
+                options.localFilePath != nil ||
+                options.rebuild ||
+                options.diskSizeGB != nil ||
+                options.targetAlias != nil {
+                throw ValidationError("--list does not accept install arguments")
+            }
+            return
+        }
+        _ = try options.resolve()
+    }
+
+    mutating func run() throws {
+        withRuntimeManager { manager in
+            if list {
+                manager.listInstallableDistributions()
+            }
+            let invocation = try options.resolve()
+            try manager.runInstall(
+                name: invocation.name,
+                targetAlias: invocation.targetAlias,
+                localFilePath: invocation.localFilePath,
+                rawDiskPath: invocation.rawDiskPath,
+                rebuild: invocation.rebuild,
+                diskSizeGB: invocation.diskSizeGB
+            )
+        }
+    }
+}
+
+struct BootstrapInstallCommand: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "_bootstrap-install",
+        abstract: "Internal bootstrap installer.",
+        shouldDisplay: false
+    )
+
+    @OptionGroup
+    var options: InstallOptions
+
+    mutating func validate() throws {
+        let invocation = try options.resolve()
+        if invocation.rawDiskPath != nil {
+            throw ValidationError("_bootstrap-install does not support --raw")
+        }
+    }
+
+    mutating func run() throws {
+        withRuntimeManager { manager in
+            let invocation = try options.resolve()
+            try manager.runBootstrapInstall(
+                name: invocation.name,
+                targetAlias: invocation.targetAlias,
+                localFilePath: invocation.localFilePath,
+                rebuild: invocation.rebuild,
+                diskSizeGB: invocation.diskSizeGB
+            )
+        }
+    }
+}
+
+struct UninstallCommand: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "uninstall",
+        abstract: "Uninstall an instance."
+    )
+
+    @Flag(name: [.customLong("keep-cache")], help: "Keep shared cache after uninstall.")
+    var keepCache = false
+
+    @Argument(help: "Instance name.")
+    var name: String
+
+    mutating func run() throws {
+        withRuntimeManager { manager in
+            try manager.runUninstall(name: name, keepCache: keepCache)
+        }
+    }
+}
+
+struct CacheCommand: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "cache",
+        abstract: "Cache operations.",
+        subcommands: [CacheFetchCommand.self, CacheStatusCommand.self]
+    )
+}
+
+struct CacheFetchCommand: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "fetch",
+        abstract: "Fetch cache entry from distro or local rootfs."
+    )
+
+    @Argument(help: "Distribution alias.")
+    var targetAlias: String?
+
+    @Option(name: [.customLong("rootfs"), .customLong("file")], help: "Local rootfs archive path.")
+    var localFilePath: String?
+
+    @Flag(name: [.customLong("force")], help: "Force refresh.")
+    var force = false
+
+    mutating func validate() throws {
+        if targetAlias == nil, localFilePath == nil {
+            throw ValidationError("cache fetch requires <distro> or --rootfs <path>")
+        }
+        if targetAlias != nil, localFilePath != nil {
+            throw ValidationError("Use either distro target or --rootfs, not both")
+        }
+    }
+
+    mutating func run() throws {
+        withRuntimeManager { manager in
+            try manager.runCacheFetch(
+                targetAlias: targetAlias,
+                localFilePath: localFilePath,
+                force: force
+            )
+        }
+    }
+}
+
+struct CacheStatusCommand: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "status",
+        abstract: "Show cache sharing status."
+    )
+
+    mutating func run() throws {
+        withRuntimeManager { manager in
+            try manager.runCacheSharingStatus()
+        }
+    }
+}
+
+struct ConfigCommand: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "config",
+        abstract: "Configuration operations.",
+        subcommands: [ConfigSetCommand.self, ConfigCacheCommand.self, ConfigCacheSharingCommand.self]
+    )
+}
+
+struct ConfigSetCommand: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "set",
+        abstract: "Set configuration value."
+    )
+
+    @Argument(help: "Config path.")
+    var path: String
+
+    @Argument(help: "Config value.")
+    var value: String
+
+    mutating func run() throws {
+        withRuntimeManager { manager in
+            try manager.runSetConfig(path: path, value: value)
+        }
+    }
+}
+
+struct ConfigCacheCommand: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "cache",
+        abstract: "Storage cache toggles.",
+        subcommands: [ConfigCacheLsCommand.self]
+    )
+}
+
+struct ConfigCacheLsCommand: ParsableCommand {
+    static let configuration = CommandConfiguration(commandName: "ls", abstract: "List storage cache toggles.")
+
+    mutating func run() throws {
+        withRuntimeManager { manager in
+            try manager.runListStorageCacheToggles()
+        }
+    }
+}
+
+struct ConfigCacheSharingCommand: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "cache-sharing",
+        abstract: "Cache sharing status.",
+        subcommands: [ConfigCacheSharingLsCommand.self]
+    )
+}
+
+struct ConfigCacheSharingLsCommand: ParsableCommand {
+    static let configuration = CommandConfiguration(commandName: "ls", abstract: "List cache sharing status.")
+
+    mutating func run() throws {
+        withRuntimeManager { manager in
+            try manager.runCacheSharingStatus()
+        }
+    }
+}
+
+struct InitCommand: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "init",
+        abstract: "Initialization helpers.",
+        subcommands: [InitWorkspaceCommand.self]
+    )
+}
+
+struct InitWorkspaceCommand: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "workspace",
+        abstract: "Initialize workspace config."
+    )
+
+    @Flag(name: [.customLong("force")], help: "Overwrite existing workspace config.")
+    var force = false
+
+    mutating func run() throws {
+        withRuntimeManager { manager in
+            try manager.runInitWorkspace(force: force)
+        }
+    }
+}
+
+struct MemoryCommand: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "memory",
+        abstract: "Memory operations.",
+        subcommands: [MemoryStatusCommand.self],
+        defaultSubcommand: MemoryStatusCommand.self
+    )
+}
+
+struct MemoryStatusCommand: ParsableCommand {
+    static let configuration = CommandConfiguration(commandName: "status", abstract: "Show memory status.")
+
+    mutating func run() throws {
+        withRuntimeManager { manager in
+            try manager.printMemoryStatus(instanceName: CLIInvocationContext.instanceName)
+        }
+    }
+}
+
+struct NetworkCommand: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "network",
+        abstract: "Network operations.",
+        subcommands: [NetworkStatusCommand.self, NetworkReconcileCommand.self],
+        defaultSubcommand: NetworkStatusCommand.self
+    )
+}
+
+struct NetworkStatusCommand: ParsableCommand {
+    static let configuration = CommandConfiguration(commandName: "status", abstract: "Show DNS/network status.")
+
+    mutating func run() throws {
+        withRuntimeManager { manager in
+            try manager.printNetworkDNSStatus(instanceName: CLIInvocationContext.instanceName)
+        }
+    }
+}
+
+struct NetworkReconcileCommand: ParsableCommand {
+    static let configuration = CommandConfiguration(commandName: "reconcile", abstract: "Reconcile DNS settings.")
+
+    mutating func run() throws {
+        withRuntimeManager { manager in
+            try manager.runNetworkDNSReconcile(instanceName: CLIInvocationContext.instanceName)
+        }
+    }
+}
+
+struct PortCommand: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "port",
+        abstract: "Port forwarding operations.",
+        subcommands: [PortLsCommand.self, PortAddCommand.self, PortRmCommand.self],
+        defaultSubcommand: PortLsCommand.self
+    )
+}
+
+struct PortLsCommand: ParsableCommand {
+    static let configuration = CommandConfiguration(commandName: "ls", abstract: "List port mappings.")
+
+    mutating func run() throws {
+        withRuntimeManager { manager in
+            try manager.listPortMappings(instanceName: CLIInvocationContext.instanceName)
+        }
+    }
+}
+
+struct PortAddCommand: ParsableCommand {
+    static let configuration = CommandConfiguration(commandName: "add", abstract: "Add host:guest port mapping.")
+
+    @Argument(help: "Mapping as <hostPort>:<guestPort>")
+    var mapping: String
+
+    mutating func run() throws {
+        withRuntimeManager { manager in
+            try manager.addPortMapping(mapping, instanceName: CLIInvocationContext.instanceName)
+        }
+    }
+}
+
+struct PortRmCommand: ParsableCommand {
+    static let configuration = CommandConfiguration(commandName: "rm", abstract: "Remove mapping by host port.")
+
+    @Argument(help: "Host port.")
+    var hostPort: String
+
+    mutating func run() throws {
+        withRuntimeManager { manager in
+            try manager.removePortMapping(hostPort, instanceName: CLIInvocationContext.instanceName)
+        }
+    }
+}
+
+func runMSLCLI() {
+    let raw = Array(CommandLine.arguments.dropFirst())
+
+    do {
+        let rewritten = try rewriteLegacyStatusStopArguments(raw)
+        emitLegacyWarning(rewritten.1)
+
+        let globalParsed = try MSLCLIOptionsParser.parseGlobalRuntimeOptions(rewritten.0)
+        CLIInvocationContext.instanceName = globalParsed.instanceName
+
+        if handleInternalRuntimeFlags(globalParsed) {
+            return
+        }
+
+        MSLCommand.main(rewritten.0)
+    } catch let error as MSLCLIParseError {
+        fail(error.errorDescription ?? String(describing: error))
+    } catch {
+        fail(String(describing: error))
+    }
+}
+
+runMSLCLI()

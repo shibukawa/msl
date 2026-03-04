@@ -566,6 +566,109 @@ final class DistributionManager {
         return distroDir
     }
 
+    @discardableResult
+    func createImageFromRaw(
+        name rawName: String,
+        rawDiskPath: String,
+        rebuild: Bool
+    ) throws -> URL {
+        try migrateLegacyRootfsCacheIfNeeded()
+        let name = try validateInstanceName(rawName)
+        let rawURL = URL(fileURLWithPath: rawDiskPath)
+        guard fileManager.fileExists(atPath: rawURL.path) else {
+            throw MSLRuntimeError("raw disk not found: \(rawURL.path)")
+        }
+
+        emitStatus("install: preparing instance '\(name)' from raw disk")
+        try ensureDir(paths.appSupport)
+        try ensureDir(paths.distrosDir)
+
+        let distroDir = paths.distroDirectory(named: name)
+        let diskFile = paths.distroDiskFile(named: name)
+        let sourceFile = paths.distroSourceFile(named: name)
+        let metadataFile = paths.distroMetadataFile(named: name)
+
+        if fileManager.fileExists(atPath: diskFile.path), !rebuild {
+            logger.log("image_create_skipped_existing", fields: ["name": name, "disk": diskFile.path])
+            emitStatus("install: image already exists, skipping build")
+            return distroDir
+        }
+
+        if fileManager.fileExists(atPath: distroDir.path), rebuild {
+            try fileManager.removeItem(at: distroDir)
+        }
+        try ensureDir(distroDir)
+        if fileManager.fileExists(atPath: diskFile.path) {
+            try fileManager.removeItem(at: diskFile)
+        }
+
+        emitStatus("install: importing raw disk")
+        try fileManager.copyItem(at: rawURL, to: diskFile)
+
+        let sha = try computeSHA256(fileAt: rawURL)
+        let sourceRecord = DistributionSourceRecord(
+            sourceType: "local-raw",
+            distro: nil,
+            version: nil,
+            arch: nil,
+            manifestId: nil,
+            localPath: rawURL.path,
+            tarballFileName: rawURL.lastPathComponent,
+            sha256: sha,
+            verifiedAtEpochMs: nowEpochMs()
+        )
+
+        let defaultKernelProfileRef = try? DefaultInstanceStore(paths: paths, fileManager: fileManager).loadDefaultKernelProfileRef()
+        let env = ProcessInfo.processInfo.environment
+        let envKernelRaw = env["MSL_KERNEL_PROFILE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let envKernelProfileRef = (envKernelRaw?.isEmpty == false) ? envKernelRaw : nil
+        let kernelProfileRef = envKernelProfileRef ?? defaultKernelProfileRef ?? "slim"
+        let compressionPolicy = try resolveCompressionPolicyForInstall()
+        let localSource = DistributionSourceSelection.localFile(rawURL)
+        let initialPolicy = initialUserConvergencePolicy(for: localSource)
+        let initialCacheSharing = initialCacheSharingPolicy(for: localSource)
+        let runtimeProfile = initialRuntimeProfile(for: localSource, instanceName: name)
+
+        let metadata = DistributionInstanceMetadata(
+            name: name,
+            distroFamily: nil,
+            createdAtEpochMs: nowEpochMs(),
+            bootstrap: DistributionInstanceMetadata.PrivilegeBootstrap(
+                firstBootPending: true,
+                privilegeBootstrapVersion: 1,
+                lastResult: "pending",
+                lastBootstrapAtEpochMs: nil
+            ),
+            user: DistributionInstanceMetadata.UserSnapshot(
+                name: resolveDefaultRuntimeUserName(),
+                uid: Int(getuid()),
+                gid: Int(getgid()),
+                groups: [initialPolicy.adminGroup]
+            ),
+            source: sourceRecord,
+            diskPath: diskFile.path,
+            kernelProfileRef: kernelProfileRef,
+            runtimeProfile: runtimeProfile,
+            userConvergencePolicy: initialPolicy,
+            workspacePolicy: initialWorkspacePolicy(),
+            compressionPolicy: compressionPolicy,
+            networkPolicy: initialNetworkPolicy(),
+            cacheSharing: initialCacheSharing
+        )
+        try writeJSON(sourceRecord, to: sourceFile)
+        try writeJSON(metadata, to: metadataFile)
+
+        logger.log("image_create_completed", fields: [
+            "name": name,
+            "disk": diskFile.path,
+            "source_type": "local-raw",
+            "compression_policy_count": String(compressionPolicy.pathPolicies.count)
+        ])
+        emitStatus("install: image ready")
+        return distroDir
+    }
+
     func readInstanceMetadata(at metadataURL: URL) throws -> DistributionInstanceMetadata {
         try readJSON(DistributionInstanceMetadata.self, from: metadataURL)
     }

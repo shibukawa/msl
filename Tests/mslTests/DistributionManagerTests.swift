@@ -385,6 +385,32 @@ final class DistributionManagerTests: XCTestCase {
         }
     }
 
+    func testCreateImageFromRawCopiesDiskAndWritesMetadata() throws {
+        let ctx = try DistributionContext.make()
+        defer { ctx.cleanup() }
+
+        let raw = ctx.root.appendingPathComponent("custom.raw", isDirectory: false)
+        try Data([0xde, 0xad, 0xbe, 0xef]).write(to: raw)
+
+        let dir = try ctx.makeManager().createImageFromRaw(
+            name: "custom",
+            rawDiskPath: raw.path,
+            rebuild: false
+        )
+        XCTAssertEqual(dir.path, ctx.paths.distroDirectory(named: "custom").path)
+
+        let disk = ctx.paths.distroDiskFile(named: "custom")
+        let copied = try Data(contentsOf: disk)
+        XCTAssertEqual(copied, Data([0xde, 0xad, 0xbe, 0xef]))
+
+        let metadataURL = ctx.paths.distroMetadataFile(named: "custom")
+        let metadata = try JSONDecoder().decode(DistributionInstanceMetadata.self, from: Data(contentsOf: metadataURL))
+        XCTAssertEqual(metadata.source.sourceType, "local-raw")
+        XCTAssertEqual(metadata.source.localPath, raw.path)
+        XCTAssertEqual(metadata.source.tarballFileName, "custom.raw")
+        XCTAssertEqual(metadata.diskPath, disk.path)
+    }
+
     func testUninstallInstanceRemovesManifestCacheByDefault() throws {
         let ctx = try DistributionContext.make()
         defer { ctx.cleanup() }

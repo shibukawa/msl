@@ -243,6 +243,7 @@ public final class RuntimeManager {
         name: String,
         targetAlias: String?,
         localFilePath: String?,
+        rawDiskPath: String?,
         rebuild: Bool,
         diskSizeGB: Int?
     ) throws -> Never {
@@ -259,14 +260,23 @@ public final class RuntimeManager {
 
         try bootstrap.ensureBootstrapped(context: .install)
 
-        let dir = try distributionManager.createImageWithImagewriter(
-            name: name,
-            targetAlias: targetAlias,
-            localFilePath: localFilePath,
-            rebuild: rebuild,
-            diskSizeGB: diskSizeGB,
-            mslExecutablePath: executablePath
-        )
+        let dir: URL
+        if let rawDiskPath {
+            dir = try distributionManager.createImageFromRaw(
+                name: name,
+                rawDiskPath: rawDiskPath,
+                rebuild: rebuild
+            )
+        } else {
+            dir = try distributionManager.createImageWithImagewriter(
+                name: name,
+                targetAlias: targetAlias,
+                localFilePath: localFilePath,
+                rebuild: rebuild,
+                diskSizeGB: diskSizeGB,
+                mslExecutablePath: executablePath
+            )
+        }
 
         try finalizeDefaultInstanceAndKernelIfNeeded(installedName: name)
         print("image created: \(dir.path)")
