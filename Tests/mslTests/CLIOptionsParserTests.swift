@@ -2,6 +2,12 @@ import XCTest
 @testable import mslCore
 
 final class CLIOptionsParserTests: XCTestCase {
+    func testParsesGlobalInstanceShortOption() throws {
+        let parsed = try MSLCLIOptionsParser.parseGlobalRuntimeOptions(["-i", "dev"])
+        XCTAssertEqual(parsed.instanceName, "dev")
+        XCTAssertEqual(parsed.remainingArguments, [])
+    }
+
     func testParsesGlobalInstanceOption() throws {
         let parsed = try MSLCLIOptionsParser.parseGlobalRuntimeOptions(["--instance", "dev"])
         XCTAssertEqual(parsed.instanceName, "dev")
@@ -24,14 +30,6 @@ final class CLIOptionsParserTests: XCTestCase {
         XCTAssertEqual(parsed.remainingArguments, ["config", "set", "storageCacheToggles.apt", "false"])
     }
 
-    func testStopsParsingAtImageSubcommand() throws {
-        let parsed = try MSLCLIOptionsParser.parseGlobalRuntimeOptions([
-            "--instance", "dev", "image", "build", "--profile", "default"
-        ])
-        XCTAssertEqual(parsed.instanceName, "dev")
-        XCTAssertEqual(parsed.remainingArguments, ["image", "build", "--profile", "default"])
-    }
-
     func testStopsParsingAtNetworkSubcommand() throws {
         let parsed = try MSLCLIOptionsParser.parseGlobalRuntimeOptions([
             "--instance", "dev", "network", "reconcile"
@@ -40,10 +38,26 @@ final class CLIOptionsParserTests: XCTestCase {
         XCTAssertEqual(parsed.remainingArguments, ["network", "reconcile"])
     }
 
+    func testStopsParsingAtStatusSubcommand() throws {
+        let parsed = try MSLCLIOptionsParser.parseGlobalRuntimeOptions([
+            "--instance", "dev", "status", "--all"
+        ])
+        XCTAssertEqual(parsed.instanceName, "dev")
+        XCTAssertEqual(parsed.remainingArguments, ["status", "--all"])
+    }
+
+    func testStopsParsingAtStopSubcommand() throws {
+        let parsed = try MSLCLIOptionsParser.parseGlobalRuntimeOptions([
+            "--instance", "dev", "stop", "--all"
+        ])
+        XCTAssertEqual(parsed.instanceName, "dev")
+        XCTAssertEqual(parsed.remainingArguments, ["stop", "--all"])
+    }
+
     func testRejectsDuplicateInstanceOption() {
         XCTAssertThrowsError(
             try MSLCLIOptionsParser.parseGlobalRuntimeOptions([
-                "--instance", "a", "--instance", "b"
+                "--instance", "a", "-i", "b"
             ])
         ) { error in
             XCTAssertEqual(error as? MSLCLIParseError, .duplicateOption(option: "--instance"))
@@ -53,6 +67,14 @@ final class CLIOptionsParserTests: XCTestCase {
     func testRejectsMissingInstanceValue() {
         XCTAssertThrowsError(
             try MSLCLIOptionsParser.parseGlobalRuntimeOptions(["--instance"])
+        ) { error in
+            XCTAssertEqual(error as? MSLCLIParseError, .missingValue(option: "--instance"))
+        }
+    }
+
+    func testRejectsMissingShortInstanceValue() {
+        XCTAssertThrowsError(
+            try MSLCLIOptionsParser.parseGlobalRuntimeOptions(["-i"])
         ) { error in
             XCTAssertEqual(error as? MSLCLIParseError, .missingValue(option: "--instance"))
         }

@@ -10,6 +10,9 @@ let package = Package(
         .library(name: "mslCore", targets: ["mslCore"]),
         .executable(name: "msl", targets: ["msl"])
     ],
+    dependencies: [
+        .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.3.0")
+    ],
     targets: [
         .target(
             name: "mslCore",
@@ -17,7 +20,10 @@ let package = Package(
         ),
         .executableTarget(
             name: "msl",
-            dependencies: ["mslCore"],
+            dependencies: [
+                "mslCore",
+                .product(name: "ArgumentParser", package: "swift-argument-parser")
+            ],
             path: "Sources/msl"
         ),
         .testTarget(

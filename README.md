@@ -4,11 +4,12 @@ This repository currently contains a Swift prototype for bootstrap/lifecycle + S
 
 ## What works now
 - `msl` command entrypoint
-- `msl --status`
-- `msl --stop`
+- `msl status [instance]`
+- `msl stop [instance]`
 - `msl --list`
 - `msl --set-default <instance>`
 - `msl install --list` (canonical + aliases)
+- `msl install --raw <path/to/disk.raw>` (import local raw disk as instance)
 - `msl init workspace [--force]` (`.mslconfig` scaffold)
 - `msl port add <hostPort>:<guestPort>`
 - `msl port ls`
@@ -78,14 +79,7 @@ Build storage image from TOML profile:
   --output /tmp/msl-storage.raw
 ```
 
-Equivalent CLI:
-
-```bash
-./.build/debug/msl image build \
-  --profile default \
-  --config /path/to/msl-image.toml \
-  --output /tmp/msl-storage.raw
-```
+`msl image build` CLI entrypoint has been removed from the public surface.
 
 Generated artifacts (same directory as output image):
 - `*.metadata.json`: base image hash, resolved compression policy, cache toggles, uid/gid, env, trim policy
@@ -336,14 +330,19 @@ For file locations with a custom `MSL_HOME`, replace `~` with `$MSL_HOME`.
 Check status:
 
 ```bash
-./.build/debug/msl --status
+./.build/debug/msl status
+./.build/debug/msl status ubuntu
 ```
 
 Stop runtime:
 
 ```bash
-./.build/debug/msl --stop
+./.build/debug/msl stop
+./.build/debug/msl stop ubuntu
 ```
+
+Legacy compatibility:
+- `msl --status` / `msl --stop` are still accepted with a deprecation warning.
 
 Port forwarding:
 

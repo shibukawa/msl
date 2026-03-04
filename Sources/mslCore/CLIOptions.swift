@@ -32,7 +32,10 @@ public enum MSLCLIOptionsParser {
         var i = 0
         var instanceName: String?
         var remaining: [String] = []
-        let subcommands: Set<String> = ["run", "install", "uninstall", "cache", "config", "image", "init", "memory", "port", "network"]
+        let subcommands: Set<String> = [
+            "run", "install", "uninstall", "cache", "config", "init",
+            "memory", "port", "network", "status", "stop"
+        ]
 
         while i < raw.count {
             let token = raw[i]
@@ -40,7 +43,7 @@ public enum MSLCLIOptionsParser {
                 remaining.append(contentsOf: raw[i...])
                 break
             }
-            if token == "--instance" {
+            if token == "--instance" || token == "-i" {
                 guard i + 1 < raw.count else {
                     throw MSLCLIParseError.missingValue(option: "--instance")
                 }
