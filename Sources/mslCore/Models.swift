@@ -110,6 +110,9 @@ public struct RuntimeBootProfile {
     public var kernelID: String
     public var kernelURL: URL
     public var commandLine: String
+    public var initMode: String
+    public var serviceManager: String?
+    public var profileSource: String
 }
 
 public enum BootstrapContext {

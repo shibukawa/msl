@@ -327,6 +327,8 @@ def alpine_entry(tmp_dir: Path):
         "checksumURL": sha_url,
         "signatureTarget": "artifact",
         "keyFingerprint": discovered_fp,
+        "serviceManager": "openrc",
+        "defaultInitMode": "direct-init",
         "userConvergenceTemplate": {
             "templateId": "alpine-busybox-v1",
             "commandFamily": "busybox_adduser",
@@ -414,6 +416,7 @@ def ubuntu_entry(version: str, page_url: str, tmp_dir: Path):
         "checksumURL": checksum_url,
         "signatureTarget": "checksum",
         "keyFingerprint": discovered_fp,
+        "serviceManager": "systemd",
         "userConvergenceTemplate": {
             "templateId": "ubuntu-useradd-v1",
             "commandFamily": "useradd",
@@ -458,6 +461,8 @@ def swift_string(value: str) -> str:
 def render_entry(entry):
     template = entry.get("userConvergenceTemplate")
     cache_sharing_defaults = entry.get("cacheSharingDefaults")
+    service_manager = entry.get("serviceManager")
+    default_init_mode = entry.get("defaultInitMode")
     if template:
         shell_fallbacks = ", ".join(swift_string(v) for v in template["shellFallbacks"])
         template_code = (
@@ -511,6 +516,8 @@ def render_entry(entry):
         f"            signatureTarget: {swift_string(entry['signatureTarget'])},\n"
         f"            keyFingerprint: {swift_string(entry['keyFingerprint'])},\n"
         "            supportState: .supported,\n"
+        f"            serviceManager: {swift_string(service_manager) if service_manager else 'nil'},\n"
+        f"            defaultInitMode: {swift_string(default_init_mode) if default_init_mode else 'nil'},\n"
         f"            userConvergenceTemplate: {template_code},\n"
         f"            cacheSharingDefaults: {cache_sharing_code}\n"
         "        )"

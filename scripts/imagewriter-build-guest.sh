@@ -178,6 +178,118 @@ set_btrfs_compression() {
   fi
 }
 
+detect_service_manager() {
+  if [ -f "$ROOTFS_DIR/etc/alpine-release" ] || [ -x "$ROOTFS_DIR/sbin/openrc-run" ] || [ -d "$ROOTFS_DIR/etc/runlevels" ]; then
+    echo "openrc"
+    return 0
+  fi
+  if [ -x "$ROOTFS_DIR/lib/systemd/systemd" ] || [ -x "$ROOTFS_DIR/usr/lib/systemd/systemd" ] || [ -d "$ROOTFS_DIR/etc/systemd" ]; then
+    echo "systemd"
+    return 0
+  fi
+  echo ""
+}
+
+normalize_root_fstab() {
+  fstab="$ROOTFS_DIR/etc/fstab"
+  if [ ! -f "$fstab" ]; then
+    return 0
+  fi
+  tmp="$fstab.tmp"
+  awk '
+    BEGIN { root_done=0 }
+    /^[[:space:]]*#/ || NF < 2 { print; next }
+    {
+      if ($2 == "/") {
+        if (root_done == 0) {
+          print "/dev/vda / auto defaults 0 1"
+          root_done = 1
+        }
+        next
+      }
+      print
+    }
+  ' "$fstab" > "$tmp"
+  if cmp -s "$fstab" "$tmp"; then
+    rm -f "$tmp"
+  else
+    mv "$tmp" "$fstab"
+  fi
+}
+
+install_systemd_contracts() {
+  mkdir -p "$ROOTFS_DIR/etc/systemd/system" "$ROOTFS_DIR/etc/systemd/timesyncd.conf.d"
+  cat > "$ROOTFS_DIR/etc/systemd/system/msl-init.service" <<'EOF_SYSTEMD_UNIT'
+[Unit]
+Description=msl init control server
+After=network.target local-fs.target
+Before=docker.service containerd.service
+
+[Service]
+Type=simple
+Environment=MSL_VSOCK_PORT=1024
+Environment=MSL_INIT_LOG_FILE=/var/log/msl-init.log
+ExecStart=/usr/local/bin/msl-init
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target
+EOF_SYSTEMD_UNIT
+
+  mkdir -p "$ROOTFS_DIR/etc/systemd/system/multi-user.target.wants"
+  ln -snf ../msl-init.service "$ROOTFS_DIR/etc/systemd/system/multi-user.target.wants/msl-init.service"
+
+  cat > "$ROOTFS_DIR/etc/systemd/timesyncd.conf.d/90-msl.conf" <<'EOF_TIMESYNCD'
+[Time]
+NTP=127.0.0.1
+FallbackNTP=
+EOF_TIMESYNCD
+
+  if [ -f "$ROOTFS_DIR/lib/systemd/system/systemd-timesyncd.service" ] || [ -f "$ROOTFS_DIR/usr/lib/systemd/system/systemd-timesyncd.service" ]; then
+    mkdir -p "$ROOTFS_DIR/etc/systemd/system/sysinit.target.wants"
+    if [ -f "$ROOTFS_DIR/lib/systemd/system/systemd-timesyncd.service" ]; then
+      ln -snf /lib/systemd/system/systemd-timesyncd.service "$ROOTFS_DIR/etc/systemd/system/sysinit.target.wants/systemd-timesyncd.service"
+    else
+      ln -snf /usr/lib/systemd/system/systemd-timesyncd.service "$ROOTFS_DIR/etc/systemd/system/sysinit.target.wants/systemd-timesyncd.service"
+    fi
+  fi
+}
+
+install_openrc_contracts() {
+  mkdir -p "$ROOTFS_DIR/etc/init.d" "$ROOTFS_DIR/etc/runlevels/default" "$ROOTFS_DIR/etc/conf.d"
+  cat > "$ROOTFS_DIR/etc/init.d/msl-init" <<'EOF_OPENRC_SERVICE'
+#!/sbin/openrc-run
+name="msl-init"
+description="msl init control server"
+command="/usr/local/bin/msl-init"
+command_background="yes"
+pidfile="/run/msl-init.pid"
+output_log="/var/log/msl-init.log"
+error_log="/var/log/msl-init.log"
+supervisor=supervise-daemon
+respawn_delay=1
+respawn_max=0
+respawn_period=0
+
+depend() {
+  need localmount
+  after bootmisc
+  before docker
+}
+
+start_pre() {
+  checkpath --file --mode 0644 /var/log/msl-init.log
+}
+EOF_OPENRC_SERVICE
+  chmod 0755 "$ROOTFS_DIR/etc/init.d/msl-init"
+  ln -snf /etc/init.d/msl-init "$ROOTFS_DIR/etc/runlevels/default/msl-init"
+
+  cat > "$ROOTFS_DIR/etc/conf.d/ntpd" <<'EOF_NTPD_CONF'
+NTPD_OPTS="-p 127.0.0.1"
+EOF_NTPD_CONF
+}
+
 apply_btrfs_policy() {
   mount_dir="$1"
   mkdir -p \
@@ -251,6 +363,7 @@ extract_rootfs() {
       tar -xf "$ROOTFS_ARCHIVE" -C "$ROOTFS_DIR"
       ;;
   esac
+  normalize_root_fstab
 }
 
 install_init_binary() {
@@ -262,6 +375,19 @@ install_init_binary() {
   cp -f "$INIT_BINARY" "$ROOTFS_DIR/usr/local/bin/msl-init"
   chmod 0755 "$ROOTFS_DIR/sbin/msl-init" "$ROOTFS_DIR/usr/local/bin/msl-init"
   ln -snf msl-init "$ROOTFS_DIR/usr/local/bin/msl"
+
+  SERVICE_MANAGER="$(detect_service_manager)"
+  case "$SERVICE_MANAGER" in
+    systemd)
+      install_systemd_contracts
+      ;;
+    openrc)
+      install_openrc_contracts
+      ;;
+    *)
+      echo "warning: could not detect service manager in rootfs; skipping msl-init service/NTP contract install" >&2
+      ;;
+  esac
 }
 
 build_from_source_dir() {

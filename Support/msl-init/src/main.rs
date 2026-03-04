@@ -12,18 +12,21 @@ use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI8, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_READ_BYTES: usize = 16 * 1024;
 const MSL_VSOCK_PORT: u32 = 1024;
 const MSL_DNS_TUNNEL_PORT: u32 = 1053;
+const MSL_TIME_TUNNEL_PORT: u32 = 1067;
 const MEMORY_STATS_FILE: &str = "/run/msl-memory-stats.env";
 const LOCAL_CONTROL_SOCKET: &str = "/run/msl-init.sock";
+const LOCAL_NTP_BIND_ADDR: &str = "127.0.0.1:123";
+const NTP_UNIX_OFFSET_SECONDS: u64 = 2_208_988_800;
 
 // Linux constants for vsock
 const AF_VSOCK: i32 = 40;
@@ -130,6 +133,7 @@ static LOG_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static DIAG_LOCK: OnceLock<Mutex<Option<std::fs::File>>> = OnceLock::new();
 static RUNTIME_USER: OnceLock<Mutex<RuntimeUserContext>> = OnceLock::new();
 static DNS_PROXY_STATE: OnceLock<Mutex<Option<DNSProxyRuntime>>> = OnceLock::new();
+static NTP_UPSTREAM_HEALTH: AtomicI8 = AtomicI8::new(0);
 
 #[derive(Clone)]
 struct RuntimeUserContext {
@@ -623,6 +627,162 @@ fn forward_dns_query_via_tunnel(query: &[u8]) -> Option<Vec<u8>> {
     Some(build_dns_success_response(query, qtype, &answers))
 }
 
+fn resolve_time_tunnel_port() -> u32 {
+    env::var("MSL_TIME_TUNNEL_PORT")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(MSL_TIME_TUNNEL_PORT)
+}
+
+fn query_time_tunnel_ms() -> Option<i64> {
+    let port = resolve_time_tunnel_port();
+    let mut stream = connect_vsock(port).ok()?;
+    let payload = br#"{"op":"now_ms"}"#;
+    let len = (payload.len() as u32).to_be_bytes();
+    if stream.write_all(&len).is_err() || stream.write_all(payload).is_err() {
+        return None;
+    }
+    let mut header = [0u8; 4];
+    if stream.read_exact(&mut header).is_err() {
+        return None;
+    }
+    let resp_len = u32::from_be_bytes(header) as usize;
+    if resp_len == 0 || resp_len > 16 * 1024 {
+        return None;
+    }
+    let mut resp = vec![0u8; resp_len];
+    if stream.read_exact(&mut resp).is_err() {
+        return None;
+    }
+    let text = String::from_utf8(resp).ok()?;
+    if extract_bool(&text, "ok") != Some(true) {
+        return None;
+    }
+    extract_int64(&text, "unixMs")
+}
+
+fn now_unix_ms() -> i64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_millis() as i64,
+        Err(_) => 0,
+    }
+}
+
+fn write_ntp_timestamp(dst: &mut [u8], unix_ms: i64) {
+    if dst.len() < 8 {
+        return;
+    }
+    let clamped_ms = if unix_ms < 0 { 0u64 } else { unix_ms as u64 };
+    let sec = clamped_ms / 1000;
+    let frac_ms = clamped_ms % 1000;
+    let ntp_sec = sec.saturating_add(NTP_UNIX_OFFSET_SECONDS);
+    let ntp_sec_u32 = if ntp_sec > u32::MAX as u64 {
+        u32::MAX
+    } else {
+        ntp_sec as u32
+    };
+    let ntp_frac_u64 = (frac_ms << 32) / 1000;
+    let ntp_frac_u32 = if ntp_frac_u64 > u32::MAX as u64 {
+        u32::MAX
+    } else {
+        ntp_frac_u64 as u32
+    };
+    dst[..4].copy_from_slice(&ntp_sec_u32.to_be_bytes());
+    dst[4..8].copy_from_slice(&ntp_frac_u32.to_be_bytes());
+}
+
+fn build_ntp_response(request: &[u8], unix_ms: i64) -> [u8; 48] {
+    let mut out = [0u8; 48];
+    out[0] = 0x24; // LI=0, VN=4, Mode=4(server)
+    out[1] = 1; // stratum
+    out[2] = request.get(2).copied().unwrap_or(4); // poll
+    out[3] = 0xEC; // precision ~= -20
+    out[12..16].copy_from_slice(b"MSL\0");
+    write_ntp_timestamp(&mut out[16..24], unix_ms);
+    if request.len() >= 48 {
+        out[24..32].copy_from_slice(&request[40..48]); // originate = client transmit
+    }
+    write_ntp_timestamp(&mut out[32..40], unix_ms); // receive
+    write_ntp_timestamp(&mut out[40..48], unix_ms); // transmit
+    out
+}
+
+fn record_ntp_upstream_health(success: bool) {
+    let next_state = if success { 1 } else { -1 };
+    let previous = NTP_UPSTREAM_HEALTH.swap(next_state, Ordering::Relaxed);
+    if previous == next_state {
+        return;
+    }
+    if success {
+        log_line("ntp_upstream_healthcheck_succeeded source=host_time_tunnel");
+    } else {
+        log_line("ntp_upstream_healthcheck_failed source=host_time_tunnel fallback=guest_clock");
+    }
+}
+
+fn start_local_ntp_server() {
+    let enabled = env::var("MSL_NTP_PROXY_ENABLED")
+        .ok()
+        .map(|v| v != "0")
+        .unwrap_or(true);
+    if !enabled {
+        log_line("local ntp proxy disabled by MSL_NTP_PROXY_ENABLED=0");
+        return;
+    }
+
+    let bind_addr = env::var("MSL_NTP_BIND_ADDR")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| LOCAL_NTP_BIND_ADDR.to_string());
+
+    let socket = match UdpSocket::bind(&bind_addr) {
+        Ok(v) => v,
+        Err(e) => {
+            log_line(&format!("local ntp bind failed addr={} err={}", bind_addr, e));
+            return;
+        }
+    };
+    let _ = socket.set_read_timeout(Some(Duration::from_millis(500)));
+    log_line(&format!("local ntp proxy started listen={}", bind_addr));
+    log_line(&format!(
+        "ntp_upstream_config_applied listen={} source=host_time_tunnel fallback=guest_clock",
+        bind_addr
+    ));
+
+    thread::spawn(move || {
+        let mut buf = [0u8; 512];
+        loop {
+            match socket.recv_from(&mut buf) {
+                Ok((size, src)) => {
+                    if size < 48 {
+                        continue;
+                    }
+                    let unix_ms = match query_time_tunnel_ms() {
+                        Some(value) => {
+                            record_ntp_upstream_health(true);
+                            value
+                        }
+                        None => {
+                            record_ntp_upstream_health(false);
+                            now_unix_ms()
+                        }
+                    };
+                    let payload = build_ntp_response(&buf[..size], unix_ms);
+                    let _ = socket.send_to(&payload, src);
+                }
+                Err(err)
+                    if err.kind() == std::io::ErrorKind::WouldBlock
+                        || err.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(err) => {
+                    log_line(&format!("local ntp recv failed err={}", err));
+                    thread::sleep(Duration::from_millis(50));
+                }
+            }
+        }
+    });
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MemoryCliAction {
     Compact,
@@ -671,6 +831,7 @@ fn main() -> Result<(), String> {
     ensure_pty_prerequisites();
     ensure_guest_network_ready();
     start_local_control_server();
+    start_local_ntp_server();
     init_diagnostic_channel();
     start_diagnostic_forwarders();
 
@@ -1150,9 +1311,32 @@ fn ensure_mount_prerequisites() {
     mount_fs_if_needed("/run", b"tmpfs\0", b"tmpfs\0", Some(b"mode=0755\0"));
 }
 
+fn is_mountpoint(target: &str) -> bool {
+    let text = match fs::read_to_string("/proc/self/mountinfo") {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    text.lines().any(|line| {
+        let mut fields = line.split_whitespace();
+        // mountinfo: id parent major:minor root mount_point ...
+        let _id = fields.next();
+        let _parent = fields.next();
+        let _majmin = fields.next();
+        let _root = fields.next();
+        let mount_point = fields.next();
+        mount_point == Some(target)
+    })
+}
+
 fn mount_fs_if_needed(target: &str, source: &[u8], fstype: &[u8], data: Option<&[u8]>) {
     if let Err(e) = fs::create_dir_all(target) {
         log_line(&format!("failed to create mountpoint {}: {}", target, e));
+        return;
+    }
+
+    // In service-managed boot, /proc,/sys,/run are already mounted by the init system.
+    // Re-mounting /run here can shadow systemd runtime state.
+    if is_mountpoint(target) {
         return;
     }
 
@@ -1249,6 +1433,9 @@ fn bind_mount_if_needed(source: &str, target: &str) -> Result<bool, String> {
 fn ensure_pty_prerequisites() {
     if let Err(e) = fs::create_dir_all("/dev/pts") {
         log_line(&format!("failed to create /dev/pts: {}", e));
+        return;
+    }
+    if is_mountpoint("/dev/pts") {
         return;
     }
 
@@ -3406,6 +3593,21 @@ fn extract_int(input: &str, key: &str) -> Option<i32> {
         }
     }
     num.parse::<i32>().ok()
+}
+
+fn extract_int64(input: &str, key: &str) -> Option<i64> {
+    let pattern = format!("\"{}\":", key);
+    let start = input.find(&pattern)? + pattern.len();
+    let rest = &input[start..];
+    let mut num = String::new();
+    for c in rest.chars() {
+        if c.is_ascii_digit() || c == '-' {
+            num.push(c);
+        } else {
+            break;
+        }
+    }
+    num.parse::<i64>().ok()
 }
 
 fn extract_bool(input: &str, key: &str) -> Option<bool> {
