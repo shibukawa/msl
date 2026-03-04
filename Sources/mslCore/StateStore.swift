@@ -19,11 +19,17 @@ public final class StateStore {
             return .initial(nowMs: nowEpochMs())
         }
         let data = try Data(contentsOf: paths.stateFile)
-        return try decoder.decode(RuntimeState.self, from: data)
+        var state = try decoder.decode(RuntimeState.self, from: data)
+        if state.normalizeSchemaV2(nowMs: nowEpochMs()) {
+            try saveState(state)
+        }
+        return state
     }
 
     public func saveState(_ state: RuntimeState) throws {
-        let data = try encoder.encode(state)
+        var normalized = state
+        _ = normalized.normalizeSchemaV2(nowMs: nowEpochMs())
+        let data = try encoder.encode(normalized)
         try data.write(to: paths.stateFile, options: .atomic)
     }
 
@@ -45,7 +51,12 @@ public final class StateStore {
             return PortMappingsState()
         }
         let data = try Data(contentsOf: paths.portsFile)
-        return try decoder.decode(PortMappingsState.self, from: data)
+        var state = try decoder.decode(PortMappingsState.self, from: data)
+        if state.schemaVersion < 2 {
+            state.schemaVersion = 2
+            try savePortMappings(state)
+        }
+        return state
     }
 
     public func savePortMappings(_ state: PortMappingsState) throws {

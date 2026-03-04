@@ -478,13 +478,18 @@ public final class RuntimeManager {
         // Connect to daemon (auto-start if needed)
         try daemonClient.ensureConnected(
             expectedInstanceName: target.instanceName,
-            hostShareRoot: resolveWorkspaceHostShareRoot()
+            hostShareRoot: resolveWorkspaceHostShareRoot(),
+            callerCwd: currentCallerCwd()
         )
         prepareCacheSharingIfNeeded(instanceName: target.instanceName)
         let shellCwd = prepareWorkspaceIfNeeded(policy: workspacePolicy, instanceName: target.instanceName)
 
         // Register session
-        let regResp = try daemonClient.send(RuntimeControlRequest(op: "session_register"))
+        let regResp = try daemonClient.send(RuntimeControlRequest(
+            op: "session_register",
+            instance: target.instanceName,
+            callerCwd: currentCallerCwd()
+        ))
         guard regResp.ok, let sessionID = regResp.sessionId else {
             throw MSLRuntimeError("failed to register session: \(regResp.error ?? "unknown")")
         }
@@ -496,6 +501,7 @@ public final class RuntimeManager {
             op: "pty_open",
             rows: size.rows,
             cols: size.cols,
+            sessionId: sessionID,
             cwd: shellCwd
         ))
         guard openResp.ok, let ptyId = openResp.ptyId else {
@@ -537,7 +543,8 @@ public final class RuntimeManager {
                     op: "pty_resize",
                     ptyId: ptyId,
                     rows: r,
-                    cols: c
+                    cols: c,
+                    sessionId: sessionID
                 ))
                 lastRows = r
                 lastCols = c
@@ -569,7 +576,8 @@ public final class RuntimeManager {
                                 _ = try? daemonClient.send(RuntimeControlRequest(
                                     op: "pty_write",
                                     ptyId: ptyId,
-                                    dataBase64: data.base64EncodedString()
+                                    dataBase64: data.base64EncodedString(),
+                                    sessionId: sessionID
                                 ))
                             }
                             exitCode = 0
@@ -581,7 +589,8 @@ public final class RuntimeManager {
                             _ = try daemonClient.send(RuntimeControlRequest(
                                 op: "pty_write",
                                 ptyId: ptyId,
-                                dataBase64: data.base64EncodedString()
+                                dataBase64: data.base64EncodedString(),
+                                sessionId: sessionID
                             ))
                             consecutiveErrors = 0
                             idleCount = 0
@@ -600,7 +609,8 @@ public final class RuntimeManager {
                 let readResp = try daemonClient.send(RuntimeControlRequest(
                     op: "pty_read",
                     timeoutMs: 1_000,
-                    ptyId: ptyId
+                    ptyId: ptyId,
+                    sessionId: sessionID
                 ))
                 guard readResp.ok else {
                     let errMsg = readResp.error ?? "pty_read failed"
@@ -649,7 +659,7 @@ public final class RuntimeManager {
         hostTerminal.restore()
 
         // Close PTY
-        _ = try? daemonClient.send(RuntimeControlRequest(op: "pty_close", ptyId: ptyId))
+        _ = try? daemonClient.send(RuntimeControlRequest(op: "pty_close", ptyId: ptyId, sessionId: sessionID))
 
         // Unregister session
         _ = try? daemonClient.send(RuntimeControlRequest(op: "session_unregister", sessionId: sessionID))
@@ -688,11 +698,16 @@ public final class RuntimeManager {
         // Connect to daemon
         try daemonClient.ensureConnected(
             expectedInstanceName: target.instanceName,
-            hostShareRoot: resolveWorkspaceHostShareRoot()
+            hostShareRoot: resolveWorkspaceHostShareRoot(),
+            callerCwd: currentCallerCwd()
         )
 
         // Register session
-        let regResp = try daemonClient.send(RuntimeControlRequest(op: "session_register"))
+        let regResp = try daemonClient.send(RuntimeControlRequest(
+            op: "session_register",
+            instance: target.instanceName,
+            callerCwd: currentCallerCwd()
+        ))
         guard regResp.ok, let sessionID = regResp.sessionId else {
             throw MSLRuntimeError("failed to register session: \(regResp.error ?? "unknown")")
         }
@@ -711,7 +726,7 @@ public final class RuntimeManager {
                 Foundation.exit(130)
             }
             pollCount += 1
-            let resp = try daemonClient.send(RuntimeControlRequest(op: "provision_status"))
+            let resp = try daemonClient.send(RuntimeControlRequest(op: "provision_status", sessionId: sessionID))
             if resp.ok {
                 let cloudInit = resp.meta?["cloud_init"] ?? "unknown"
                 logger.log("provision_polling", fields: [
@@ -767,13 +782,18 @@ public final class RuntimeManager {
         // Connect to daemon
         try daemonClient.ensureConnected(
             expectedInstanceName: target.instanceName,
-            hostShareRoot: resolveWorkspaceHostShareRoot()
+            hostShareRoot: resolveWorkspaceHostShareRoot(),
+            callerCwd: currentCallerCwd()
         )
         prepareCacheSharingIfNeeded(instanceName: target.instanceName)
         let execCwd = prepareWorkspaceIfNeeded(policy: workspacePolicy, instanceName: target.instanceName)
 
         // Register session
-        let regResp = try daemonClient.send(RuntimeControlRequest(op: "session_register"))
+        let regResp = try daemonClient.send(RuntimeControlRequest(
+            op: "session_register",
+            instance: target.instanceName,
+            callerCwd: currentCallerCwd()
+        ))
         guard regResp.ok, let sessionID = regResp.sessionId else {
             throw MSLRuntimeError("failed to register session: \(regResp.error ?? "unknown")")
         }
@@ -788,6 +808,8 @@ public final class RuntimeManager {
             op: "exec",
             argv: argv,
             timeoutMs: execTimeoutMs,
+            runAsRoot: shouldForceRootRuntimeUser(),
+            sessionId: sessionID,
             cwd: execCwd
         ))
 
@@ -819,7 +841,7 @@ public final class RuntimeManager {
         }
     }
 
-    public func printStatus() throws {
+    public func printStatus(instanceName: String? = nil, all: Bool = false) throws {
         let state: RuntimeState = try lock.withExclusiveLock {
             try bootstrap.ensureBootstrapped(context: .runtime)
             var s = try store.loadState()
@@ -836,13 +858,45 @@ public final class RuntimeManager {
             return s
         }
 
-        print("state: \(state.vmState.rawValue)")
-        print("activeSessions: \(state.activeSessionCount)")
-        print("idleTimer: \(state.idleTimer.armed ? "armed" : "not-armed")")
-        if let deadline = state.idleTimer.deadlineEpochMs {
+        let fallbackInstance = RuntimeInstanceState(
+            instance: state.distro,
+            vmState: state.vmState,
+            activeSessionCount: state.activeSessionCount,
+            idleTimer: state.idleTimer,
+            runtimeUser: state.runtimeUser,
+            initChannel: state.initChannel,
+            runtimeHostPid: state.runtimeHostPid,
+            runtimeControlSocket: state.runtimeControlSocket,
+            lastError: nil,
+            lastTransitionEpochMs: state.lastTransitionEpochMs
+        )
+        let instances = (state.instances?.isEmpty == false ? state.instances! : [fallbackInstance]).sorted {
+            $0.instance < $1.instance
+        }
+
+        if all {
+            print("INSTANCE\tSTATE\tSESSIONS\tIDLE\tPID\tLAST_ERROR")
+            for entry in instances {
+                let idle = entry.idleTimer.armed ? "armed" : "not-armed"
+                let pid = entry.runtimeHostPid.map(String.init) ?? "-"
+                let lastError = entry.lastError?.replacingOccurrences(of: "\n", with: " ") ?? "-"
+                print("\(entry.instance)\t\(entry.vmState.rawValue)\t\(entry.activeSessionCount)\t\(idle)\t\(pid)\t\(lastError)")
+            }
+            return
+        }
+
+        let targetInstance = instanceName ?? state.distro
+        guard let selected = instances.first(where: { $0.instance == targetInstance }) else {
+            throw MSLRuntimeError("instance '\(targetInstance)' not found")
+        }
+        print("instance: \(selected.instance)")
+        print("state: \(selected.vmState.rawValue)")
+        print("activeSessions: \(selected.activeSessionCount)")
+        print("idleTimer: \(selected.idleTimer.armed ? "armed" : "not-armed")")
+        if let deadline = selected.idleTimer.deadlineEpochMs {
             print("idleDeadlineEpochMs: \(deadline)")
         }
-        if let initChannel = state.initChannel {
+        if let initChannel = selected.initChannel {
             print("initChannelStatus: \(initChannel.lastStatus.rawValue)")
             if let version = initChannel.version {
                 print("initChannelVersion: \(version)")
@@ -869,7 +923,8 @@ public final class RuntimeManager {
         }
         try daemonClient.ensureConnected(
             expectedInstanceName: target.instanceName,
-            hostShareRoot: resolveWorkspaceHostShareRoot()
+            hostShareRoot: resolveWorkspaceHostShareRoot(),
+            callerCwd: currentCallerCwd()
         )
         defer { daemonClient.disconnect() }
 
@@ -918,7 +973,8 @@ public final class RuntimeManager {
         }
         try daemonClient.ensureConnected(
             expectedInstanceName: target.instanceName,
-            hostShareRoot: resolveWorkspaceHostShareRoot()
+            hostShareRoot: resolveWorkspaceHostShareRoot(),
+            callerCwd: currentCallerCwd()
         )
         defer { daemonClient.disconnect() }
 
@@ -949,7 +1005,8 @@ public final class RuntimeManager {
         }
         try daemonClient.ensureConnected(
             expectedInstanceName: target.instanceName,
-            hostShareRoot: resolveWorkspaceHostShareRoot()
+            hostShareRoot: resolveWorkspaceHostShareRoot(),
+            callerCwd: currentCallerCwd()
         )
         defer { daemonClient.disconnect() }
 
@@ -962,27 +1019,53 @@ public final class RuntimeManager {
         print("mode=\(meta["dns_mode"] ?? "unknown") status=\(meta["dns_status"] ?? "unknown") action=\(meta["dns_action"] ?? "-")")
     }
 
-    public func stopVM() throws {
+    public func stopVM(instanceName: String? = nil, all: Bool = false) throws {
         // Try sending stop via daemon control socket first
+        var attemptedDaemonStop = false
         do {
             let state = try lock.withExclusiveLock(timeoutSec: 2) { try store.loadState() }
-            if state.vmState == .running,
-               let pid = state.runtimeHostPid, isDaemonAlive(pid: pid) {
-                let socketPath = state.runtimeControlSocket ?? paths.runtimeControlSocketFile.path
+            let daemonPid = state.daemonHostPid ?? state.runtimeHostPid
+            if let daemonPid, isDaemonAlive(pid: daemonPid) {
+                attemptedDaemonStop = true
+                let socketPath = state.daemonControlSocket ?? state.runtimeControlSocket ?? paths.runtimeControlSocketFile.path
                 let client = RuntimeControlClient(socketPath: socketPath)
-                let resp = try client.send(RuntimeControlRequest(op: "stop"))
+                let resp = try client.send(RuntimeControlRequest(
+                    op: "instance_stop",
+                    instance: instanceName,
+                    all: all,
+                    callerCwd: currentCallerCwd()
+                ))
                 if resp.ok {
-                    // Wait for daemon to actually stop
-                    for _ in 0..<30 {
-                        if !isDaemonAlive(pid: pid) { break }
-                        Thread.sleep(forTimeInterval: 0.1)
+                    if all || (instanceName == nil || instanceName == state.distro) {
+                        for _ in 0..<30 {
+                            if !isDaemonAlive(pid: daemonPid) { break }
+                            Thread.sleep(forTimeInterval: 0.1)
+                        }
                     }
-                    print("stopped")
+                    if all {
+                        print("stopped all")
+                    } else if let instanceName, !instanceName.isEmpty {
+                        print("stopped \(instanceName)")
+                    } else {
+                        print("stopped")
+                    }
                     return
                 }
+                throw MSLRuntimeError(resp.error ?? "stop failed")
             }
         } catch {
+            if attemptedDaemonStop {
+                throw error
+            }
             // Fall through to legacy stop
+        }
+
+        if all {
+            print("already stopped")
+            return
+        }
+        if let instanceName, !instanceName.isEmpty {
+            throw MSLRuntimeError("instance '\(instanceName)' is not running")
         }
 
         // Legacy fallback: direct state manipulation
@@ -1012,48 +1095,66 @@ public final class RuntimeManager {
         }
     }
 
-    public func addPortMapping(_ raw: String) throws {
-        let mapping = try parsePortMapping(raw)
+    public func addPortMapping(_ raw: String, instanceName: String? = nil) throws {
+        let target = try resolveRuntimeTarget(explicitInstanceName: instanceName)
+        let mapping = try parsePortMapping(raw, instanceName: target.instanceName)
         var runtimeSocket: String?
-        var vmState: VMState = .stopped
+        var instanceRunning = false
         try lock.withExclusiveLock {
             try bootstrap.ensureBootstrapped(context: .runtime)
             let runtime = try store.loadState()
-            vmState = runtime.vmState
+            instanceRunning = isInstanceRunning(runtime, instanceName: target.instanceName)
             runtimeSocket = runtime.runtimeControlSocket
             var state = try store.loadPortMappings()
-            if state.mappings.contains(where: { $0.hostPort == mapping.hostPort }) {
-                throw MSLRuntimeError("host port \(mapping.hostPort) is already mapped")
+            if let existing = state.mappings.first(where: { $0.hostPort == mapping.hostPort }) {
+                if existing.instance == target.instanceName {
+                    throw MSLRuntimeError("host port \(mapping.hostPort) is already mapped in instance '\(target.instanceName)'")
+                }
+                throw MSLRuntimeError(
+                    "port_conflict host_port=\(mapping.hostPort) owner_instance=\(existing.instance)"
+                )
             }
             state.mappings.append(mapping)
-            state.mappings.sort { $0.hostPort < $1.hostPort }
+            state.mappings.sort { lhs, rhs in
+                if lhs.hostPort == rhs.hostPort {
+                    return lhs.instance < rhs.instance
+                }
+                return lhs.hostPort < rhs.hostPort
+            }
             try store.savePortMappings(state)
             logger.log("port_forward_add", fields: [
+                "instance": target.instanceName,
                 "hostPort": String(mapping.hostPort),
                 "guestPort": String(mapping.guestPort)
             ])
         }
 
-        if vmState == .running {
+        if instanceRunning {
             let socketPath = runtimeSocket ?? paths.runtimeControlSocketFile.path
             let client = RuntimeControlClient(socketPath: socketPath)
-            let response = try client.send(RuntimeControlRequest(op: "port_add", hostPort: mapping.hostPort, guestPort: mapping.guestPort))
+            let response = try client.send(RuntimeControlRequest(
+                op: "port_add",
+                instance: target.instanceName,
+                hostPort: mapping.hostPort,
+                guestPort: mapping.guestPort
+            ))
             if !response.ok {
                 throw MSLRuntimeError(response.error ?? "failed to apply runtime port mapping")
             }
         }
-        print("added \(mapping.hostPort):\(mapping.guestPort)")
+        print("added \(mapping.hostPort):\(mapping.guestPort) (instance=\(target.instanceName))")
     }
 
-    public func listPortMappings() throws {
+    public func listPortMappings(instanceName: String? = nil) throws {
+        let target = try resolveRuntimeTarget(explicitInstanceName: instanceName)
         var mappings = try lock.withExclusiveLock {
             try bootstrap.ensureBootstrapped(context: .runtime)
-            return try store.loadPortMappings().mappings
+            return try store.loadPortMappings().mappings.filter { $0.instance == target.instanceName }
         }
         let manualHostPorts = Set(mappings.map { $0.hostPort })
 
         let runtimeStatus: [RuntimePortStatusItem] = (try? RuntimeControlClient(socketPath: paths.runtimeControlSocketFile.path)
-            .send(RuntimeControlRequest(op: "port_ls", hostPort: nil, guestPort: nil)).items) ?? []
+            .send(RuntimeControlRequest(op: "port_ls", instance: target.instanceName, hostPort: nil, guestPort: nil)).items) ?? []
 
         if mappings.isEmpty, runtimeStatus.isEmpty {
             print("no port mappings")
@@ -1063,7 +1164,13 @@ public final class RuntimeManager {
         // Favor runtime status when available.
         if !runtimeStatus.isEmpty {
             mappings = runtimeStatus.map {
-                PortMapping(hostPort: $0.hostPort, guestPort: $0.guestPort, bindAddress: $0.bindAddress, createdAtEpochMs: nowEpochMs())
+                PortMapping(
+                    hostPort: $0.hostPort,
+                    guestPort: $0.guestPort,
+                    bindAddress: $0.bindAddress,
+                    createdAtEpochMs: nowEpochMs(),
+                    instance: $0.instance ?? target.instanceName
+                )
             }
         }
 
@@ -1077,42 +1184,51 @@ public final class RuntimeManager {
         }
     }
 
-    public func removePortMapping(_ hostPortArg: String) throws {
+    public func removePortMapping(_ hostPortArg: String, instanceName: String? = nil) throws {
         guard let hostPort = Int(hostPortArg), (1...65_535).contains(hostPort) else {
             throw MSLRuntimeError("invalid host port: \(hostPortArg)")
         }
 
-        var vmState: VMState = .stopped
+        let target = try resolveRuntimeTarget(explicitInstanceName: instanceName)
+        var instanceRunning = false
         var runtimeSocket: String?
         let removed = try lock.withExclusiveLock { () throws -> Bool in
             try bootstrap.ensureBootstrapped(context: .runtime)
             let runtime = try store.loadState()
-            vmState = runtime.vmState
+            instanceRunning = isInstanceRunning(runtime, instanceName: target.instanceName)
             runtimeSocket = runtime.runtimeControlSocket
             var state = try store.loadPortMappings()
             let originalCount = state.mappings.count
-            state.mappings.removeAll { $0.hostPort == hostPort }
+            state.mappings.removeAll { $0.hostPort == hostPort && $0.instance == target.instanceName }
             if state.mappings.count != originalCount {
                 try store.savePortMappings(state)
-                logger.log("port_forward_remove", fields: ["hostPort": String(hostPort)])
+                logger.log("port_forward_remove", fields: [
+                    "instance": target.instanceName,
+                    "hostPort": String(hostPort)
+                ])
                 return true
             }
             return false
         }
 
-        if removed, vmState == .running {
+        if removed, instanceRunning {
             let socketPath = runtimeSocket ?? paths.runtimeControlSocketFile.path
             let client = RuntimeControlClient(socketPath: socketPath)
-            let response = try client.send(RuntimeControlRequest(op: "port_rm", hostPort: hostPort, guestPort: nil))
+            let response = try client.send(RuntimeControlRequest(
+                op: "port_rm",
+                instance: target.instanceName,
+                hostPort: hostPort,
+                guestPort: nil
+            ))
             if !response.ok {
                 throw MSLRuntimeError(response.error ?? "failed to apply runtime port removal")
             }
         }
 
         if removed {
-            print("removed \(hostPort)")
+            print("removed \(hostPort) (instance=\(target.instanceName))")
         } else {
-            print("no mapping for host port \(hostPort)")
+            print("no mapping for host port \(hostPort) in instance \(target.instanceName)")
         }
     }
 
@@ -1342,7 +1458,7 @@ public final class RuntimeManager {
         return String(last)
     }
 
-    private func parsePortMapping(_ raw: String) throws -> PortMapping {
+    private func parsePortMapping(_ raw: String, instanceName: String) throws -> PortMapping {
         let parts = raw.split(separator: ":", omittingEmptySubsequences: false)
         guard parts.count == 2 else {
             throw MSLRuntimeError("invalid mapping '\(raw)'. expected <hostPort>:<guestPort>")
@@ -1353,7 +1469,21 @@ public final class RuntimeManager {
         guard (1...65_535).contains(hostPort), (1...65_535).contains(guestPort) else {
             throw MSLRuntimeError("invalid mapping '\(raw)'. ports must be in 1..65535")
         }
-        return PortMapping(hostPort: hostPort, guestPort: guestPort)
+        return PortMapping(hostPort: hostPort, guestPort: guestPort, instance: instanceName)
+    }
+
+    private func isInstanceRunning(_ state: RuntimeState, instanceName: String) -> Bool {
+        if state.distro == instanceName, state.vmState == .running {
+            return true
+        }
+        return state.instances?.contains(where: { $0.instance == instanceName && $0.vmState == .running }) == true
+    }
+
+    private func currentCallerCwd() -> String {
+        return URL(fileURLWithPath: fileManager.currentDirectoryPath, isDirectory: true)
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+            .path
     }
 
     private static func resolveExecutablePath(_ rawPath: String, fileManager: FileManager) -> String {
@@ -1558,6 +1688,16 @@ public final class RuntimeManager {
         )
         let instanceName = metadataURL.deletingLastPathComponent().lastPathComponent
         return (instanceName, metadataURL)
+    }
+
+    private func shouldForceRootRuntimeUser() -> Bool {
+        guard let raw = ProcessInfo.processInfo.environment["MSL_RUNTIME_USER_ROOT"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        else {
+            return false
+        }
+        return raw == "1" || raw == "true" || raw == "yes"
     }
 
     private func formatBytes(_ bytes: UInt64) -> String {

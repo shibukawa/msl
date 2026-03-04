@@ -26,15 +26,18 @@ final class RuntimeControlTests: XCTestCase {
 
     func testResponseWithItems() throws {
         let item = RuntimePortStatusItem(
+            instance: "ubuntu",
             hostPort: 8080, guestPort: 80,
-            bindAddress: "127.0.0.1", active: true, error: nil
+            bindAddress: "127.0.0.1", active: true, ownerInstance: "alpine", error: nil
         )
         let resp = RuntimeControlResponse(ok: true, error: nil, items: [item])
         let data = try JSONEncoder().encode(resp)
         let decoded = try JSONDecoder().decode(RuntimeControlResponse.self, from: data)
         XCTAssertEqual(decoded.items?.count, 1)
+        XCTAssertEqual(decoded.items?.first?.instance, "ubuntu")
         XCTAssertEqual(decoded.items?.first?.hostPort, 8080)
         XCTAssertEqual(decoded.items?.first?.guestPort, 80)
+        XCTAssertEqual(decoded.items?.first?.ownerInstance, "alpine")
         XCTAssertEqual(decoded.items?.first?.active, true)
     }
 
@@ -43,6 +46,7 @@ final class RuntimeControlTests: XCTestCase {
     func testExecRequestRoundTrip() throws {
         let req = RuntimeControlRequest(
             op: "exec",
+            instance: "ubuntu",
             argv: ["echo", "hello"],
             timeoutMs: 30000,
             cwd: "/Users/alice/work"
@@ -50,6 +54,7 @@ final class RuntimeControlTests: XCTestCase {
         let data = try JSONEncoder().encode(req)
         let decoded = try JSONDecoder().decode(RuntimeControlRequest.self, from: data)
         XCTAssertEqual(decoded.op, "exec")
+        XCTAssertEqual(decoded.instance, "ubuntu")
         XCTAssertEqual(decoded.argv, ["echo", "hello"])
         XCTAssertEqual(decoded.cwd, "/Users/alice/work")
         XCTAssertEqual(decoded.timeoutMs, 30000)
@@ -188,10 +193,31 @@ final class RuntimeControlTests: XCTestCase {
     }
 
     func testStopRequestRoundTrip() throws {
-        let req = RuntimeControlRequest(op: "stop")
+        let req = RuntimeControlRequest(op: "instance_stop", all: true, callerCwd: "/Users/alice/work")
         let data = try JSONEncoder().encode(req)
         let decoded = try JSONDecoder().decode(RuntimeControlRequest.self, from: data)
-        XCTAssertEqual(decoded.op, "stop")
+        XCTAssertEqual(decoded.op, "instance_stop")
+        XCTAssertEqual(decoded.all, true)
+        XCTAssertEqual(decoded.callerCwd, "/Users/alice/work")
+    }
+
+    func testInstanceListResponseRoundTrip() throws {
+        let item = RuntimeInstanceStatusItem(
+            instance: "ubuntu",
+            vmState: "Running",
+            activeSessionCount: 2,
+            idleTimerArmed: false,
+            idleDeadlineEpochMs: nil,
+            runtimeHostPid: 123,
+            lastError: nil,
+            lastTransitionEpochMs: 100
+        )
+        let resp = RuntimeControlResponse(ok: true, instances: [item])
+        let data = try JSONEncoder().encode(resp)
+        let decoded = try JSONDecoder().decode(RuntimeControlResponse.self, from: data)
+        XCTAssertEqual(decoded.instances?.count, 1)
+        XCTAssertEqual(decoded.instances?.first?.instance, "ubuntu")
+        XCTAssertEqual(decoded.instances?.first?.vmState, "Running")
     }
 
     func testProvisionStatusRequestRoundTrip() throws {
@@ -283,6 +309,9 @@ final class RuntimeControlTests: XCTestCase {
         )
         XCTAssertEqual(decoded.op, "stop")
         XCTAssertNil(decoded.hostPort)
+        XCTAssertNil(decoded.instance)
+        XCTAssertNil(decoded.all)
+        XCTAssertNil(decoded.callerCwd)
         XCTAssertNil(decoded.guestPort)
         XCTAssertNil(decoded.argv)
         XCTAssertNil(decoded.timeoutMs)

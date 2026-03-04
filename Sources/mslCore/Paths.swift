@@ -14,6 +14,7 @@ public struct MSLPaths {
     public let sessionsFile: URL
     public let portsFile: URL
     public let runtimeControlSocketFile: URL
+    public let runtimeEventSocketFile: URL
     public let initChannelSocketFile: URL
     public let initChannelHandoffFile: URL
     public let initChannelAckFile: URL
@@ -61,6 +62,7 @@ public struct MSLPaths {
         self.sessionsFile = runtime.appendingPathComponent("sessions.json", isDirectory: false)
         self.portsFile = runtime.appendingPathComponent("ports.json", isDirectory: false)
         self.runtimeControlSocketFile = runtime.appendingPathComponent("control.sock", isDirectory: false)
+        self.runtimeEventSocketFile = runtime.appendingPathComponent("events.sock", isDirectory: false)
         self.mslHostToolsDir = mslSystemHome
         self.mslHostExt4MkfsHelperBinaryFile = mslHostToolsDir.appendingPathComponent("msl-ext4-mkfs", isDirectory: false)
         self.mslHostInitBinaryFile = mslHostToolsDir.appendingPathComponent("msl-init", isDirectory: false)
@@ -114,6 +116,28 @@ public struct MSLPaths {
         appLogs
             .appendingPathComponent("instances", isDirectory: true)
             .appendingPathComponent(instanceName, isDirectory: true)
+    }
+
+    public func instanceLogsDirectory(named instanceName: String) -> URL {
+        diagnosticLogsDirectory(named: instanceName)
+    }
+
+    public func instanceSessionLogsDirectory(named instanceName: String) -> URL {
+        instanceLogsDirectory(named: instanceName).appendingPathComponent("sessions", isDirectory: true)
+    }
+
+    public func instanceVMLogsDirectory(named instanceName: String) -> URL {
+        instanceLogsDirectory(named: instanceName).appendingPathComponent("vm", isDirectory: true)
+    }
+
+    public func sessionLogFile(instanceName: String, sessionID: String) -> URL {
+        instanceSessionLogsDirectory(named: instanceName)
+            .appendingPathComponent("\(sessionID).log", isDirectory: false)
+    }
+
+    public func instanceVMLifecycleLogFile(named instanceName: String) -> URL {
+        instanceVMLogsDirectory(named: instanceName)
+            .appendingPathComponent("lifecycle.log", isDirectory: false)
     }
 }
 

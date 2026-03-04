@@ -280,11 +280,25 @@ STAGE2_OUTPUT="$STAGE_OUT_DIR/stage2-btrfs.raw"
 STAGE_TMP_IMAGE="$STAGE_TMP_DIR/guest-tmp-work.raw"
 STAGE_INIT=""
 progress_step "preparing staging area"
-cp -f "$ROOTFS_TARBALL" "$STAGE_ROOTFS"
+copy_if_needed() {
+  src="$1"
+  dst="$2"
+  if [ "$src" = "$dst" ]; then
+    return 0
+  fi
+  if [ -e "$dst" ]; then
+    if [ "$src" -ef "$dst" ] 2>/dev/null; then
+      return 0
+    fi
+  fi
+  cp -f "$src" "$dst"
+}
+
+copy_if_needed "$ROOTFS_TARBALL" "$STAGE_ROOTFS"
 rm -f "$STAGE_OUTPUT" "$STAGE1_OUTPUT" "$STAGE2_OUTPUT" "$STAGE_TMP_IMAGE"
 if [ -n "$INIT_BINARY_PATH" ]; then
   STAGE_INIT="$STAGE_IN_DIR/$(basename "$INIT_BINARY_PATH")"
-  cp -f "$INIT_BINARY_PATH" "$STAGE_INIT"
+  copy_if_needed "$INIT_BINARY_PATH" "$STAGE_INIT"
 fi
 progress_step "staged rootfs/init artifacts"
 
@@ -334,7 +348,9 @@ tmp_mount="/mnt/msl-imagewriter-tmp"
 tmp_work_dir="$tmp_mount/work"
 worker="$tmp_mount/msl-imagewriter-build-guest.sh"
 local_output="$tmp_mount/msl-imagewriter-output.raw"
-tmp_image_mb=4096
+tmp_image_mb=8192
+tmp_image_min_mb=4096
+tmp_image_overhead_mb=4096
 
 if ! command -v base64 >/dev/null 2>&1; then
   echo "error: base64 command is required in guest" >&2
@@ -361,6 +377,22 @@ if [ -z "$tmp_image" ]; then
   echo "error: temporary work image path is empty" >&2
   exit 1
 fi
+case "$size_mb" in
+  ""|*[!0-9]*)
+    tmp_image_mb=$((tmp_image_min_mb + tmp_image_overhead_mb))
+    ;;
+  *)
+    if [ "$size_mb" -gt 0 ]; then
+      tmp_image_mb=$((size_mb + tmp_image_overhead_mb))
+    else
+      tmp_image_mb=$((tmp_image_min_mb + tmp_image_overhead_mb))
+    fi
+    ;;
+esac
+if [ "$tmp_image_mb" -lt "$tmp_image_min_mb" ]; then
+  tmp_image_mb="$tmp_image_min_mb"
+fi
+echo "imagewriter_guest_tmp_image_mb=$tmp_image_mb mode=$mode size_mb=$size_mb"
 mkdir -p "$(dirname "$tmp_image")"
 rm -f "$tmp_image"
 truncate -s "${tmp_image_mb}M" "$tmp_image"
