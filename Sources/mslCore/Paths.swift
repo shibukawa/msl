@@ -35,6 +35,11 @@ public struct MSLPaths {
     public let bootstrapCloudInitUserDataFile: URL
     public let bootstrapCloudInitMetaDataFile: URL
     public let bootstrapCloudInitSeedISOFile: URL
+    public let securityRootDir: URL
+    public let securityToolsDir: URL
+    public let securityVulsDBDir: URL
+    public let securityVulsRuntimeDir: URL
+    public let securityStateDir: URL
     public let mslHostToolsDir: URL
     public let mslHostExt4MkfsHelperBinaryFile: URL
     public let mslHostInitBinaryFile: URL
@@ -90,6 +95,11 @@ public struct MSLPaths {
         self.bootstrapCloudInitUserDataFile = bootstrapCloudInitDir.appendingPathComponent("user-data", isDirectory: false)
         self.bootstrapCloudInitMetaDataFile = bootstrapCloudInitDir.appendingPathComponent("meta-data", isDirectory: false)
         self.bootstrapCloudInitSeedISOFile = bootstrapArtifactsDir.appendingPathComponent("seed.iso", isDirectory: false)
+        self.securityRootDir = appSupport.appendingPathComponent("security", isDirectory: true)
+        self.securityToolsDir = securityRootDir.appendingPathComponent("tools", isDirectory: true)
+        self.securityVulsDBDir = securityRootDir.appendingPathComponent("vuls-db", isDirectory: true)
+        self.securityVulsRuntimeDir = securityRootDir.appendingPathComponent("vuls-runtime", isDirectory: true)
+        self.securityStateDir = securityRootDir.appendingPathComponent("state", isDirectory: true)
     }
 
     public func distroDirectory(named name: String) -> URL {

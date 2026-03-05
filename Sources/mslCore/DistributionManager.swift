@@ -136,6 +136,17 @@ final class DistributionManager {
         manifestStore.installableDescriptors()
     }
 
+    func resolveManifestEntry(alias: String) -> DistributionManifestEntry? {
+        manifestStore.resolve(alias: alias)
+    }
+
+    func manifestEntry(manifestID: String?) -> DistributionManifestEntry? {
+        guard let manifestID, !manifestID.isEmpty else {
+            return nil
+        }
+        return manifestStore.allEntries().first { $0.id == manifestID }
+    }
+
     func installedInstances() -> [InstalledInstanceDescriptor] {
         guard let contents = try? fileManager.contentsOfDirectory(
             at: paths.distrosDir,
@@ -774,6 +785,17 @@ final class DistributionManager {
             ])
             throw error
         }
+    }
+
+    func updateImageMaintenanceStatus(
+        metadataURL: URL,
+        mutate: (inout DistributionInstanceMetadata.ImageMaintenanceStatus) -> Void
+    ) throws {
+        var metadata = try readOrRebuildInstanceMetadata(at: metadataURL)
+        var status = metadata.imageMaintenance ?? DistributionInstanceMetadata.ImageMaintenanceStatus()
+        mutate(&status)
+        metadata.imageMaintenance = status
+        try writeJSON(metadata, to: metadataURL)
     }
 
     func resolveUserConvergencePolicy(metadataURL: URL) throws -> UserConvergencePolicy {
@@ -1757,6 +1779,34 @@ final class DistributionManager {
     }
 
     internal func compactSparseImageIfSupported(_ imageURL: URL) throws {
+        if let qemuImg = process.findExecutable(["qemu-img"]) {
+            let tempURL = imageURL.deletingLastPathComponent()
+                .appendingPathComponent(".\(imageURL.lastPathComponent).compact-\(UUID().uuidString).tmp", isDirectory: false)
+            defer {
+                if fileManager.fileExists(atPath: tempURL.path) {
+                    try? fileManager.removeItem(at: tempURL)
+                }
+            }
+
+            let convert = try process.run(
+                qemuImg,
+                ["convert", "-O", "raw", "-S", "4k", imageURL.path, tempURL.path],
+                captureOutput: true
+            )
+            guard convert.exitCode == 0 else {
+                throw MSLRuntimeError(
+                    "qemu-img convert failed (\(convert.exitCode)): " +
+                    (convert.stderr.isEmpty ? convert.stdout : convert.stderr)
+                )
+            }
+
+            if fileManager.fileExists(atPath: imageURL.path) {
+                try fileManager.removeItem(at: imageURL)
+            }
+            try fileManager.moveItem(at: tempURL, to: imageURL)
+            return
+        }
+
         guard let fallocate = process.findExecutable(["fallocate"]) else {
             return
         }

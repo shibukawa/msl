@@ -1,6 +1,7 @@
 .PHONY: build build-init build-ext4-helper build-image build-imagewriter build-imagewriter-help imagewriter-help imagewriter-setup imagewriter \
 	reset reset-disk reset-full clean-alpine clean-ubuntu run \
 	test test-regression \
+	install-security-tools \
 	update-distribution-list \
 	kernel-help kernel-fetch-source kernel-build kernel-build-docker kernel-stage \
 	clean
@@ -193,6 +194,9 @@ test:
 
 test-regression: build
 	MSL="$(MSL)" bash Tests/regression/runner.sh
+
+install-security-tools:
+	./scripts/install-security-tools.sh
 
 update-distribution-list:
 	python3 scripts/update-distribution-manifest.py

@@ -43,6 +43,20 @@ public final class RuntimeManager {
         DistributionManager(paths: paths, logger: logger)
     }()
 
+    private lazy var securityScanOrchestrator: SecurityScanOrchestrator = {
+        SecurityScanOrchestrator(
+            paths: paths,
+            fileManager: fileManager,
+            logger: logger,
+            progress: { message in
+                guard message.hasPrefix("security: downloading ") else {
+                    return
+                }
+                fputs("\(message)\n", stderr)
+            }
+        )
+    }()
+
     public init(executablePath: String, fileManager: FileManager = .default) throws {
         self.fileManager = fileManager
         if let homeOverride = ProcessInfo.processInfo.environment["MSL_HOME"], !homeOverride.isEmpty {
@@ -467,6 +481,7 @@ public final class RuntimeManager {
         let commandStartMs = runtimeMonotonicMs()
         let metadataResolveStartMs = runtimeMonotonicMs()
         let target = try resolveRuntimeTarget(explicitInstanceName: instanceName)
+        maybeStartWeeklySecurityScan(instanceName: target.instanceName, metadataURL: target.metadataURL)
         logger.log("startup_phase_duration_ms", fields: [
             "phase": "runtime_metadata_resolve",
             "elapsed_ms": String(max(0, runtimeMonotonicMs() - metadataResolveStartMs)),
@@ -1105,6 +1120,542 @@ public final class RuntimeManager {
         }
     }
 
+    public func printImageInspect(instanceName: String? = nil) throws {
+        let target = try resolveRuntimeTarget(explicitInstanceName: instanceName)
+        let metadata = try distributionManager.readOrRebuildInstanceMetadata(at: target.metadataURL)
+        let diskURL = URL(fileURLWithPath: metadata.diskPath)
+        let logicalBytes = logicalBytes(of: diskURL) ?? 0
+        let allocatedBytes = allocatedBytes(of: diskURL) ?? logicalBytes
+        let maintenance = metadata.imageMaintenance
+        let guestStats = try? collectGuestStorageInspectStatsIfRunning(instanceName: target.instanceName)
+        let cacheUsages = collectExternalizedCacheUsages(metadata: metadata)
+        let beforeCompressionBytes = guestStats?.beforeCompressionBytes ?? maintenance?.cachedTotalContentBytes
+        let afterCompressionBytes = guestStats?.afterCompressionBytes ?? maintenance?.cachedCompressedBytes
+        let compressionSavingPercent: Double? =
+            guestStats?.compressionRatioPercent ?? maintenance?.cachedCompressionSavingPercent
+
+        print("instance: \(target.instanceName)")
+        print("disk: \(tildePath(diskURL.path))")
+        printIndentedMegaBytesLine(label: "total storage size:", bytes: logicalBytes)
+        printIndentedMegaBytesLine(label: "total content size:", bytes: beforeCompressionBytes)
+        printIndentedCompressedLine(
+            label: "compressed size:",
+            bytes: afterCompressionBytes,
+            savingPercent: compressionSavingPercent
+        )
+        printIndentedMegaBytesLine(label: "image size on macOS:", bytes: allocatedBytes)
+        print("  last defrag at: \(formatDefragTimestamp(maintenance))")
+        print("externalized caches:")
+        if cacheUsages.isEmpty {
+            print("  (none)")
+        } else {
+            for usage in cacheUsages {
+                let label = usage.label.padding(toLength: 18, withPad: " ", startingAt: 0)
+                let value = formatMegaBytesTenths(usage.bytes).leftPadding(toLength: 10)
+                print("  \(label) \(value) MB  \(tildePath(usage.hostPath))")
+            }
+        }
+    }
+
+    public func runImageDefrag(instanceName: String? = nil, dryRun: Bool = false) throws {
+        let target = try resolveRuntimeTarget(explicitInstanceName: instanceName)
+        let metadata = try distributionManager.readOrRebuildInstanceMetadata(at: target.metadataURL)
+        let diskURL = URL(fileURLWithPath: metadata.diskPath)
+        guard fileManager.fileExists(atPath: diskURL.path) else {
+            throw MSLRuntimeError("disk image not found: \(diskURL.path)")
+        }
+
+        let beforeAllocated = allocatedBytes(of: diskURL) ?? 0
+        let wasRunning = try isInstanceRunningByName(target.instanceName)
+        if dryRun {
+            print("defrag dry-run: instance=\(target.instanceName) disk=\(diskURL.path) allocatedBefore=\(beforeAllocated) action=fstrim")
+            if !wasRunning {
+                print("defrag dry-run: instance is stopped and will be started temporarily for trim")
+            }
+            return
+        }
+
+        let hostShareRoot = resolveWorkspaceHostShareRoot()
+        try lock.withExclusiveLock {
+            try bootstrap.ensureBootstrapped(context: .runtime)
+        }
+        try daemonClient.ensureConnected(
+            expectedInstanceName: target.instanceName,
+            hostShareRoot: hostShareRoot,
+            callerCwd: currentCallerCwd()
+        )
+        defer {
+            if !wasRunning {
+                _ = try? daemonClient.send(RuntimeControlRequest(
+                    op: "instance_stop",
+                    instance: target.instanceName
+                ))
+            }
+            daemonClient.disconnect()
+        }
+        let trimResponse = try daemonClient.send(RuntimeControlRequest(
+            op: "exec",
+            instance: target.instanceName,
+            argv: [
+                "/bin/sh",
+                "-lc",
+                """
+                set -eu
+                if ! command -v fstrim >/dev/null 2>&1; then
+                  echo "fstrim_missing" >&2
+                  exit 127
+                fi
+                fstrim -av >/dev/null 2>&1 || fstrim -a >/dev/null 2>&1
+                """
+            ],
+            timeoutMs: 180_000,
+            runAsRoot: true
+        ))
+        guard trimResponse.ok, (trimResponse.exitCode ?? 1) == 0 else {
+            throw MSLRuntimeError(trimResponse.error ?? trimResponse.stderr ?? "fstrim failed")
+        }
+
+        let afterAllocated = allocatedBytes(of: diskURL) ?? beforeAllocated
+        try distributionManager.updateImageMaintenanceStatus(metadataURL: target.metadataURL) { status in
+            status.lastRunAtEpochMs = nowEpochMs()
+            status.lastOperation = "manual_defrag"
+            status.lastResult = "ok"
+            status.lastErrorCode = nil
+            status.lastErrorMessage = nil
+            status.lastCompactAtEpochMs = nowEpochMs()
+            status.lastCompactBytesBefore = beforeAllocated
+            status.lastCompactBytesAfter = afterAllocated
+        }
+        print("defrag completed: \(target.instanceName)")
+        print("mode: trim-only (fstrim -av)")
+        print("allocatedBefore: \(beforeAllocated)")
+        print("allocatedAfter: \(afterAllocated)")
+    }
+
+    public func runImageRefresh(
+        instanceName: String? = nil,
+        dryRun: Bool = false
+    ) throws {
+        let target = try resolveRuntimeTarget(explicitInstanceName: instanceName)
+        let hostInitPath = paths.mslHostInitBinaryFile.path
+        guard fileManager.fileExists(atPath: hostInitPath) else {
+            throw MSLRuntimeError("host msl-init binary not found: \(hostInitPath). run `make build-init` first.")
+        }
+        let hostShareRoot = resolveWorkspaceHostShareRoot()
+        let guestInitPaths = guestVisibleHostPathCandidates(hostInitPath, hostShareRoot: hostShareRoot)
+        guard !guestInitPaths.isEmpty else {
+            throw MSLRuntimeError("host msl-init path is outside host share root (\(hostShareRoot)): \(hostInitPath)")
+        }
+
+        if dryRun {
+            print("refresh dry-run: instance=\(target.instanceName)")
+            print("hostInit: \(hostInitPath)")
+            print("guestSource: \(guestInitPaths.joined(separator: ","))")
+            return
+        }
+
+        try lock.withExclusiveLock {
+            try bootstrap.ensureBootstrapped(context: .runtime)
+        }
+        try daemonClient.ensureConnected(
+            expectedInstanceName: target.instanceName,
+            hostShareRoot: hostShareRoot,
+            callerCwd: currentCallerCwd()
+        )
+        defer { daemonClient.disconnect() }
+
+        let versionBefore = try readGuestInitVersionViaDaemon(instanceName: target.instanceName)
+        var response: RuntimeControlResponse?
+        for guestInitPath in guestInitPaths {
+            let candidate = try daemonClient.send(RuntimeControlRequest(
+                op: "exec",
+                instance: target.instanceName,
+                argv: [
+                    "/bin/sh",
+                    "-lc",
+                    """
+                    set -eu
+                    src="$1"
+                    dst="/usr/local/bin/msl-init"
+                    tmp="/usr/local/bin/.msl-init.tmp.$$"
+                    if [ ! -f "$src" ]; then
+                      echo "source_missing" >&2
+                      exit 20
+                    fi
+                    mkdir -p /usr/local/bin
+                    if [ -f "$dst" ] && cmp -s "$src" "$dst"; then
+                      printf "skipped"
+                      exit 0
+                    fi
+                    cp "$src" "$tmp"
+                    chmod 0755 "$tmp"
+                    mv "$tmp" "$dst"
+                    ln -sf /usr/local/bin/msl-init /usr/local/bin/msl
+                    printf "updated"
+                    """,
+                    "msl-image-refresh",
+                    guestInitPath
+                ],
+                timeoutMs: 12_000,
+                runAsRoot: true
+            ))
+            response = candidate
+            if candidate.ok && (candidate.exitCode ?? 0) == 0 {
+                break
+            }
+            if !isInitSourceMissing(response: candidate) {
+                break
+            }
+        }
+        let finalResponse = response ?? RuntimeControlResponse(ok: false, error: "refresh request failed")
+        let versionAfter = try readGuestInitVersionViaDaemon(instanceName: target.instanceName)
+        let result = finalResponse.ok && (finalResponse.exitCode ?? 0) == 0 ? "ok" : "failed"
+        try distributionManager.updateImageMaintenanceStatus(metadataURL: target.metadataURL) { status in
+            status.lastRunAtEpochMs = nowEpochMs()
+            status.lastOperation = "manual_refresh"
+            status.lastResult = result
+            status.lastErrorCode = result == "ok" ? nil : "refresh_failed"
+            status.lastErrorMessage = result == "ok" ? nil : (finalResponse.error ?? finalResponse.stderr ?? "refresh failed")
+            status.lastRefreshVersionBefore = versionBefore
+            status.lastRefreshVersionAfter = versionAfter
+        }
+        guard result == "ok" else {
+            throw MSLRuntimeError(finalResponse.error ?? finalResponse.stderr ?? "refresh failed")
+        }
+        print("refresh completed: \(target.instanceName)")
+        if let versionBefore {
+            print("versionBefore: \(versionBefore)")
+        }
+        if let versionAfter {
+            print("versionAfter: \(versionAfter)")
+        }
+    }
+
+    public func runImageScan(
+        instanceName: String? = nil,
+        policyRaw: String?,
+        offline: Bool,
+        updateVuls: Bool,
+        outputPath: String?
+    ) throws -> Never {
+        let target = try resolveRuntimeTarget(explicitInstanceName: instanceName)
+        if try shouldAutoStopBeforeImageScan(instanceName: target.instanceName) {
+            print("scan precheck: instance '\(target.instanceName)' is idle-running (no active sessions). stopping before scan...")
+            try stopVM(instanceName: target.instanceName)
+        }
+        let metadata = try distributionManager.readOrRebuildInstanceMetadata(at: target.metadataURL)
+        guard let manifestEntry = distributionManager.manifestEntry(manifestID: metadata.source.manifestId) else {
+            throw MSLRuntimeError("security_scan_exec_failed: manifest entry not found for \(target.instanceName)")
+        }
+        let request = try buildSecurityScanRequest(
+            target: target.instanceName,
+            policyRaw: policyRaw,
+            formatRaw: "json",
+            offline: offline,
+            updateVuls: updateVuls,
+            outputPath: outputPath,
+            gateMode: false
+        )
+        let (result, _, durationMs) = try securityScanOrchestrator.scanInstance(
+            request: request,
+            instanceName: target.instanceName,
+            manifestEntry: manifestEntry,
+            isRunning: try isInstanceRunningByName(target.instanceName)
+        )
+        let warningCount = result.policyResult.decision == "warn" ? 1 : 0
+        let errorCount = result.policyResult.decision == "block" ? 1 : 0
+        let vulnTotal =
+            result.vulnerabilityCounts.critical +
+            result.vulnerabilityCounts.high +
+            result.vulnerabilityCounts.medium +
+            result.vulnerabilityCounts.low +
+            result.vulnerabilityCounts.unknown
+        print("scan completed: target=\(target.instanceName), duration=\(durationMs) ms, errors=\(errorCount), warnings=\(warningCount)")
+        if vulnTotal == 0 {
+            print("No vulnerabilities were detected")
+        }
+        printImageScanFollowUpHelp(
+            instanceName: target.instanceName,
+            format: request.format,
+            outputPath: outputPath
+        )
+        Foundation.exit(result.policyResult.decision == "block" ? 2 : 0)
+    }
+
+    public func runImageScanResultCLI(instanceName: String? = nil) throws -> Never {
+        let target = try resolveRuntimeTarget(explicitInstanceName: instanceName)
+        let scanDir = scanResultsDirectory(instanceName: target.instanceName)
+        guard let latest = latestVulsResultFile(instanceName: target.instanceName) else {
+            throw MSLRuntimeError("scan result not found under \(scanDir.path). run `msl image scan \(target.instanceName)` first.")
+        }
+        let vulsCLIDir = paths.securityToolsDir.appendingPathComponent("vuls-cli", isDirectory: true)
+        let vulsBinary = vulsCLIDir.appendingPathComponent("vuls", isDirectory: false)
+        guard fileManager.isExecutableFile(atPath: vulsBinary.path) else {
+            throw MSLRuntimeError("security_report_cli_not_installed: run `make install-security-tools` first")
+        }
+        try fileManager.createDirectory(at: scanDir, withIntermediateDirectories: true)
+        let configPath = scanDir.appendingPathComponent("vuls-tui-config.toml", isDirectory: false)
+        let config = """
+[servers]
+  [servers.\(target.instanceName)]
+  host = "\(target.instanceName)"
+  port = "local"
+"""
+        try config.write(to: configPath, atomically: true, encoding: .utf8)
+
+        print("launching vuls tui...")
+        print("results: \(scanDir.path)")
+        print("latest: \(latest.path)")
+        print("config: \(configPath.path)")
+        print("press Ctrl+C to exit")
+
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/script")
+        proc.arguments = [
+            "-q",
+            "/dev/null",
+            vulsBinary.path,
+            "tui",
+            "-config=\(configPath.path)",
+            "-results-dir=\(scanDir.path)",
+            "-log-dir=\(scanDir.path)",
+        ]
+        proc.currentDirectoryURL = vulsCLIDir
+        proc.standardInput = FileHandle.standardInput
+        proc.standardOutput = FileHandle.standardOutput
+        proc.standardError = FileHandle.standardError
+        try proc.run()
+
+        let stdinFD = STDIN_FILENO
+        let originalPgrp = tcgetpgrp(stdinFD)
+        let childPgrp = pid_t(proc.processIdentifier)
+        if originalPgrp > 0 {
+            _ = tcsetpgrp(stdinFD, childPgrp)
+            _ = kill(childPgrp, SIGCONT)
+        }
+
+        proc.waitUntilExit()
+        if originalPgrp > 0 {
+            _ = tcsetpgrp(stdinFD, originalPgrp)
+        }
+        Foundation.exit(proc.terminationStatus)
+    }
+
+    public func runImageScanResultHTTP(instanceName: String? = nil, port: Int) throws -> Never {
+        let target = try resolveRuntimeTarget(explicitInstanceName: instanceName)
+        let scanDir = scanResultsDirectory(instanceName: target.instanceName)
+        guard latestVulsResultFile(instanceName: target.instanceName) != nil else {
+            throw MSLRuntimeError("scan result not found under \(scanDir.path). run `msl image scan \(target.instanceName)` first.")
+        }
+
+        let vulsrepoDir = paths.securityToolsDir.appendingPathComponent("vulsrepo", isDirectory: true)
+        let vulsrepoBinary = vulsrepoDir.appendingPathComponent("vulsrepo", isDirectory: false)
+        guard fileManager.isExecutableFile(atPath: vulsrepoBinary.path) else {
+            throw MSLRuntimeError("security_report_viewer_not_installed: run `make install-security-tools` first")
+        }
+
+        let tmpDir = paths.runtime.appendingPathComponent("vulsrepo-\(target.instanceName)-\(nowEpochMs())", isDirectory: true)
+        try fileManager.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: tmpDir) }
+
+        let config = """
+[Server]
+rootPath = "\(vulsrepoDir.path)"
+resultsPath = "\(scanDir.path)"
+serverPort = "\(port)"
+serverIP = "127.0.0.1"
+"""
+        let configPath = tmpDir.appendingPathComponent("vulsrepo-config.toml", isDirectory: false)
+        try config.write(to: configPath, atomically: true, encoding: .utf8)
+
+        let proc = Process()
+        proc.executableURL = vulsrepoBinary
+        proc.arguments = []
+        proc.currentDirectoryURL = tmpDir
+        proc.standardOutput = FileHandle.standardOutput
+        proc.standardError = FileHandle.standardError
+        try proc.run()
+
+        print("vulsrepo started: http://127.0.0.1:\(port)")
+        print("results: \(scanDir.path)")
+        _ = waitForLocalTCPPort(port: port, timeoutSec: 5.0)
+        _ = try? runHostShell("/usr/bin/open http://127.0.0.1:\(port)")
+        print("press Ctrl+C to stop vulsrepo")
+
+        installInterruptHandler()
+        while proc.isRunning {
+            if isInterrupted() {
+                proc.terminate()
+                break
+            }
+            Thread.sleep(forTimeInterval: 0.2)
+        }
+        proc.waitUntilExit()
+        Foundation.exit(0)
+    }
+
+    private func waitForLocalTCPPort(port: Int, timeoutSec: TimeInterval) -> Bool {
+        let deadline = Date().addingTimeInterval(timeoutSec)
+        while Date() < deadline {
+            var addr = sockaddr_in()
+            addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+            addr.sin_family = sa_family_t(AF_INET)
+            addr.sin_port = in_port_t(UInt16(port).bigEndian)
+            addr.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+
+            let fd = socket(AF_INET, SOCK_STREAM, 0)
+            if fd >= 0 {
+                let connected = withUnsafePointer(to: &addr) { ptr -> Bool in
+                    ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saPtr in
+                        connect(fd, saPtr, socklen_t(MemoryLayout<sockaddr_in>.size)) == 0
+                    }
+                }
+                _ = close(fd)
+                if connected {
+                    return true
+                }
+            }
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+        return false
+    }
+
+    public func runImageResize(instanceName: String? = nil, sizeBytes: Int64) throws {
+        let target = try resolveRuntimeTarget(explicitInstanceName: instanceName)
+        guard sizeBytes > 0 else {
+            throw MSLRuntimeError("size must be positive")
+        }
+        if try isInstanceRunningByName(target.instanceName) {
+            throw MSLRuntimeError("instance '\(target.instanceName)' is running. run `msl stop --instance \(target.instanceName)` first.")
+        }
+        let metadata = try distributionManager.readOrRebuildInstanceMetadata(at: target.metadataURL)
+        let diskURL = URL(fileURLWithPath: metadata.diskPath)
+        guard fileManager.fileExists(atPath: diskURL.path) else {
+            throw MSLRuntimeError("disk image not found: \(diskURL.path)")
+        }
+        guard let beforeBytes = logicalBytes(of: diskURL) else {
+            throw MSLRuntimeError("failed to read disk size: \(diskURL.path)")
+        }
+        let afterBytes = sizeBytes
+        guard afterBytes > beforeBytes else {
+            throw MSLRuntimeError("resize is grow-only. current=\(beforeBytes) target=\(afterBytes)")
+        }
+
+        let handle = try FileHandle(forWritingTo: diskURL)
+        defer { try? handle.close() }
+        try handle.truncate(atOffset: UInt64(afterBytes))
+
+        try distributionManager.updateImageMaintenanceStatus(metadataURL: target.metadataURL) { status in
+            status.lastRunAtEpochMs = nowEpochMs()
+            status.lastOperation = "manual_resize"
+            status.lastResult = "ok"
+            status.lastErrorCode = nil
+            status.lastErrorMessage = nil
+        }
+        print("resize completed: \(target.instanceName)")
+        print("before: \(beforeBytes) bytes (\(formatBytes(UInt64(beforeBytes))))")
+        print("after: \(afterBytes) bytes (\(formatBytes(UInt64(afterBytes))))")
+    }
+
+    public func runImageExport(
+        instanceName: String? = nil,
+        mode: String,
+        outputPath: String?,
+        force: Bool = false
+    ) throws {
+        let target = try resolveRuntimeTarget(explicitInstanceName: instanceName)
+        let resolvedOutputPath = (outputPath?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
+            ? outputPath!
+            : defaultImageExportOutputPath(mode: mode, instanceName: target.instanceName)
+        let outputURL = URL(
+            fileURLWithPath: resolvedOutputPath,
+            relativeTo: URL(fileURLWithPath: fileManager.currentDirectoryPath, isDirectory: true)
+        ).standardizedFileURL
+        if fileManager.fileExists(atPath: outputURL.path) {
+            if force {
+                try fileManager.removeItem(at: outputURL)
+            } else {
+                throw MSLRuntimeError("output already exists: \(outputURL.path) (use --force to overwrite)")
+            }
+        }
+        try fileManager.createDirectory(at: outputURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+
+        switch mode {
+        case "archive":
+            let instanceDir = paths.distroDirectory(named: target.instanceName)
+            let distrosRoot = paths.distrosDir
+            let command = "tar -C \(shellQuote(distrosRoot.path)) -cf - \(shellQuote(target.instanceName)) | zstd -q -T0 -o \(shellQuote(outputURL.path))"
+            let result = try runHostShell(command)
+            guard result.exitCode == 0 else {
+                throw MSLRuntimeError("archive export failed (\(result.exitCode)): \(result.stderr.isEmpty ? result.stdout : result.stderr)")
+            }
+            guard fileManager.fileExists(atPath: instanceDir.path) else {
+                throw MSLRuntimeError("instance directory not found: \(instanceDir.path)")
+            }
+            try distributionManager.updateImageMaintenanceStatus(metadataURL: target.metadataURL) { status in
+                status.lastRunAtEpochMs = nowEpochMs()
+                status.lastOperation = "manual_export_archive"
+                status.lastResult = "ok"
+                status.lastErrorCode = nil
+                status.lastErrorMessage = nil
+            }
+            print("export completed: mode=archive instance=\(target.instanceName)")
+            print("output: \(outputURL.path)")
+        case "rootfs":
+            let hostShareRoot = resolveWorkspaceHostShareRoot()
+            guard let guestOutputPath = mapHostPathToGuestVisible(outputURL.path, hostShareRoot: hostShareRoot) else {
+                throw MSLRuntimeError(
+                    "rootfs export output must be under host share root (\(hostShareRoot)): \(outputURL.path)"
+                )
+            }
+            try lock.withExclusiveLock {
+                try bootstrap.ensureBootstrapped(context: .runtime)
+            }
+            try daemonClient.ensureConnected(
+                expectedInstanceName: target.instanceName,
+                hostShareRoot: hostShareRoot,
+                callerCwd: currentCallerCwd()
+            )
+            defer { daemonClient.disconnect() }
+            let response = try daemonClient.send(RuntimeControlRequest(
+                op: "exec",
+                instance: target.instanceName,
+                argv: [
+                    "/bin/sh",
+                    "-lc",
+                    """
+                    set -eu
+                    out="$1"
+                    tmp="${out}.tmp.$$"
+                    tar --numeric-owner \
+                      --exclude=/proc --exclude=/sys --exclude=/dev --exclude=/run --exclude=/tmp \
+                      --exclude=/mnt/macos --exclude=/mnt/msl \
+                      -C / -cf "$tmp" .
+                    mv "$tmp" "$out"
+                    """,
+                    "msl-image-export-rootfs",
+                    guestOutputPath
+                ],
+                timeoutMs: 0,
+                runAsRoot: true
+            ))
+            guard response.ok, (response.exitCode ?? 0) == 0 else {
+                throw MSLRuntimeError(response.error ?? response.stderr ?? "rootfs export failed")
+            }
+            try distributionManager.updateImageMaintenanceStatus(metadataURL: target.metadataURL) { status in
+                status.lastRunAtEpochMs = nowEpochMs()
+                status.lastOperation = "manual_export_rootfs"
+                status.lastResult = "ok"
+                status.lastErrorCode = nil
+                status.lastErrorMessage = nil
+            }
+            print("export completed: mode=rootfs instance=\(target.instanceName)")
+            print("output: \(outputURL.path)")
+        default:
+            throw MSLRuntimeError("unsupported export mode: \(mode). supported: archive|rootfs")
+        }
+    }
+
     public func addPortMapping(_ raw: String, instanceName: String? = nil) throws {
         let target = try resolveRuntimeTarget(explicitInstanceName: instanceName)
         let mapping = try parsePortMapping(raw, instanceName: target.instanceName)
@@ -1690,6 +2241,279 @@ public final class RuntimeManager {
         }
     }
 
+    private func buildSecurityScanRequest(
+        target: String,
+        policyRaw: String?,
+        formatRaw: String,
+        offline: Bool,
+        updateVuls: Bool,
+        outputPath: String?,
+        gateMode: Bool
+    ) throws -> SecurityScanRequest {
+        let normalizedPolicy = (policyRaw ?? "warn").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let policyMode: SecurityPolicyMode
+        switch normalizedPolicy {
+        case "allow":
+            policyMode = .allow
+        case "warn":
+            policyMode = .warn
+        case "block":
+            policyMode = .block
+        default:
+            throw MSLRuntimeError("invalid --policy '\(normalizedPolicy)'. supported: allow|warn|block")
+        }
+
+        let normalizedFormat = formatRaw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let format: SecurityScanOutputFormat
+        switch normalizedFormat {
+        case "text":
+            format = .text
+        case "json":
+            format = .json
+        default:
+            throw MSLRuntimeError("invalid --format '\(normalizedFormat)'. supported: text|json")
+        }
+
+        return SecurityScanRequest(
+            target: target,
+            policy: SecurityPolicy(mode: policyMode),
+            format: format,
+            offline: offline,
+            updateVuls: updateVuls,
+            outputPath: outputPath,
+            gateMode: gateMode
+        )
+    }
+
+    private func printImageScanFollowUpHelp(
+        instanceName: String,
+        format: SecurityScanOutputFormat,
+        outputPath: String?
+    ) {
+        print("")
+        print("next:")
+        print("  cli summary: msl image scan result \(instanceName)")
+        print("  web viewer: msl image scan result \(instanceName) --http")
+
+        switch format {
+        case .json:
+            if let outputPath, !outputPath.isEmpty {
+                print("  json (requested output): \(outputPath)")
+            }
+            if let latest = latestVulsResultFile(instanceName: instanceName) {
+                print("  vuls json (latest for this VM): \(latest.path)")
+            }
+        case .text:
+            print("  json output: msl image scan \(instanceName)")
+        }
+    }
+
+    private func scanResultsDirectory(instanceName: String) -> URL {
+        paths
+            .distroDirectory(named: instanceName)
+            .appendingPathComponent("security", isDirectory: true)
+            .appendingPathComponent("scans", isDirectory: true)
+    }
+
+    private func scanStateDirectory(instanceName: String) -> URL {
+        paths
+            .distroDirectory(named: instanceName)
+            .appendingPathComponent("security", isDirectory: true)
+            .appendingPathComponent("state", isDirectory: true)
+    }
+
+    private func latestVulsResultFile(instanceName: String) -> URL? {
+        let scanDir = scanResultsDirectory(instanceName: instanceName)
+        guard let entries = try? fileManager.contentsOfDirectory(
+            at: scanDir,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return nil
+        }
+
+        let candidateDirs = entries.filter { url in
+            (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true &&
+                isVulsTimestampDirectoryName(url.lastPathComponent)
+        }.sorted { $0.lastPathComponent > $1.lastPathComponent }
+
+        for dir in candidateDirs {
+            guard let files = try? fileManager.contentsOfDirectory(
+                at: dir,
+                includingPropertiesForKeys: [.isRegularFileKey],
+                options: [.skipsHiddenFiles]
+            ) else {
+                continue
+            }
+            let json = files
+                .filter { $0.pathExtension.lowercased() == "json" && !$0.lastPathComponent.hasSuffix("_diff.json") }
+                .sorted { $0.lastPathComponent < $1.lastPathComponent }
+            if let first = json.first {
+                return first
+            }
+        }
+        return nil
+    }
+
+    private func isVulsTimestampDirectoryName(_ name: String) -> Bool {
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime]
+        if iso.date(from: name) != nil {
+            return true
+        }
+        let legacy = DateFormatter()
+        legacy.locale = Locale(identifier: "en_US_POSIX")
+        legacy.timeZone = TimeZone(secondsFromGMT: 0)
+        legacy.dateFormat = "yyyy-MM-dd'T'HH-mm-ssZ"
+        return legacy.date(from: name) != nil
+    }
+
+    private struct WeeklySecurityScanState: Codable {
+        var schemaVersion: Int
+        var lastAttemptAtEpochMs: Int64?
+        var lastSuccessAtEpochMs: Int64?
+        var nextRunAtEpochMs: Int64?
+    }
+
+    private func maybeStartWeeklySecurityScan(instanceName: String, metadataURL: URL) {
+        let config = try? defaultInstanceStore.loadConfig()
+        let enabled = config?.security?.weeklyScanOnStart ?? true
+        guard enabled else {
+            return
+        }
+
+        let nowMs = nowEpochMs()
+        let stateURL = scanStateDirectory(instanceName: instanceName).appendingPathComponent("weekly-startup-scan.json", isDirectory: false)
+        let existingState = try? readWeeklySecurityScanState(url: stateURL)
+        if let state = existingState,
+           let nextRunAt = state.nextRunAtEpochMs,
+           nowMs < nextRunAt {
+            return
+        }
+        let previousRunText = formatWeeklyScanDate(state: existingState)
+        fputs("security: weekly check started (instance=\(instanceName), previous=\(previousRunText))\n", stderr)
+
+        let policy = config?.security?.weeklyScanPolicy ?? "warn"
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            do {
+                try self.fileManager.createDirectory(at: self.scanStateDirectory(instanceName: instanceName), withIntermediateDirectories: true)
+                try self.writeWeeklySecurityScanState(
+                    .init(
+                        schemaVersion: 1,
+                        lastAttemptAtEpochMs: nowMs,
+                        lastSuccessAtEpochMs: nil,
+                        nextRunAtEpochMs: nowMs + 7 * 24 * 60 * 60 * 1000
+                    ),
+                    url: stateURL
+                )
+            } catch {
+                self.logger.log("security_weekly_scan_state_write_failed", fields: [
+                    "instance": instanceName,
+                    "error": String(describing: error),
+                ])
+            }
+
+            do {
+                let metadata = try self.distributionManager.readOrRebuildInstanceMetadata(at: metadataURL)
+                guard let manifestEntry = self.distributionManager.manifestEntry(manifestID: metadata.source.manifestId) else {
+                    self.logger.log("security_weekly_scan_skipped", fields: [
+                        "instance": instanceName,
+                        "reason": "manifest_not_found",
+                    ])
+                    return
+                }
+                let reportPath = self.paths
+                    .distroDirectory(named: instanceName)
+                    .appendingPathComponent("security", isDirectory: true)
+                    .appendingPathComponent("scans", isDirectory: true)
+                    .appendingPathComponent("weekly-startup-\(nowMs).json", isDirectory: false)
+                    .path
+                let request = try self.buildSecurityScanRequest(
+                    target: "startup-weekly:\(instanceName)",
+                    policyRaw: policy,
+                    formatRaw: "json",
+                    offline: false,
+                    updateVuls: false,
+                    outputPath: reportPath,
+                    gateMode: false
+                )
+                var reportedDownload = false
+                let weeklyOrchestrator = SecurityScanOrchestrator(
+                    paths: self.paths,
+                    fileManager: self.fileManager,
+                    logger: self.logger,
+                    progress: { message in
+                        guard message.hasPrefix("security: downloading ") else {
+                            return
+                        }
+                        if !reportedDownload {
+                            fputs("security: downloading security updates\n", stderr)
+                            reportedDownload = true
+                        }
+                    }
+                )
+                let (result, _, durationMs) = try weeklyOrchestrator.scanManifestTarget(
+                    request: request,
+                    manifestEntry: manifestEntry
+                )
+                let warningCount = result.policyResult.decision == "warn" ? 1 : 0
+                let errorCount = result.policyResult.decision == "block" ? 1 : 0
+                try self.writeWeeklySecurityScanState(
+                    .init(
+                        schemaVersion: 1,
+                        lastAttemptAtEpochMs: nowMs,
+                        lastSuccessAtEpochMs: nowMs,
+                        nextRunAtEpochMs: nowMs + 7 * 24 * 60 * 60 * 1000
+                    ),
+                    url: stateURL
+                )
+                self.logger.log("security_weekly_scan_completed", fields: [
+                    "instance": instanceName,
+                    "policy": policy,
+                    "report_path": reportPath,
+                ])
+                if errorCount == 0 && warningCount == 0 {
+                    fputs("security: weekly check result (duration=\(durationMs) ms, no errors)\n", stderr)
+                } else {
+                    fputs("security: weekly check result (duration=\(durationMs) ms, errors=\(errorCount), warnings=\(warningCount))\n", stderr)
+                    fputs("security: review with `msl image scan result --cli \(instanceName)`\n", stderr)
+                }
+            } catch {
+                self.logger.log("security_weekly_scan_failed", fields: [
+                    "instance": instanceName,
+                    "policy": policy,
+                    "error": String(describing: error),
+                ])
+                fputs("security: weekly check failed (\(error))\n", stderr)
+                fputs("security: review with `msl image scan result --cli \(instanceName)`\n", stderr)
+            }
+        }
+    }
+
+    private func formatWeeklyScanDate(state: WeeklySecurityScanState?) -> String {
+        let epochMs = state?.lastSuccessAtEpochMs ?? state?.lastAttemptAtEpochMs
+        guard let epochMs else {
+            return "n/a"
+        }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone.current
+        formatter.dateFormat = "yyyy/MM/dd"
+        return formatter.string(from: Date(timeIntervalSince1970: TimeInterval(epochMs) / 1000))
+    }
+
+    private func readWeeklySecurityScanState(url: URL) throws -> WeeklySecurityScanState {
+        let data = try Data(contentsOf: url)
+        return try JSONDecoder().decode(WeeklySecurityScanState.self, from: data)
+    }
+
+    private func writeWeeklySecurityScanState(_ state: WeeklySecurityScanState, url: URL) throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try encoder.encode(state).write(to: url, options: .atomic)
+    }
+
     private func resolveRuntimeTarget(explicitInstanceName: String?) throws -> (instanceName: String, metadataURL: URL) {
         let configured = try defaultInstanceStore.loadDefaultInstanceName()
         let metadataURL = try distributionManager.runtimeMetadataURL(
@@ -1710,9 +2534,380 @@ public final class RuntimeManager {
         return raw == "1" || raw == "true" || raw == "yes"
     }
 
+    private func isInstanceRunningByName(_ instanceName: String) throws -> Bool {
+        try lock.withExclusiveLock {
+            try bootstrap.ensureBootstrapped(context: .runtime)
+            let state = try store.loadState()
+            return isInstanceRunning(state, instanceName: instanceName)
+        }
+    }
+
+    private func runtimeInstanceStateByName(_ instanceName: String) throws -> RuntimeInstanceState? {
+        try lock.withExclusiveLock {
+            try bootstrap.ensureBootstrapped(context: .runtime)
+            let state = try store.loadState()
+            if let matched = state.instances?.first(where: { $0.instance == instanceName }) {
+                return matched
+            }
+            if state.distro == instanceName {
+                return RuntimeInstanceState(
+                    instance: state.distro,
+                    vmState: state.vmState,
+                    activeSessionCount: state.activeSessionCount,
+                    idleTimer: state.idleTimer,
+                    runtimeUser: state.runtimeUser,
+                    initChannel: state.initChannel,
+                    runtimeHostPid: state.runtimeHostPid,
+                    runtimeControlSocket: state.runtimeControlSocket,
+                    lastError: nil,
+                    lastTransitionEpochMs: state.lastTransitionEpochMs
+                )
+            }
+            return nil
+        }
+    }
+
+    private func shouldAutoStopBeforeImageScan(instanceName: String) throws -> Bool {
+        guard let instance = try runtimeInstanceStateByName(instanceName) else {
+            return false
+        }
+        guard instance.vmState == .running else {
+            return false
+        }
+        // Only auto-stop when no interactive session is attached.
+        // If sessions are active, scan should keep the existing explicit failure behavior.
+        return instance.activeSessionCount == 0
+    }
+
+    private func mapHostPathToGuestVisible(_ hostPath: String, hostShareRoot: String) -> String? {
+        guard hostPath.hasPrefix("/") else {
+            return nil
+        }
+        let normalizedRoot = hostShareRoot.hasSuffix("/") && hostShareRoot.count > 1
+            ? String(hostShareRoot.dropLast())
+            : hostShareRoot
+        if normalizedRoot == "/" {
+            return "/mnt/macos" + hostPath
+        }
+        if hostPath == normalizedRoot {
+            return "/mnt/macos"
+        }
+        if hostPath.hasPrefix(normalizedRoot + "/") {
+            let suffix = String(hostPath.dropFirst(normalizedRoot.count))
+            return "/mnt/macos" + suffix
+        }
+        return nil
+    }
+
+    private func guestVisibleHostPathCandidates(_ hostPath: String, hostShareRoot: String) -> [String] {
+        guard hostPath.hasPrefix("/") else {
+            return []
+        }
+        var candidates: [String] = []
+        if let mapped = mapHostPathToGuestVisible(hostPath, hostShareRoot: hostShareRoot) {
+            candidates.append(mapped)
+        }
+        if hostShareRoot != "/" {
+            if !candidates.contains(hostPath) {
+                candidates.append(hostPath)
+            }
+        }
+        return candidates
+    }
+
+    private func isInitSourceMissing(response: RuntimeControlResponse) -> Bool {
+        if response.exitCode == 20 {
+            return true
+        }
+        if let error = response.error?.lowercased(), error.contains("source_missing") {
+            return true
+        }
+        if let stderr = response.stderr?.lowercased(), stderr.contains("source_missing") {
+            return true
+        }
+        return false
+    }
+
+    private func defaultImageExportOutputPath(mode: String, instanceName: String) -> String {
+        let fileName: String
+        switch mode {
+        case "archive":
+            fileName = "\(instanceName).zstd"
+        case "rootfs":
+            fileName = "\(instanceName).rootfs.tar.xz"
+        default:
+            fileName = "\(instanceName).img"
+        }
+        return URL(fileURLWithPath: fileManager.currentDirectoryPath, isDirectory: true)
+            .appendingPathComponent(fileName, isDirectory: false)
+            .path
+    }
+
+    private func readGuestInitVersionViaDaemon(instanceName: String) throws -> String? {
+        let response = try daemonClient.send(RuntimeControlRequest(
+            op: "exec",
+            instance: instanceName,
+            argv: [
+                "/bin/sh",
+                "-lc",
+                """
+                if [ -x /usr/local/bin/msl-init ]; then
+                  /usr/local/bin/msl-init version 2>/dev/null || /usr/local/bin/msl-init --version 2>/dev/null || sha256sum /usr/local/bin/msl-init 2>/dev/null | awk '{print $1}'
+                fi
+                """
+            ],
+            timeoutMs: 2_000
+        ))
+        guard response.ok, (response.exitCode ?? 1) == 0 else {
+            return nil
+        }
+        let value = response.stdout?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return value.isEmpty ? nil : value
+    }
+
+    private func logicalBytes(of fileURL: URL) -> Int64? {
+        do {
+            let attrs = try fileManager.attributesOfItem(atPath: fileURL.path)
+            if let value = attrs[.size] as? NSNumber {
+                return value.int64Value
+            }
+            return nil
+        } catch {
+            return nil
+        }
+    }
+
+    private func allocatedBytes(of fileURL: URL) -> Int64? {
+        let values = try? fileURL.resourceValues(forKeys: [.totalFileAllocatedSizeKey, .fileAllocatedSizeKey])
+        if let total = values?.totalFileAllocatedSize {
+            return Int64(total)
+        }
+        if let allocated = values?.fileAllocatedSize {
+            return Int64(allocated)
+        }
+        return nil
+    }
+
+    private func shellQuote(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\"'\"'") + "'"
+    }
+
+    private func runHostShell(_ command: String) throws -> ProcessResult {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = ["-lc", command]
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
+        try process.run()
+        process.waitUntilExit()
+        let stdout = String(data: stdoutPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        let stderr = String(data: stderrPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        return ProcessResult(exitCode: process.terminationStatus, stdout: stdout, stderr: stderr)
+    }
+
     private func formatBytes(_ bytes: UInt64) -> String {
         let gib = Double(bytes) / Double(1024 * 1024 * 1024)
         return String(format: "%.2f GiB", gib)
+    }
+
+    private struct GuestStorageInspectStats {
+        var beforeCompressionBytes: Int64?
+        var afterCompressionBytes: Int64?
+        var compressionRatioPercent: Double?
+    }
+
+    private struct ExternalizedCacheUsage {
+        var label: String
+        var hostPath: String
+        var bytes: Int64
+    }
+
+    private func collectGuestStorageInspectStatsIfRunning(instanceName: String) throws -> GuestStorageInspectStats? {
+        if try !isInstanceRunningByName(instanceName) {
+            return nil
+        }
+        let hostShareRoot = resolveWorkspaceHostShareRoot()
+        try daemonClient.ensureConnected(
+            expectedInstanceName: instanceName,
+            hostShareRoot: hostShareRoot,
+            callerCwd: currentCallerCwd()
+        )
+        defer {
+            daemonClient.disconnect()
+        }
+        let response = try daemonClient.send(RuntimeControlRequest(
+            op: "exec",
+            instance: instanceName,
+            argv: [
+                "/bin/sh",
+                "-lc",
+                """
+                set -eu
+                if command -v du >/dev/null 2>&1; then
+                  apparent_kib="$(du -sx --apparent-size / 2>/dev/null | awk '{print $1}' || true)"
+                  actual_kib="$(du -sx / 2>/dev/null | awk '{print $1}' || true)"
+                  case "$apparent_kib" in ''|*[!0-9]*) apparent_kib='' ;; esac
+                  case "$actual_kib" in ''|*[!0-9]*) actual_kib='' ;; esac
+                  if [ -n "$apparent_kib" ]; then
+                    echo "du_apparent_bytes=$((apparent_kib * 1024))"
+                  fi
+                  if [ -n "$actual_kib" ]; then
+                    echo "du_actual_bytes=$((actual_kib * 1024))"
+                  fi
+                fi
+                """
+            ],
+            timeoutMs: 120_000
+        ))
+        guard response.ok, (response.exitCode ?? 1) == 0 else {
+            return nil
+        }
+        let parsed = parseKeyValueLines(response.stdout ?? "")
+        let beforeCompressionBytes = parsed["du_apparent_bytes"]
+        let afterCompressionBytes = parsed["du_actual_bytes"]
+        let ratio: Double?
+        if let beforeCompressionBytes, let afterCompressionBytes, beforeCompressionBytes > 0 {
+            ratio = (1.0 - (Double(afterCompressionBytes) / Double(beforeCompressionBytes))) * 100.0
+        } else {
+            ratio = nil
+        }
+        return GuestStorageInspectStats(
+            beforeCompressionBytes: beforeCompressionBytes,
+            afterCompressionBytes: afterCompressionBytes,
+            compressionRatioPercent: ratio
+        )
+    }
+
+    private func parseKeyValueLines(_ text: String) -> [String: Int64] {
+        var result: [String: Int64] = [:]
+        for line in text.split(separator: "\n") {
+            let parts = line.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+            guard parts.count == 2 else { continue }
+            let key = String(parts[0]).trimmingCharacters(in: .whitespacesAndNewlines)
+            let valueText = String(parts[1]).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !key.isEmpty, let value = Int64(valueText) else { continue }
+            result[key] = value
+        }
+        return result
+    }
+
+    private func collectExternalizedCacheUsages(metadata: DistributionInstanceMetadata) -> [ExternalizedCacheUsage] {
+        let policyConfig = metadata.cacheSharing ?? CacheSharingPolicyResolver.defaultConfigForDistroFamily(
+            metadata.distroFamily
+                ?? metadata.source.distro
+                ?? DistributionManager.inferDistroFamilyStatic(from: metadata.source.manifestId)
+        )
+        let policy = CacheSharingPolicyResolver.resolve(config: policyConfig)
+        guard policy.enabled else {
+            return []
+        }
+
+        let hostHome = ProcessInfo.processInfo.environment["HOME"] ?? fileManager.homeDirectoryForCurrentUser.path
+        let hostCacheRoot = CacheSharingPolicyResolver.hostCacheRootPath(hostHome: hostHome)
+        var candidates: [(String, String)] = []
+        if policy.apt { candidates.append(("apt", hostCacheRoot + "/apt")) }
+        if policy.apk { candidates.append(("apk", hostCacheRoot + "/apk")) }
+        if policy.zypper { candidates.append(("zypper", hostCacheRoot + "/zypper")) }
+        if policy.dnf { candidates.append(("dnf", hostCacheRoot + "/dnf")) }
+        if policy.go { candidates.append(("go", hostCacheRoot + "/go")) }
+        if policy.python { candidates.append(("python", hostCacheRoot + "/python")) }
+        if policy.npm { candidates.append(("npm", hostCacheRoot + "/node/npm")) }
+        if policy.pnpm { candidates.append(("pnpm", hostCacheRoot + "/node/pnpm-store")) }
+        if policy.yarn { candidates.append(("yarn", hostCacheRoot + "/node/yarn")) }
+        if policy.maven { candidates.append(("maven", hostCacheRoot + "/java/maven-repo")) }
+        if policy.gradle { candidates.append(("gradle", hostCacheRoot + "/java/gradle")) }
+        if policy.composer { candidates.append(("composer", hostCacheRoot + "/php/composer")) }
+        if policy.scala { candidates.append(("scala", hostCacheRoot + "/scala")) }
+        if policy.ruby { candidates.append(("ruby", hostCacheRoot + "/ruby")) }
+        if policy.rust { candidates.append(("rust", hostCacheRoot + "/rust")) }
+        if policy.deno { candidates.append(("deno", hostCacheRoot + "/deno")) }
+        if policy.bun { candidates.append(("bun", hostCacheRoot + "/bun")) }
+        if policy.nuget { candidates.append(("nuget", hostCacheRoot + "/dotnet")) }
+
+        return candidates.map { label, path in
+            let bytes = hostDirectoryUsageBytes(path: path) ?? 0
+            return ExternalizedCacheUsage(label: label, hostPath: path, bytes: bytes)
+        }
+    }
+
+    private func hostDirectoryUsageBytes(path: String) -> Int64? {
+        let quoted = shellQuote(path)
+        let result = try? runHostShell("du -sk \(quoted) 2>/dev/null | awk '{print $1}'")
+        guard let result, result.exitCode == 0 else {
+            return nil
+        }
+        let raw = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let kib = Int64(raw), kib >= 0 else {
+            return nil
+        }
+        return kib * 1024
+    }
+
+    private func formatMegaBytesTenths(_ bytes: Int64) -> String {
+        let mb = Double(max(0, bytes)) / Double(1024 * 1024)
+        let formatter = NumberFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.numberStyle = .decimal
+        formatter.usesGroupingSeparator = true
+        formatter.minimumFractionDigits = 1
+        formatter.maximumFractionDigits = 1
+        return formatter.string(from: NSNumber(value: mb)) ?? String(format: "%.1f", mb)
+    }
+
+    private func printIndentedMegaBytesLine(label: String, bytes: Int64?) {
+        let labelWidth = 24
+        let valueWidth = 10
+        let paddedLabel = label.padding(toLength: labelWidth, withPad: " ", startingAt: 0)
+        guard let bytes else {
+            let paddedValue = "N/A".leftPadding(toLength: valueWidth)
+            print("  \(paddedLabel)\(paddedValue) MB")
+            return
+        }
+        let value = formatMegaBytesTenths(bytes)
+        let paddedValue = value.leftPadding(toLength: valueWidth)
+        print("  \(paddedLabel)\(paddedValue) MB")
+    }
+
+    private func printIndentedCompressedLine(label: String, bytes: Int64?, savingPercent: Double?) {
+        let labelWidth = 24
+        let valueWidth = 10
+        let paddedLabel = label.padding(toLength: labelWidth, withPad: " ", startingAt: 0)
+        guard let bytes else {
+            let paddedValue = "N/A".leftPadding(toLength: valueWidth)
+            print("  \(paddedLabel)\(paddedValue) MB")
+            return
+        }
+        let size = formatMegaBytesTenths(bytes).leftPadding(toLength: valueWidth)
+        if let savingPercent {
+            let percent = String(format: "-%.1f%%", savingPercent)
+            print("  \(paddedLabel)\(size) MB (\(percent))")
+        } else {
+            print("  \(paddedLabel)\(size) MB")
+        }
+    }
+
+    private func formatDefragTimestamp(_ maintenance: DistributionInstanceMetadata.ImageMaintenanceStatus?) -> String {
+        guard let maintenance else { return "never" }
+        if maintenance.lastOperation == "manual_defrag" || maintenance.lastOperation == "startup_auto_trim" {
+            return formatEpochMs(maintenance.lastRunAtEpochMs)
+        }
+        if let compactAt = maintenance.lastCompactAtEpochMs {
+            return formatEpochMs(compactAt)
+        }
+        return "never"
+    }
+
+    private func tildePath(_ path: String) -> String {
+        let homePath = fileManager.homeDirectoryForCurrentUser.path
+        if path == homePath {
+            return "~"
+        }
+        if path.hasPrefix(homePath + "/") {
+            return "~" + String(path.dropFirst(homePath.count))
+        }
+        return path
     }
 
     private func formatEpochMs(_ value: Int64?) -> String {
@@ -1722,7 +2917,16 @@ public final class RuntimeManager {
         let date = Date(timeIntervalSince1970: TimeInterval(value) / 1000.0)
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime]
-        return "\(formatter.string(from: date)) (\(value))"
+        return formatter.string(from: date)
+    }
+}
+
+private extension String {
+    func leftPadding(toLength: Int, withPad pad: Character = " ") -> String {
+        if count >= toLength {
+            return self
+        }
+        return String(repeating: String(pad), count: toLength - count) + self
     }
 }
 

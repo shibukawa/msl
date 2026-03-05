@@ -8,6 +8,11 @@ public final class DaemonServer {
         var runtimeUser: RuntimeUserState
         var adminGroup: String
     }
+    private struct GuestStorageSnapshot {
+        var totalContentBytes: Int64?
+        var compressedBytes: Int64?
+        var compressionSavingPercent: Double?
+    }
 
     private let paths: MSLPaths
     private let lock: FileLock
@@ -67,6 +72,57 @@ public final class DaemonServer {
     private var effectivePortMappingsSnapshot: EffectivePortMappings = .empty
     private var autoPortErrorsByHostPort: [Int: String] = [:]
     private var cacheShareEnvAdditions: [String: String] = [:]
+    private let autoImageCompactThresholdBytes: Int64
+    private let autoImageCompactThresholdPercent: Double
+    private let autoImageCompactCooldownMs: Int64
+    private static let readInitVersionScript = """
+    if [ -x /usr/local/bin/msl-init ]; then
+      /usr/local/bin/msl-init version 2>/dev/null || /usr/local/bin/msl-init --version 2>/dev/null || sha256sum /usr/local/bin/msl-init 2>/dev/null | awk '{print $1}'
+    fi
+    """
+    private static let autoRefreshInitScript = """
+    set -eu
+    src="$1"
+    dst="/usr/local/bin/msl-init"
+    tmp="/usr/local/bin/.msl-init.tmp.$$"
+    if [ ! -f "$src" ]; then
+      echo "source_missing" >&2
+      exit 20
+    fi
+    mkdir -p /usr/local/bin
+    if [ -f "$dst" ] && cmp -s "$src" "$dst"; then
+      printf "skipped"
+      exit 0
+    fi
+    cp "$src" "$tmp"
+    chmod 0755 "$tmp"
+    mv "$tmp" "$dst"
+    ln -sf /usr/local/bin/msl-init /usr/local/bin/msl
+    printf "updated"
+    """
+    private static let autoTrimScript = """
+    set -eu
+    if ! command -v fstrim >/dev/null 2>&1; then
+      echo "fstrim_missing" >&2
+      exit 127
+    fi
+    fstrim -av >/dev/null 2>&1 || fstrim -a >/dev/null 2>&1
+    """
+    private static let inspectSnapshotScript = """
+    set -eu
+    if command -v du >/dev/null 2>&1; then
+      apparent_kib="$(du -sx --apparent-size / 2>/dev/null | awk '{print $1}' || true)"
+      actual_kib="$(du -sx / 2>/dev/null | awk '{print $1}' || true)"
+      case "$apparent_kib" in ''|*[!0-9]*) apparent_kib='' ;; esac
+      case "$actual_kib" in ''|*[!0-9]*) actual_kib='' ;; esac
+      if [ -n "$apparent_kib" ]; then
+        echo "du_apparent_bytes=$((apparent_kib * 1024))"
+      fi
+      if [ -n "$actual_kib" ]; then
+        echo "du_actual_bytes=$((actual_kib * 1024))"
+      fi
+    fi
+    """
     private static let legacyHostSharePrepareScript = """
     set -eu
     share_root="$1"
@@ -359,6 +415,18 @@ public final class DaemonServer {
         self.logRouter = RuntimeLogRouter(paths: paths, fileManager: fileManager)
         self.executablePath = executablePath
         self.explicitInstanceName = explicitInstanceName?.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.autoImageCompactThresholdBytes = DaemonServer.readInt64Env(
+            "MSL_IMAGE_AUTO_COMPACT_THRESHOLD_BYTES",
+            defaultValue: 512 * 1024 * 1024
+        )
+        self.autoImageCompactThresholdPercent = DaemonServer.readDoubleEnv(
+            "MSL_IMAGE_AUTO_COMPACT_THRESHOLD_PERCENT",
+            defaultValue: 0.10
+        )
+        self.autoImageCompactCooldownMs = DaemonServer.readInt64Env(
+            "MSL_IMAGE_AUTO_COMPACT_COOLDOWN_MS",
+            defaultValue: 6 * 60 * 60 * 1_000
+        )
     }
 
     /// Main daemon entry point. Blocks until idle timeout or explicit stop.
@@ -459,6 +527,11 @@ public final class DaemonServer {
         instanceContext.initClient = client
 
         prepareHostShareRootMountOnStartup(client: client)
+        maybeAutoRefreshGuestInit(
+            client: client,
+            metadataURL: metadataURL,
+            instanceName: instanceName
+        )
         syncGuestClockAtStartup(client: client, instanceName: instanceName)
         logger.log("startup_total_duration_ms", fields: [
             "elapsed_ms": String(max(0, daemonMonotonicMs() - startupStartMs)),
@@ -944,6 +1017,11 @@ public final class DaemonServer {
             }
             context.initClient = resolvedClient
             prepareHostShareRootMountOnStartup(client: resolvedClient)
+            maybeAutoRefreshGuestInit(
+                client: resolvedClient,
+                metadataURL: metadataURL,
+                instanceName: instanceName
+            )
             syncGuestClockAtStartup(client: resolvedClient, instanceName: instanceName)
             let resolved = try convergeRuntimeUser(
                 client: resolvedClient,
@@ -1546,12 +1624,412 @@ public final class DaemonServer {
     }
 
     private func resolveConfiguredHostShareRoot() -> String {
-        let raw = ProcessInfo.processInfo.environment["MSL_HOST_SHARE_ROOT"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let raw, !raw.isEmpty, raw.hasPrefix("/") else {
-            return "/"
+        let config = try? defaultInstanceStore.loadConfig()
+        return WorkspaceHostSharePolicy.resolveRoot(
+            config: config,
+            environment: ProcessInfo.processInfo.environment,
+            fileManager: .default
+        )
+    }
+
+    private func maybeAutoRefreshGuestInit(
+        client: InitChannelClient,
+        metadataURL: URL,
+        instanceName: String
+    ) {
+        let hostInitPath = paths.mslHostInitBinaryFile.path
+        guard FileManager.default.fileExists(atPath: hostInitPath) else {
+            logger.log("image_auto_refresh_skipped", fields: [
+                "instance": instanceName,
+                "reason": "host_init_missing",
+                "host_path": hostInitPath
+            ])
+            return
         }
-        return raw
+
+        let hostShareRoot = resolveConfiguredHostShareRoot()
+        let guestSourcePaths = guestVisibleHostPathCandidates(hostPath: hostInitPath, hostShareRoot: hostShareRoot)
+        guard !guestSourcePaths.isEmpty else {
+            logger.log("image_auto_refresh_skipped", fields: [
+                "instance": instanceName,
+                "reason": "host_path_outside_share_root",
+                "host_path": hostInitPath,
+                "host_share_root": hostShareRoot
+            ])
+            return
+        }
+
+        let versionBefore = readGuestInitVersion(client: client)
+        do {
+            var response: InitChannelResponse?
+            for guestSourcePath in guestSourcePaths {
+                var candidate = try client.send(InitChannelRequest(
+                    op: "init_refresh",
+                    timeoutMs: 8_000,
+                    initSourcePath: guestSourcePath,
+                    initDryRun: false
+                ))
+                if candidate.error?.code == .unsupportedOp {
+                    candidate = try client.send(InitChannelRequest(
+                        op: "exec",
+                        argv: [
+                            "/bin/sh",
+                            "-lc",
+                            Self.autoRefreshInitScript,
+                            "msl-auto-refresh",
+                            guestSourcePath
+                        ],
+                        runAsRoot: true,
+                        timeoutMs: 8_000
+                    ))
+                }
+                response = candidate
+                if candidate.ok, (candidate.exitCode ?? 0) == 0 {
+                    break
+                }
+                if !isInitSourceMissing(candidate) {
+                    break
+                }
+            }
+            let finalResponse = response ?? InitChannelResponse(
+                requestId: UUID().uuidString,
+                op: "init_refresh",
+                status: "error",
+                error: InitChannelErrorPayload(code: .internalError, message: "refresh request failed")
+            )
+            let exitCode = finalResponse.exitCode ?? 0
+            let status = finalResponse.meta?["status"] ??
+                finalResponse.stdout?
+                    .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+                    .lowercased() ?? ""
+            let operationResult = (finalResponse.ok && exitCode == 0) ? (status.isEmpty ? "ok" : status) : "failed"
+            let versionAfter = readGuestInitVersion(client: client)
+
+            logger.log(
+                finalResponse.ok && exitCode == 0 ? "image_auto_refresh_succeeded" : "image_auto_refresh_failed",
+                fields: [
+                    "instance": instanceName,
+                    "result": operationResult,
+                    "exit_code": String(exitCode),
+                    "version_before": versionBefore ?? "",
+                    "version_after": versionAfter ?? "",
+                    "error": finalResponse.error?.message ?? finalResponse.stderr ?? ""
+                ]
+            )
+
+            persistImageMaintenanceStatus(metadataURL: metadataURL) { status in
+                status.lastRunAtEpochMs = nowEpochMs()
+                status.lastOperation = "startup_auto_refresh"
+                status.lastResult = operationResult
+                status.lastErrorCode = finalResponse.ok && exitCode == 0 ? nil : (finalResponse.error?.code.rawValue ?? "exec_failed")
+                status.lastErrorMessage = finalResponse.ok && exitCode == 0 ? nil : (finalResponse.error?.message ?? finalResponse.stderr ?? "refresh failed")
+                status.lastRefreshVersionBefore = versionBefore
+                status.lastRefreshVersionAfter = versionAfter
+            }
+        } catch {
+            logger.log("image_auto_refresh_failed", fields: [
+                "instance": instanceName,
+                "error": String(describing: error)
+            ])
+            persistImageMaintenanceStatus(metadataURL: metadataURL) { status in
+                status.lastRunAtEpochMs = nowEpochMs()
+                status.lastOperation = "startup_auto_refresh"
+                status.lastResult = "failed"
+                status.lastErrorCode = "exec_error"
+                status.lastErrorMessage = String(describing: error)
+                status.lastRefreshVersionBefore = versionBefore
+            }
+        }
+    }
+
+    private func runAutoTrimBeforeStop(
+        client: InitChannelClient?,
+        metadataURL: URL?,
+        instanceName: String
+    ) {
+        guard let client else {
+            return
+        }
+        do {
+            let response = try client.send(InitChannelRequest(
+                op: "exec",
+                argv: ["/bin/sh", "-lc", Self.autoTrimScript],
+                runAsRoot: true,
+                timeoutMs: 8_000
+            ))
+            let exitCode = response.exitCode ?? 0
+            let result = (response.ok && exitCode == 0) ? "ok" : "failed"
+            logger.log(
+                result == "ok" ? "image_auto_trim_succeeded" : "image_auto_trim_failed",
+                fields: [
+                    "instance": instanceName,
+                    "exit_code": String(exitCode),
+                    "error": response.error?.message ?? response.stderr ?? ""
+                ]
+            )
+            guard let metadataURL else { return }
+            persistImageMaintenanceStatus(metadataURL: metadataURL) { status in
+                status.lastRunAtEpochMs = nowEpochMs()
+                status.lastOperation = "stop_auto_trim"
+                status.lastResult = result
+                status.lastErrorCode = result == "ok" ? nil : (response.error?.code.rawValue ?? "trim_failed")
+                status.lastErrorMessage = result == "ok" ? nil : (response.error?.message ?? response.stderr ?? "trim failed")
+            }
+        } catch {
+            logger.log("image_auto_trim_failed", fields: [
+                "instance": instanceName,
+                "error": String(describing: error)
+            ])
+            guard let metadataURL else { return }
+            persistImageMaintenanceStatus(metadataURL: metadataURL) { status in
+                status.lastRunAtEpochMs = nowEpochMs()
+                status.lastOperation = "stop_auto_trim"
+                status.lastResult = "failed"
+                status.lastErrorCode = "exec_error"
+                status.lastErrorMessage = String(describing: error)
+            }
+        }
+    }
+
+    private func maybeAutoCompactImageAfterStop(
+        metadataURL: URL?,
+        instanceName: String
+    ) {
+        guard let metadataURL else { return }
+        do {
+            let metadata = try distributionManager.readOrRebuildInstanceMetadata(at: metadataURL)
+            let imageURL = URL(fileURLWithPath: metadata.diskPath)
+            guard FileManager.default.fileExists(atPath: imageURL.path) else {
+                return
+            }
+            let nowMs = nowEpochMs()
+            let beforeAllocated = allocatedBytes(of: imageURL) ?? 0
+            let logicalSize = logicalBytes(of: imageURL) ?? beforeAllocated
+            let reclaimable = max(0, logicalSize - beforeAllocated)
+            let reclaimRatio = logicalSize > 0 ? Double(reclaimable) / Double(logicalSize) : 0
+            let lastCompactMs = metadata.imageMaintenance?.lastCompactAtEpochMs ?? 0
+            let inCooldown = lastCompactMs > 0 && (nowMs - lastCompactMs) < autoImageCompactCooldownMs
+            let thresholdSatisfied = reclaimable >= autoImageCompactThresholdBytes && reclaimRatio >= autoImageCompactThresholdPercent
+
+            guard thresholdSatisfied && !inCooldown else {
+                logger.log("image_auto_compact_skipped", fields: [
+                    "instance": instanceName,
+                    "reason": inCooldown ? "cooldown" : "threshold_not_met",
+                    "reclaimable_bytes": String(reclaimable),
+                    "reclaim_ratio": String(format: "%.6f", reclaimRatio)
+                ])
+                persistImageMaintenanceStatus(metadataURL: metadataURL) { status in
+                    status.lastRunAtEpochMs = nowMs
+                    status.lastOperation = "stop_auto_compact"
+                    status.lastResult = "skipped"
+                    status.lastErrorCode = inCooldown ? "cooldown" : "threshold_not_met"
+                    status.lastErrorMessage = nil
+                    status.lastCompactBytesBefore = beforeAllocated
+                    status.lastCompactBytesAfter = beforeAllocated
+                }
+                return
+            }
+
+            do {
+                try distributionManager.compactSparseImageIfSupported(imageURL)
+                let afterAllocated = allocatedBytes(of: imageURL) ?? beforeAllocated
+                logger.log("image_auto_compact_completed", fields: [
+                    "instance": instanceName,
+                    "before_allocated_bytes": String(beforeAllocated),
+                    "after_allocated_bytes": String(afterAllocated)
+                ])
+                persistImageMaintenanceStatus(metadataURL: metadataURL) { status in
+                    status.lastRunAtEpochMs = nowMs
+                    status.lastOperation = "stop_auto_compact"
+                    status.lastResult = "ok"
+                    status.lastErrorCode = nil
+                    status.lastErrorMessage = nil
+                    status.lastCompactAtEpochMs = nowMs
+                    status.lastCompactBytesBefore = beforeAllocated
+                    status.lastCompactBytesAfter = afterAllocated
+                }
+            } catch {
+                logger.log("image_auto_compact_failed", fields: [
+                    "instance": instanceName,
+                    "error": String(describing: error)
+                ])
+                persistImageMaintenanceStatus(metadataURL: metadataURL) { status in
+                    status.lastRunAtEpochMs = nowMs
+                    status.lastOperation = "stop_auto_compact"
+                    status.lastResult = "failed"
+                    status.lastErrorCode = "compact_failed"
+                    status.lastErrorMessage = String(describing: error)
+                    status.lastCompactBytesBefore = beforeAllocated
+                }
+            }
+        } catch {
+            logger.log("image_auto_compact_failed", fields: [
+                "instance": instanceName,
+                "error": String(describing: error)
+            ])
+        }
+    }
+
+    private func persistImageMaintenanceStatus(
+        metadataURL: URL,
+        mutate: (inout DistributionInstanceMetadata.ImageMaintenanceStatus) -> Void
+    ) {
+        do {
+            try distributionManager.updateImageMaintenanceStatus(metadataURL: metadataURL, mutate: mutate)
+        } catch {
+            logger.log("image_maintenance_metadata_update_failed", fields: [
+                "metadata": metadataURL.path,
+                "error": String(describing: error)
+            ])
+        }
+    }
+
+    private func persistInspectSnapshotBeforeStop(
+        client: InitChannelClient?,
+        metadataURL: URL?,
+        instanceName: String
+    ) {
+        guard let client, let metadataURL else {
+            return
+        }
+        guard let snapshot = collectGuestStorageSnapshot(client: client) else {
+            return
+        }
+        persistImageMaintenanceStatus(metadataURL: metadataURL) { status in
+            status.cachedTotalContentBytes = snapshot.totalContentBytes
+            status.cachedCompressedBytes = snapshot.compressedBytes
+            status.cachedCompressionSavingPercent = snapshot.compressionSavingPercent
+            status.cachedAtEpochMs = nowEpochMs()
+        }
+        logger.log("image_inspect_snapshot_cached", fields: [
+            "instance": instanceName,
+            "total_content_bytes": snapshot.totalContentBytes.map(String.init) ?? "",
+            "compressed_bytes": snapshot.compressedBytes.map(String.init) ?? "",
+            "compression_saving_percent": snapshot.compressionSavingPercent.map { String(format: "%.2f", $0) } ?? ""
+        ])
+    }
+
+    private func collectGuestStorageSnapshot(client: InitChannelClient) -> GuestStorageSnapshot? {
+        do {
+            let response = try client.send(InitChannelRequest(
+                op: "exec",
+                argv: ["/bin/sh", "-lc", Self.inspectSnapshotScript],
+                timeoutMs: 120_000
+            ))
+            guard response.ok, (response.exitCode ?? 1) == 0 else {
+                return nil
+            }
+            let parsed = parseKeyValueLines(response.stdout ?? "")
+            let before = parsed["du_apparent_bytes"]
+            let after = parsed["du_actual_bytes"]
+            let saving: Double?
+            if let before, let after, before > 0 {
+                saving = (1.0 - (Double(after) / Double(before))) * 100.0
+            } else {
+                saving = nil
+            }
+            return GuestStorageSnapshot(totalContentBytes: before, compressedBytes: after, compressionSavingPercent: saving)
+        } catch {
+            return nil
+        }
+    }
+
+    private func parseKeyValueLines(_ text: String) -> [String: Int64] {
+        var result: [String: Int64] = [:]
+        for line in text.split(separator: "\n") {
+            let parts = line.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+            guard parts.count == 2 else { continue }
+            let key = String(parts[0]).trimmingCharacters(in: .whitespacesAndNewlines)
+            let valueText = String(parts[1]).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !key.isEmpty, let value = Int64(valueText) else { continue }
+            result[key] = value
+        }
+        return result
+    }
+
+    private func guestVisibleHostPath(hostPath: String, hostShareRoot: String) -> String? {
+        guard hostPath.hasPrefix("/") else {
+            return nil
+        }
+        let normalizedRoot = hostShareRoot.hasSuffix("/") && hostShareRoot.count > 1
+            ? String(hostShareRoot.dropLast())
+            : hostShareRoot
+        if normalizedRoot == "/" {
+            return "/mnt/macos" + hostPath
+        }
+        if hostPath == normalizedRoot {
+            return "/mnt/macos"
+        }
+        if hostPath.hasPrefix(normalizedRoot + "/") {
+            let suffix = String(hostPath.dropFirst(normalizedRoot.count))
+            return "/mnt/macos" + suffix
+        }
+        return nil
+    }
+
+    private func guestVisibleHostPathCandidates(hostPath: String, hostShareRoot: String) -> [String] {
+        guard hostPath.hasPrefix("/") else {
+            return []
+        }
+        var candidates: [String] = []
+        if let mapped = guestVisibleHostPath(hostPath: hostPath, hostShareRoot: hostShareRoot) {
+            candidates.append(mapped)
+        }
+        if hostShareRoot != "/" {
+            if !candidates.contains(hostPath) {
+                candidates.append(hostPath)
+            }
+        }
+        return candidates
+    }
+
+    private func isInitSourceMissing(_ response: InitChannelResponse) -> Bool {
+        if response.exitCode == 20 {
+            return true
+        }
+        if let message = response.error?.message.lowercased(), message.contains("source_missing") {
+            return true
+        }
+        if let stderr = response.stderr?.lowercased(), stderr.contains("source_missing") {
+            return true
+        }
+        return false
+    }
+
+    private func readGuestInitVersion(client: InitChannelClient) -> String? {
+        do {
+            let response = try client.send(InitChannelRequest(
+                op: "exec",
+                argv: ["/bin/sh", "-lc", Self.readInitVersionScript],
+                timeoutMs: 2_000
+            ))
+            guard response.ok, (response.exitCode ?? 1) == 0 else {
+                return nil
+            }
+            let value = response.stdout?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return value.isEmpty ? nil : value
+        } catch {
+            return nil
+        }
+    }
+
+    private func allocatedBytes(of fileURL: URL) -> Int64? {
+        let values = try? fileURL.resourceValues(forKeys: [.totalFileAllocatedSizeKey, .fileAllocatedSizeKey])
+        if let total = values?.totalFileAllocatedSize {
+            return Int64(total)
+        }
+        if let allocated = values?.fileAllocatedSize {
+            return Int64(allocated)
+        }
+        return nil
+    }
+
+    private func logicalBytes(of fileURL: URL) -> Int64? {
+        let values = try? fileURL.resourceValues(forKeys: [.fileSizeKey])
+        guard let size = values?.fileSize else {
+            return nil
+        }
+        return Int64(size)
     }
 
     private func handlePtyWrite(_ request: RuntimeControlRequest) -> RuntimeControlResponse {
@@ -2560,7 +3038,22 @@ public final class DaemonServer {
     private func stopInstanceRuntime(instanceName: String, reason: String) {
         let context = instanceRegistry.context(for: instanceName)
         context.lifecycleState = .stopping
+        let metadataURL = context.metadataURL
+        runAutoTrimBeforeStop(
+            client: context.initClient,
+            metadataURL: metadataURL,
+            instanceName: instanceName
+        )
+        persistInspectSnapshotBeforeStop(
+            client: context.initClient,
+            metadataURL: metadataURL,
+            instanceName: instanceName
+        )
         context.vmRunner?.stopRunningVM()
+        maybeAutoCompactImageAfterStop(
+            metadataURL: metadataURL,
+            instanceName: instanceName
+        )
         context.vmRunner = nil
         context.initClient = nil
         context.runtimeUser = nil
@@ -2651,17 +3144,11 @@ public final class DaemonServer {
         controlServer?.stop()
         eventBus?.stop()
         forwarder?.stopAll()
-        if let activeInstanceName {
-            instanceRegistry.context(for: activeInstanceName).lifecycleState = .stopping
-        }
-        vmRunner?.stopRunningVM()
-        if let activeInstanceName {
-            let context = instanceRegistry.context(for: activeInstanceName)
-            context.lifecycleState = .stopped
-            context.vmRunner = nil
-            context.initClient = nil
-            context.runtimeUser = nil
-            context.lastError = nil
+        if let activeInstanceName,
+           instanceRegistry.context(for: activeInstanceName).lifecycleState == .running {
+            stopInstanceRuntime(instanceName: activeInstanceName, reason: "daemon_shutdown")
+        } else {
+            vmRunner?.stopRunningVM()
         }
         updateStateStopped()
         logger.log("daemon_stopped")
@@ -3422,6 +3909,24 @@ public final class DaemonServer {
             return 300_000  // 5 min (first provisioning)
         }
         return 120_000  // 2 min (warm VM default)
+    }
+
+    private static func readInt64Env(_ key: String, defaultValue: Int64) -> Int64 {
+        guard let raw = ProcessInfo.processInfo.environment[key],
+              let value = Int64(raw),
+              value > 0 else {
+            return defaultValue
+        }
+        return value
+    }
+
+    private static func readDoubleEnv(_ key: String, defaultValue: Double) -> Double {
+        guard let raw = ProcessInfo.processInfo.environment[key],
+              let value = Double(raw),
+              value > 0 else {
+            return defaultValue
+        }
+        return value
     }
 
     private func updateInitChannelState(_ probe: InitChannelProbeResult) {

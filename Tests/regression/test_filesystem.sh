@@ -1,7 +1,7 @@
 # test_filesystem.sh — ファイルシステム共有テスト
 # runner.sh から source される
 
-if ! "$MSL" --list 2>/dev/null | grep -q .; then
+if ! "$MSL" list 2>/dev/null | grep -q .; then
   skip_test "filesystem tests" "no installed instance"
   return 0
 fi
@@ -14,11 +14,11 @@ if ! ensure_live_ready; then
   return 0
 fi
 
-# --- /mnt/msl exists (macOS shared dir) ---
-run_test "shared dir /mnt/msl exists" "$MSL" run test -d /mnt/msl
+# --- /mnt/macos exists (macOS shared dir) ---
+run_test "shared dir /mnt/macos exists" "$MSL" run test -d /mnt/macos
 
-# --- home directory is bind-mounted ---
-run_test "home dir exists" "$MSL" run test -d /root
+# --- active home directory exists ---
+run_test "home dir exists" "$MSL" run sh -lc 'test -d "$HOME"'
 
 # --- write and read a temp file ---
 run_test_output "write and read file" "msl-test-ok" \

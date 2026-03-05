@@ -64,6 +64,8 @@ public struct InitChannelRequest: Codable {
     public var dnsProxyUpstreams: [String]?
     public var dnsProxyListenAddress: String?
     public var dnsProxyListenPort: Int?
+    public var initSourcePath: String?
+    public var initDryRun: Bool?
 
     public init(
         version: Int = 1,
@@ -106,7 +108,9 @@ public struct InitChannelRequest: Codable {
         dnsSource: String? = nil,
         dnsProxyUpstreams: [String]? = nil,
         dnsProxyListenAddress: String? = nil,
-        dnsProxyListenPort: Int? = nil
+        dnsProxyListenPort: Int? = nil,
+        initSourcePath: String? = nil,
+        initDryRun: Bool? = nil
     ) {
         self.version = version
         self.requestId = requestId
@@ -149,6 +153,8 @@ public struct InitChannelRequest: Codable {
         self.dnsProxyUpstreams = dnsProxyUpstreams
         self.dnsProxyListenAddress = dnsProxyListenAddress
         self.dnsProxyListenPort = dnsProxyListenPort
+        self.initSourcePath = initSourcePath
+        self.initDryRun = initDryRun
     }
 }
 

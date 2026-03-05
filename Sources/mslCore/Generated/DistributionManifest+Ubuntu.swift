@@ -44,6 +44,11 @@ enum EmbeddedDistributionManifestUbuntu {
                 apk: false,
                 zypper: false,
                 dnf: true
+            ),
+            vulnerabilityDBTarget: DistributionManifestEntry.VulnerabilityDBTarget(
+                family: "redhat",
+                release: "2",
+                dictionary: "goval"
             )
         ),
         DistributionManifestEntry(
@@ -51,10 +56,10 @@ enum EmbeddedDistributionManifestUbuntu {
             distro: "alpine",
             version: "3.23",
             arch: "arm64",
-            tarballURL: "https://images.linuxcontainers.org/images/alpine/3.23/arm64/default/20260304_02:43/rootfs.tar.xz",
-            sha256: "db0a56e8b7499b4b496546e04e3859c7f4eeda38c79d5e848e381455ccb585f1",
-            signatureURL: "https://images.linuxcontainers.org/images/alpine/3.23/arm64/default/20260304_02:43/SHA256SUMS.asc",
-            checksumURL: "https://images.linuxcontainers.org/images/alpine/3.23/arm64/default/20260304_02:43/SHA256SUMS",
+            tarballURL: "https://images.linuxcontainers.org/images/alpine/3.23/arm64/default/20260304_13:00/rootfs.tar.xz",
+            sha256: "51fc4909e40cafd7fbe1566faa666837000bb4f19cde2d54e3b48fbba7ab5cd8",
+            signatureURL: "https://images.linuxcontainers.org/images/alpine/3.23/arm64/default/20260304_13:00/SHA256SUMS.asc",
+            checksumURL: "https://images.linuxcontainers.org/images/alpine/3.23/arm64/default/20260304_13:00/SHA256SUMS",
             signatureTarget: "checksum",
             keyFingerprint: "E7FB0CAEC8173D669066514CBAEFF88C22F6E216",
             supportState: .supported,
@@ -88,6 +93,11 @@ enum EmbeddedDistributionManifestUbuntu {
                 apk: true,
                 zypper: false,
                 dnf: false
+            ),
+            vulnerabilityDBTarget: DistributionManifestEntry.VulnerabilityDBTarget(
+                family: "alpine",
+                release: "3.23",
+                dictionary: "goval"
             )
         ),
         DistributionManifestEntry(
@@ -132,6 +142,11 @@ enum EmbeddedDistributionManifestUbuntu {
                 apk: false,
                 zypper: false,
                 dnf: false
+            ),
+            vulnerabilityDBTarget: DistributionManifestEntry.VulnerabilityDBTarget(
+                family: "debian",
+                release: "trixie",
+                dictionary: "goval"
             )
         ),
         DistributionManifestEntry(
@@ -176,6 +191,11 @@ enum EmbeddedDistributionManifestUbuntu {
                 apk: false,
                 zypper: false,
                 dnf: false
+            ),
+            vulnerabilityDBTarget: DistributionManifestEntry.VulnerabilityDBTarget(
+                family: "ubuntu",
+                release: "noble",
+                dictionary: "goval"
             )
         ),
         DistributionManifestEntry(
@@ -220,6 +240,11 @@ enum EmbeddedDistributionManifestUbuntu {
                 apk: false,
                 zypper: false,
                 dnf: false
+            ),
+            vulnerabilityDBTarget: DistributionManifestEntry.VulnerabilityDBTarget(
+                family: "ubuntu",
+                release: "questing",
+                dictionary: "goval"
             )
         ),
         DistributionManifestEntry(
@@ -227,10 +252,10 @@ enum EmbeddedDistributionManifestUbuntu {
             distro: "fedora",
             version: "43",
             arch: "arm64",
-            tarballURL: "https://images.linuxcontainers.org/images/fedora/43/arm64/default/20260304_01:55/rootfs.tar.xz",
-            sha256: "ebc18508d312cc6849658ee09d2e4ab1f9c18b01fc4bd2a80678d5d8c2d2031c",
-            signatureURL: "https://images.linuxcontainers.org/images/fedora/43/arm64/default/20260304_01:55/SHA256SUMS.asc",
-            checksumURL: "https://images.linuxcontainers.org/images/fedora/43/arm64/default/20260304_01:55/SHA256SUMS",
+            tarballURL: "https://images.linuxcontainers.org/images/fedora/43/arm64/default/20260304_20:33/rootfs.tar.xz",
+            sha256: "4ef6c6703c8abcd13abb0797b2688944027a61703263870d919da5529add66df",
+            signatureURL: "https://images.linuxcontainers.org/images/fedora/43/arm64/default/20260304_20:33/SHA256SUMS.asc",
+            checksumURL: "https://images.linuxcontainers.org/images/fedora/43/arm64/default/20260304_20:33/SHA256SUMS",
             signatureTarget: "checksum",
             keyFingerprint: "E7FB0CAEC8173D669066514CBAEFF88C22F6E216",
             supportState: .supported,
@@ -264,6 +289,11 @@ enum EmbeddedDistributionManifestUbuntu {
                 apk: false,
                 zypper: false,
                 dnf: true
+            ),
+            vulnerabilityDBTarget: DistributionManifestEntry.VulnerabilityDBTarget(
+                family: "redhat",
+                release: "43",
+                dictionary: "goval"
             )
         ),
         DistributionManifestEntry(
@@ -308,6 +338,11 @@ enum EmbeddedDistributionManifestUbuntu {
                 apk: false,
                 zypper: true,
                 dnf: false
+            ),
+            vulnerabilityDBTarget: DistributionManifestEntry.VulnerabilityDBTarget(
+                family: "opensuse",
+                release: "16.0",
+                dictionary: "goval"
             )
         )
     ]

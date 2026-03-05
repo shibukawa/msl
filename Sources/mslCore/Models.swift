@@ -331,6 +331,16 @@ public struct PortMappingsState: Codable {
 }
 
 public struct MSLConfig: Codable, Equatable {
+    public struct SecurityConfig: Codable, Equatable {
+        public var weeklyScanOnStart: Bool?
+        public var weeklyScanPolicy: String?
+
+        public init(weeklyScanOnStart: Bool? = nil, weeklyScanPolicy: String? = nil) {
+            self.weeklyScanOnStart = weeklyScanOnStart
+            self.weeklyScanPolicy = weeklyScanPolicy
+        }
+    }
+
     public struct NetworkDNSConfig: Codable, Equatable {
         public var mode: String?
         public var manualNameservers: [String]?
@@ -362,6 +372,7 @@ public struct MSLConfig: Codable, Equatable {
     public var storageCacheToggles: [String: Bool]?
     public var network: NetworkConfig?
     public var memory: MemoryPolicyConfig?
+    public var security: SecurityConfig?
 
     public init(
         schemaVersion: Int? = 1,
@@ -370,7 +381,8 @@ public struct MSLConfig: Codable, Equatable {
         workspaceHostShareRoot: String? = nil,
         storageCacheToggles: [String: Bool]? = nil,
         network: NetworkConfig? = nil,
-        memory: MemoryPolicyConfig? = nil
+        memory: MemoryPolicyConfig? = nil,
+        security: SecurityConfig? = nil
     ) {
         self.schemaVersion = schemaVersion
         self.defaultInstanceName = defaultInstanceName
@@ -379,6 +391,7 @@ public struct MSLConfig: Codable, Equatable {
         self.storageCacheToggles = storageCacheToggles
         self.network = network
         self.memory = memory
+        self.security = security
     }
 }
 

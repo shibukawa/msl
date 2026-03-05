@@ -10,7 +10,7 @@ if ! ensure_live_ready; then
   return 0
 fi
 
-CACHE_INSTANCE="$("$MSL" --list 2>/dev/null | sed -e 's/ \[default\]$//' | awk '{print $1}' | head -n 1)"
+CACHE_INSTANCE="$("$MSL" list 2>/dev/null | sed -e 's/ \[default\]$//' | awk '{print $1}' | head -n 1)"
 
 if [ -z "$CACHE_INSTANCE" ]; then
   skip_test "step23 cache sharing integration" "no installed instance"
@@ -19,7 +19,7 @@ fi
 HOST_CACHE_ROOT="$HOME/Library/Application Support/msl/caches"
 METADATA_FILE="${MSL_HOME:-$HOME}/Library/Application Support/msl/distros/$CACHE_INSTANCE/metadata.json"
 
-run_test "step23 stop before cache-sharing checks" "$MSL" --stop
+run_test "step23 stop before cache-sharing checks" "$MSL" stop --all
 run_test_output "step23 metadata has cacheSharing" "\"cacheSharing\"" \
   /bin/sh -lc "cat \"$METADATA_FILE\""
 
@@ -37,4 +37,4 @@ run_test "step23 apk bind mount when apk exists" \
 run_test "step23 host cache apt dir created" test -d "$HOST_CACHE_ROOT/apt"
 run_test "step23 host cache apk dir created" test -d "$HOST_CACHE_ROOT/apk"
 
-run_test "step23 stop after cache-sharing checks" "$MSL" --stop
+run_test "step23 stop after cache-sharing checks" "$MSL" stop --all

@@ -87,6 +87,18 @@ public struct UserConvergencePolicyTemplate: Codable, Equatable {
 public typealias UserConvergencePolicy = UserConvergencePolicyTemplate
 
 public struct DistributionManifestEntry: Codable, Equatable {
+    public struct VulnerabilityDBTarget: Codable, Equatable {
+        public var family: String
+        public var release: String?
+        public var dictionary: String
+
+        public init(family: String, release: String? = nil, dictionary: String) {
+            self.family = family
+            self.release = release
+            self.dictionary = dictionary
+        }
+    }
+
     public var id: String
     public var distro: String
     public var version: String
@@ -102,6 +114,7 @@ public struct DistributionManifestEntry: Codable, Equatable {
     public var defaultInitMode: String?
     public var userConvergenceTemplate: UserConvergencePolicyTemplate?
     public var cacheSharingDefaults: CacheSharingConfig?
+    public var vulnerabilityDBTarget: VulnerabilityDBTarget?
 
     public init(
         id: String,
@@ -118,7 +131,8 @@ public struct DistributionManifestEntry: Codable, Equatable {
         serviceManager: String? = nil,
         defaultInitMode: String? = nil,
         userConvergenceTemplate: UserConvergencePolicyTemplate? = nil,
-        cacheSharingDefaults: CacheSharingConfig? = nil
+        cacheSharingDefaults: CacheSharingConfig? = nil,
+        vulnerabilityDBTarget: VulnerabilityDBTarget? = nil
     ) {
         self.id = id
         self.distro = distro
@@ -135,6 +149,7 @@ public struct DistributionManifestEntry: Codable, Equatable {
         self.defaultInitMode = defaultInitMode
         self.userConvergenceTemplate = userConvergenceTemplate
         self.cacheSharingDefaults = cacheSharingDefaults
+        self.vulnerabilityDBTarget = vulnerabilityDBTarget
     }
 }
 
@@ -256,6 +271,55 @@ public struct DistributionNetworkPolicy: Codable, Equatable {
 }
 
 public struct DistributionInstanceMetadata: Codable, Equatable {
+    public struct ImageMaintenanceStatus: Codable, Equatable {
+        public var lastRunAtEpochMs: Int64?
+        public var lastOperation: String?
+        public var lastResult: String?
+        public var lastErrorCode: String?
+        public var lastErrorMessage: String?
+        public var lastCompactAtEpochMs: Int64?
+        public var lastCompactBytesBefore: Int64?
+        public var lastCompactBytesAfter: Int64?
+        public var lastRefreshVersionBefore: String?
+        public var lastRefreshVersionAfter: String?
+        public var cachedTotalContentBytes: Int64?
+        public var cachedCompressedBytes: Int64?
+        public var cachedCompressionSavingPercent: Double?
+        public var cachedAtEpochMs: Int64?
+
+        public init(
+            lastRunAtEpochMs: Int64? = nil,
+            lastOperation: String? = nil,
+            lastResult: String? = nil,
+            lastErrorCode: String? = nil,
+            lastErrorMessage: String? = nil,
+            lastCompactAtEpochMs: Int64? = nil,
+            lastCompactBytesBefore: Int64? = nil,
+            lastCompactBytesAfter: Int64? = nil,
+            lastRefreshVersionBefore: String? = nil,
+            lastRefreshVersionAfter: String? = nil,
+            cachedTotalContentBytes: Int64? = nil,
+            cachedCompressedBytes: Int64? = nil,
+            cachedCompressionSavingPercent: Double? = nil,
+            cachedAtEpochMs: Int64? = nil
+        ) {
+            self.lastRunAtEpochMs = lastRunAtEpochMs
+            self.lastOperation = lastOperation
+            self.lastResult = lastResult
+            self.lastErrorCode = lastErrorCode
+            self.lastErrorMessage = lastErrorMessage
+            self.lastCompactAtEpochMs = lastCompactAtEpochMs
+            self.lastCompactBytesBefore = lastCompactBytesBefore
+            self.lastCompactBytesAfter = lastCompactBytesAfter
+            self.lastRefreshVersionBefore = lastRefreshVersionBefore
+            self.lastRefreshVersionAfter = lastRefreshVersionAfter
+            self.cachedTotalContentBytes = cachedTotalContentBytes
+            self.cachedCompressedBytes = cachedCompressedBytes
+            self.cachedCompressionSavingPercent = cachedCompressionSavingPercent
+            self.cachedAtEpochMs = cachedAtEpochMs
+        }
+    }
+
     public struct RuntimeInitProfile: Codable, Equatable {
         public var initMode: String
         public var serviceManager: String
@@ -313,6 +377,7 @@ public struct DistributionInstanceMetadata: Codable, Equatable {
     public var compressionPolicy: DistributionCompressionPolicy?
     public var networkPolicy: DistributionNetworkPolicy?
     public var cacheSharing: CacheSharingConfig?
+    public var imageMaintenance: ImageMaintenanceStatus?
 
     public init(
         name: String,
@@ -328,7 +393,8 @@ public struct DistributionInstanceMetadata: Codable, Equatable {
         workspacePolicy: WorkspacePolicy? = nil,
         compressionPolicy: DistributionCompressionPolicy? = nil,
         networkPolicy: DistributionNetworkPolicy? = nil,
-        cacheSharing: CacheSharingConfig? = nil
+        cacheSharing: CacheSharingConfig? = nil,
+        imageMaintenance: ImageMaintenanceStatus? = nil
     ) {
         self.name = name
         self.distroFamily = distroFamily
@@ -344,6 +410,7 @@ public struct DistributionInstanceMetadata: Codable, Equatable {
         self.compressionPolicy = compressionPolicy
         self.networkPolicy = networkPolicy
         self.cacheSharing = cacheSharing
+        self.imageMaintenance = imageMaintenance
     }
 }
 

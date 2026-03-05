@@ -148,6 +148,7 @@ struct MSLCommand: ParsableCommand {
             ListCommand.self,
             StatusCommand.self,
             StopCommand.self,
+            ImageCommand.self,
             InstallCommand.self,
             UninstallCommand.self,
             CacheCommand.self,
@@ -160,9 +161,6 @@ struct MSLCommand: ParsableCommand {
         ]
     )
 
-    @Option(name: [.short, .long], help: "Target instance name.")
-    var instance: String?
-
     @Option(name: [.customLong("set-default")], help: "Set default instance name.")
     var setDefault: String?
 
@@ -170,8 +168,6 @@ struct MSLCommand: ParsableCommand {
     var serialConsole = false
 
     mutating func validate() throws {
-        CLIInvocationContext.instanceName = instance
-
         var modeCount = 0
         if setDefault != nil { modeCount += 1 }
         if serialConsole { modeCount += 1 }
@@ -188,7 +184,7 @@ struct MSLCommand: ParsableCommand {
             if serialConsole {
                 setenv("MSL_ATTACH_SERIAL", "1", 1)
             }
-            try manager.runDefaultShell(instanceName: instance)
+            try manager.runDefaultShell(instanceName: CLIInvocationContext.instanceName)
         }
     }
 }
@@ -203,14 +199,22 @@ struct RunCommand: ParsableCommand {
     @Option(name: [.short, .long], help: "Timeout in seconds.")
     var timeout: Int?
 
-    @Argument(help: "Command and arguments.")
+    @Argument(parsing: .captureForPassthrough, help: "Command and arguments.")
     var command: [String] = []
+
+    private var normalizedCommand: [String] {
+        var argv = command
+        while argv.first == "--" {
+            argv.removeFirst()
+        }
+        return argv
+    }
 
     mutating func validate() throws {
         if let timeout, timeout <= 0 {
             throw ValidationError("--timeout must be a positive integer")
         }
-        if command.isEmpty {
+        if normalizedCommand.isEmpty {
             throw ValidationError("Missing command. See `msl run --help`.")
         }
     }
@@ -218,7 +222,7 @@ struct RunCommand: ParsableCommand {
     mutating func run() throws {
         withRuntimeManager { manager in
             try manager.runCommand(
-                argv: command,
+                argv: normalizedCommand,
                 timeoutSec: timeout ?? 0,
                 instanceName: CLIInvocationContext.instanceName
             )
@@ -293,6 +297,246 @@ struct StopCommand: ParsableCommand {
         let targetInstance = instance ?? CLIInvocationContext.instanceName
         withRuntimeManager { manager in
             try manager.stopVM(instanceName: targetInstance, all: all)
+        }
+    }
+}
+
+struct ImageCommand: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "image",
+        abstract: "Image maintenance operations.",
+        subcommands: [
+            ImageInspectCommand.self,
+            ImageScanCommand.self,
+            ImageResizeCommand.self,
+            ImageDefragCommand.self,
+            ImageExportCommand.self
+        ]
+    )
+}
+
+struct ImageInspectCommand: ParsableCommand {
+    static let configuration = CommandConfiguration(commandName: "inspect", abstract: "Inspect image metadata and disk stats.")
+
+    @Argument(help: "Instance name.")
+    var instance: String?
+
+    mutating func validate() throws {
+        if instance != nil, CLIInvocationContext.instanceName != nil {
+            throw ValidationError("Specify target instance with either global `--instance`/`-i` or `image inspect <instance>`, not both")
+        }
+    }
+
+    mutating func run() throws {
+        let targetInstance = instance ?? CLIInvocationContext.instanceName
+        withRuntimeManager { manager in
+            try manager.printImageInspect(instanceName: targetInstance)
+        }
+    }
+}
+
+struct ImageScanCommand: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "scan",
+        abstract: "Run vulnerability security scan.",
+        subcommands: [
+            ImageScanRunCommand.self,
+            ImageScanResultCommand.self
+        ],
+        defaultSubcommand: ImageScanRunCommand.self
+    )
+}
+
+struct ImageScanRunCommand: ParsableCommand {
+    static let configuration = CommandConfiguration(commandName: "run", abstract: "Run vulnerability security scan.")
+
+    @Argument(help: "Instance name.")
+    var instance: String?
+
+    @Option(name: [.customLong("policy")], help: "Policy mode: allow|warn|block")
+    var policy: String = "warn"
+
+    @Flag(name: [.customLong("offline")], help: "Use local cache only.")
+    var offline = false
+
+    @Flag(name: [.customLong("update-vuls")], help: "Force Vuls runtime update check.")
+    var updateVuls = false
+
+    @Option(name: [.customLong("output")], help: "Write output to file.")
+    var output: String?
+
+    mutating func validate() throws {
+        if instance != nil, CLIInvocationContext.instanceName != nil {
+            throw ValidationError("Specify target instance with either global `--instance`/`-i` or `image scan <instance>`, not both")
+        }
+        if offline, updateVuls {
+            throw ValidationError("--offline and --update-vuls cannot be used together")
+        }
+        if let output, output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            throw ValidationError("--output must not be empty")
+        }
+    }
+
+    mutating func run() throws {
+        let targetInstance = instance ?? CLIInvocationContext.instanceName
+        withRuntimeManager { manager in
+            try manager.runImageScan(
+                instanceName: targetInstance,
+                policyRaw: policy,
+                offline: offline,
+                updateVuls: updateVuls,
+                outputPath: output
+            )
+        }
+    }
+}
+
+struct ImageScanResultCommand: ParsableCommand {
+    static let configuration = CommandConfiguration(commandName: "result", abstract: "Show latest scan result for instance.")
+
+    @Argument(help: "Instance name.")
+    var instance: String?
+
+    @Flag(name: [.customLong("http")], help: "Start vulsrepo server and open browser.")
+    var http = false
+
+    @Option(name: [.customLong("port")], help: "HTTP port for vulsrepo.")
+    var port: Int = 5511
+
+    mutating func validate() throws {
+        if instance != nil, CLIInvocationContext.instanceName != nil {
+            throw ValidationError("Specify target instance with either global `--instance`/`-i` or `image scan result <instance>`, not both")
+        }
+        if port <= 0 || port > 65535 {
+            throw ValidationError("--port must be in 1..65535")
+        }
+    }
+
+    mutating func run() throws {
+        let targetInstance = instance ?? CLIInvocationContext.instanceName
+        withRuntimeManager { manager in
+            if http {
+                try manager.runImageScanResultHTTP(instanceName: targetInstance, port: port)
+            } else {
+                try manager.runImageScanResultCLI(instanceName: targetInstance)
+            }
+        }
+    }
+}
+
+struct ImageResizeCommand: ParsableCommand {
+    static let configuration = CommandConfiguration(commandName: "resize", abstract: "Grow disk image size.")
+
+    @Argument(help: "Usage: [<instance>] <size>. size supports M/MB/G/GB (e.g. 1536M, 1.5G).")
+    var arguments: [String] = []
+
+    private var resolvedInstance: String?
+    private var resolvedSizeBytes: Int64 = 0
+
+    mutating func validate() throws {
+        guard arguments.count == 1 || arguments.count == 2 else {
+            throw ValidationError("Usage: msl image resize [<instance>] <size>. size supports M/MB/G/GB (e.g. 1536M, 1.5G).")
+        }
+        if arguments.count == 2, CLIInvocationContext.instanceName != nil {
+            throw ValidationError("Specify target instance with either global `--instance`/`-i` or `image resize <instance> <size>`, not both")
+        }
+        resolvedInstance = arguments.count == 2 ? arguments[0] : CLIInvocationContext.instanceName
+        resolvedSizeBytes = try Self.parseResizeSize(arguments.last ?? "")
+    }
+
+    private static func parseResizeSize(_ raw: String) throws -> Int64 {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let pattern = #"^([0-9]+(?:\.[0-9]+)?)\s*([mMgG](?:[bB])?)$"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else {
+            throw ValidationError("invalid size '\(raw)'. expected formats like 1536M or 1.5G")
+        }
+        let nsrange = NSRange(trimmed.startIndex..<trimmed.endIndex, in: trimmed)
+        guard let match = regex.firstMatch(in: trimmed, options: [], range: nsrange),
+              match.numberOfRanges == 3,
+              let numberRange = Range(match.range(at: 1), in: trimmed),
+              let unitRange = Range(match.range(at: 2), in: trimmed) else {
+            throw ValidationError("invalid size '\(raw)'. expected formats like 1536M or 1.5G")
+        }
+        guard let value = Double(trimmed[numberRange]), value > 0, value.isFinite else {
+            throw ValidationError("invalid size '\(raw)'. size must be a positive number")
+        }
+        let unit = trimmed[unitRange].lowercased()
+        let multiplier: Double = unit.hasPrefix("g") ? 1024 * 1024 * 1024 : 1024 * 1024
+        let bytes = value * multiplier
+        guard bytes.isFinite, bytes > 0, bytes <= Double(Int64.max) else {
+            throw ValidationError("size is out of range: \(raw)")
+        }
+        return Int64(bytes.rounded(.up))
+    }
+
+    mutating func run() throws {
+        withRuntimeManager { manager in
+            try manager.runImageResize(instanceName: resolvedInstance, sizeBytes: resolvedSizeBytes)
+        }
+    }
+}
+
+struct ImageDefragCommand: ParsableCommand {
+    static let configuration = CommandConfiguration(commandName: "defrag", abstract: "Run guest filesystem trim (fstrim).")
+
+    @Argument(help: "Instance name.")
+    var instance: String?
+
+    @Flag(name: [.customLong("dry-run")], help: "Show what would be done.")
+    var dryRun = false
+
+    mutating func validate() throws {
+        if instance != nil, CLIInvocationContext.instanceName != nil {
+            throw ValidationError("Specify target instance with either global `--instance`/`-i` or `image defrag <instance>`, not both")
+        }
+    }
+
+    mutating func run() throws {
+        let targetInstance = instance ?? CLIInvocationContext.instanceName
+        withRuntimeManager { manager in
+            try manager.runImageDefrag(instanceName: targetInstance, dryRun: dryRun)
+        }
+    }
+}
+
+struct ImageExportCommand: ParsableCommand {
+    static let configuration = CommandConfiguration(commandName: "export", abstract: "Export image artifacts.")
+
+    enum ExportMode: String, ExpressibleByArgument {
+        case archive
+        case rootfs
+    }
+
+    @Argument(help: "Instance name.")
+    var instance: String?
+
+    @Option(name: [.customLong("mode")], help: "Export mode: archive|rootfs")
+    var mode: ExportMode = .archive
+
+    @Option(name: [.customLong("output")], help: "Output file path.")
+    var output: String?
+
+    @Flag(name: [.customLong("force")], help: "Overwrite output if exists.")
+    var force = false
+
+    mutating func validate() throws {
+        if instance != nil, CLIInvocationContext.instanceName != nil {
+            throw ValidationError("Specify target instance with either global `--instance`/`-i` or `image export <instance>`, not both")
+        }
+        if let output, output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            throw ValidationError("--output must not be empty")
+        }
+    }
+
+    mutating func run() throws {
+        let targetInstance = instance ?? CLIInvocationContext.instanceName
+        withRuntimeManager { manager in
+            try manager.runImageExport(
+                instanceName: targetInstance,
+                mode: mode.rawValue,
+                outputPath: output,
+                force: force
+            )
         }
     }
 }
@@ -639,7 +883,7 @@ func runMSLCLI() {
             return
         }
 
-        MSLCommand.main(raw)
+        MSLCommand.main(globalParsed.remainingArguments)
     } catch let error as MSLCLIParseError {
         fail(error.errorDescription ?? String(describing: error))
     } catch {

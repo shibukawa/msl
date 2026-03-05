@@ -54,6 +54,14 @@ final class CLIOptionsParserTests: XCTestCase {
         XCTAssertEqual(parsed.remainingArguments, ["stop", "--all"])
     }
 
+    func testStopsParsingAtImageSubcommand() throws {
+        let parsed = try MSLCLIOptionsParser.parseGlobalRuntimeOptions([
+            "--instance", "dev", "image", "inspect", "ubuntu"
+        ])
+        XCTAssertEqual(parsed.instanceName, "dev")
+        XCTAssertEqual(parsed.remainingArguments, ["image", "inspect", "ubuntu"])
+    }
+
     func testRejectsDuplicateInstanceOption() {
         XCTAssertThrowsError(
             try MSLCLIOptionsParser.parseGlobalRuntimeOptions([

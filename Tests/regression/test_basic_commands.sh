@@ -1,7 +1,7 @@
 # test_basic_commands.sh — 基本コマンド実行テスト
 # runner.sh から source される
 
-if ! "$MSL" --list 2>/dev/null | grep -q .; then
+if ! "$MSL" list 2>/dev/null | grep -q .; then
   skip_test "basic command tests" "no installed instance"
   return 0
 fi
@@ -26,8 +26,8 @@ run_test_expect_fail "exit code fail (false)" "$MSL" run false
 # --- uname → Linux ---
 run_test_output "uname -s" "Linux" "$MSL" run uname -s
 
-# --- whoami → root ---
-run_test_output "whoami" "root" "$MSL" run whoami
+# --- whoami → current runtime user ---
+run_test_output "whoami" "${USER:-}" "$MSL" run whoami
 
 # --- multi-arg command ---
 run_test_output "echo multi args" "hello world" "$MSL" run echo hello world
@@ -45,4 +45,4 @@ run_test_output "run with timeout" "done" "$MSL" run --timeout 10 echo done
 run_test_expect_fail "run timeout exceeded" "$MSL" run --timeout 1 sleep 30
 
 # --- status check ---
-run_test "msl --status" "$MSL" --status
+run_test "msl status" "$MSL" status

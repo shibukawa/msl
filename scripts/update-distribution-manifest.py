@@ -275,6 +275,17 @@ def service_manager_for_distro(distro: str) -> str:
     return "systemd"
 
 
+def vulnerability_db_target_for_distro(distro: str, release: str):
+    family = distro
+    if distro in ("amazonlinux", "fedora"):
+        family = "redhat"
+    return {
+        "family": family,
+        "release": release,
+        "dictionary": "goval",
+    }
+
+
 def user_convergence_template_for_distro(distro: str):
     if distro == "alpine":
         return {
@@ -398,6 +409,7 @@ def linuxcontainers_entry(target: dict, products: dict, tmp_dir: Path):
         "serviceManager": service_manager_for_distro(distro),
         "userConvergenceTemplate": user_convergence_template_for_distro(distro),
         "cacheSharingDefaults": cache_sharing_defaults_for_manager(normalized_manager),
+        "vulnerabilityDBTarget": vulnerability_db_target_for_distro(distro, release),
     }
     return entry, discovered_fp, armored
 
@@ -555,6 +567,7 @@ def alpine_entry(tmp_dir: Path):
             "apt": False,
             "apk": True,
         },
+        "vulnerabilityDBTarget": vulnerability_db_target_for_distro("alpine", "latest"),
     }
     return entry, discovered_fp, armored
 
@@ -643,6 +656,7 @@ def ubuntu_entry(version: str, page_url: str, tmp_dir: Path):
             "apt": True,
             "apk": False,
         },
+        "vulnerabilityDBTarget": vulnerability_db_target_for_distro("ubuntu", version),
     }
     return entry, discovered_fp, armored
 
@@ -660,6 +674,7 @@ def swift_string(value: str) -> str:
 def render_entry(entry):
     template = entry.get("userConvergenceTemplate")
     cache_sharing_defaults = entry.get("cacheSharingDefaults")
+    vulnerability_db_target = entry.get("vulnerabilityDBTarget")
     service_manager = entry.get("serviceManager")
     default_init_mode = entry.get("defaultInitMode")
     if template:
@@ -704,6 +719,17 @@ def render_entry(entry):
     else:
         cache_sharing_code = "nil"
 
+    if vulnerability_db_target:
+        vulnerability_db_target_code = (
+            "DistributionManifestEntry.VulnerabilityDBTarget(\n"
+            f"                family: {swift_string(vulnerability_db_target['family'])},\n"
+            f"                release: {swift_string(vulnerability_db_target.get('release') or '')},\n"
+            f"                dictionary: {swift_string(vulnerability_db_target['dictionary'])}\n"
+            "            )"
+        )
+    else:
+        vulnerability_db_target_code = "nil"
+
     return (
         "        DistributionManifestEntry(\n"
         f"            id: {swift_string(entry['id'])},\n"
@@ -720,7 +746,8 @@ def render_entry(entry):
         f"            serviceManager: {swift_string(service_manager) if service_manager else 'nil'},\n"
         f"            defaultInitMode: {swift_string(default_init_mode) if default_init_mode else 'nil'},\n"
         f"            userConvergenceTemplate: {template_code},\n"
-        f"            cacheSharingDefaults: {cache_sharing_code}\n"
+        f"            cacheSharingDefaults: {cache_sharing_code},\n"
+        f"            vulnerabilityDBTarget: {vulnerability_db_target_code}\n"
         "        )"
     )
 

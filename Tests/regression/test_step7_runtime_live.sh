@@ -13,7 +13,7 @@ if ! ensure_live_ready; then
   return 0
 fi
 
-STEP7_INSTANCE_LIST="$("$MSL" --list 2>/dev/null | sed -e 's/ \[default\]$//' | awk '{print $1}')"
+STEP7_INSTANCE_LIST="$("$MSL" list 2>/dev/null | sed -e 's/ \[default\]$//' | awk '{print $1}')"
 STEP7_INSTANCE="$(printf "%s\n" "$STEP7_INSTANCE_LIST" | sed -n '1p')"
 STEP7_SECOND_INSTANCE="$(printf "%s\n" "$STEP7_INSTANCE_LIST" | sed -n '2p')"
 
@@ -21,12 +21,12 @@ if [ -z "$STEP7_INSTANCE" ]; then
   skip_test "step7 live boot/attach" "no installed instance"
   skip_test "step7 no-seed boot path" "no installed instance"
   skip_test "step7 diagnostic logs" "no installed instance"
-  skip_test "step7 instance mismatch guidance" "no installed instance"
+  skip_test "step7 multi-instance parallel run" "no installed instance"
   return 0
 fi
 
 # Clean start to make instance selection deterministic.
-run_test "step7 stop before live checks" "$MSL" --stop
+run_test "step7 stop before live checks" "$MSL" stop --all
 
 # I1/I3/I5: explicit instance run succeeds through Step7 boot path.
 run_test_output "step7 explicit instance uname" "Linux" \
@@ -44,21 +44,21 @@ run_test_output "step7 boot without seed.iso" "Linux" \
 
 # I6/I9: forwarded logs and runtime observability should be available.
 STEP7_LOG_DIR="$APP_SUPPORT_DIR/logs/instances/$STEP7_INSTANCE"
-STEP7_DAEMON_LOG="$APP_SUPPORT_DIR/runtime/logs/daemon.log"
+STEP7_MSL_LOG="$APP_SUPPORT_DIR/runtime/logs/msl.log"
 
 run_test "step7 diagnostic log dir exists" test -d "$STEP7_LOG_DIR"
 run_test "step7 init log exists" test -f "$STEP7_LOG_DIR/init.log"
 run_test "step7 kernel log exists" test -f "$STEP7_LOG_DIR/kernel.log"
-run_test "step7 daemon has runtime_target_resolved" grep -q "runtime_target_resolved" "$STEP7_DAEMON_LOG"
-run_test "step7 daemon has kernel_profile_resolved" grep -q "kernel_profile_resolved" "$STEP7_DAEMON_LOG"
-run_test "step7 daemon has init_handshake" grep -q "init_handshake_" "$STEP7_DAEMON_LOG"
+run_test "step7 msl log has runtime_target_resolved" grep -q "runtime_target_resolved" "$STEP7_MSL_LOG"
+run_test "step7 msl log has daemon_ready" grep -q "daemon_ready" "$STEP7_MSL_LOG"
+run_test "step7 msl log has kernel_profile_resolved" grep -q "kernel_profile_resolved" "$STEP7_MSL_LOG"
 
-# I2: mismatch guidance when a different instance is requested against running daemon.
+# Current runtime supports parallel multi-instance runs.
 if [ -n "$STEP7_SECOND_INSTANCE" ]; then
-  run_test_expect_fail_output "step7 instance mismatch guidance" "run \`msl --stop\` before switching" \
-    "$MSL" --instance "$STEP7_SECOND_INSTANCE" run --timeout 5 true
+  run_test_output "step7 multi-instance parallel run" "Linux" \
+    "$MSL" --instance "$STEP7_SECOND_INSTANCE" run --timeout 5 uname -s
 else
-  skip_test "step7 instance mismatch guidance" "requires 2 instances"
+  skip_test "step7 multi-instance parallel run" "requires 2 instances"
 fi
 
-run_test "step7 stop after live checks" "$MSL" --stop
+run_test "step7 stop after live checks" "$MSL" stop --all

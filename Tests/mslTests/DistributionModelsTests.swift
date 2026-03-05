@@ -183,12 +183,20 @@ final class DistributionModelsTests: XCTestCase {
             keyFingerprint: "DEADBEEF",
             supportState: .supported,
             userConvergenceTemplate: nil,
-            cacheSharingDefaults: CacheSharingConfig(enabled: true, apt: true, apk: false)
+            cacheSharingDefaults: CacheSharingConfig(enabled: true, apt: true, apk: false),
+            vulnerabilityDBTarget: DistributionManifestEntry.VulnerabilityDBTarget(
+                family: "ubuntu",
+                release: "24.04",
+                dictionary: "goval"
+            )
         )
         let data = try JSONEncoder().encode(entry)
         let decoded = try JSONDecoder().decode(DistributionManifestEntry.self, from: data)
         XCTAssertEqual(decoded.cacheSharingDefaults?.enabled, true)
         XCTAssertEqual(decoded.cacheSharingDefaults?.apt, true)
         XCTAssertEqual(decoded.cacheSharingDefaults?.apk, false)
+        XCTAssertEqual(decoded.vulnerabilityDBTarget?.family, "ubuntu")
+        XCTAssertEqual(decoded.vulnerabilityDBTarget?.release, "24.04")
+        XCTAssertEqual(decoded.vulnerabilityDBTarget?.dictionary, "goval")
     }
 }

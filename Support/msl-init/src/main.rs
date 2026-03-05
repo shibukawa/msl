@@ -1654,6 +1654,7 @@ fn handle_request_line(line: &str) -> String {
             }
         }
         "host_share_prepare" => host_share_prepare_response(&request_id, &op, line),
+        "init_refresh" => init_refresh_response(&request_id, &op, line),
         "pty_open" => pty_open_response(&request_id, &op, line),
         "pty_read" => pty_read_response(&request_id, &op, line),
         "pty_write" => pty_write_response(&request_id, &op, line),
@@ -1948,6 +1949,75 @@ fn host_share_prepare_response(request_id: &str, op: &str, line: &str) -> String
             escape_json(&source_root),
             escape_json(&target_root)
         )),
+    )
+}
+
+fn init_refresh_response(request_id: &str, op: &str, line: &str) -> String {
+    let source_path = match extract_string(line, "initSourcePath")
+        .and_then(|value| normalize_absolute_path(&value))
+    {
+        Some(path) => path,
+        None => return error_response(request_id, op, "invalid_request", "initSourcePath is required"),
+    };
+    let dry_run = extract_bool(line, "initDryRun").unwrap_or(false);
+    let source = Path::new(&source_path);
+    if !source.is_file() {
+        return error_response(request_id, op, "invalid_request", "initSourcePath is not a readable file");
+    }
+
+    let destination = Path::new("/usr/local/bin/msl-init");
+    let same_binary = if destination.exists() {
+        match (fs::read(source), fs::read(destination)) {
+            (Ok(src), Ok(dst)) => src == dst,
+            _ => false,
+        }
+    } else {
+        false
+    };
+
+    if same_binary {
+        return ok_response(
+            request_id,
+            op,
+            Some("\"meta\":{\"status\":\"skipped\"}".to_string()),
+        );
+    }
+
+    if dry_run {
+        return ok_response(
+            request_id,
+            op,
+            Some("\"meta\":{\"status\":\"would_update\"}".to_string()),
+        );
+    }
+
+    if let Err(err) = fs::create_dir_all("/usr/local/bin") {
+        return error_response(request_id, op, "internal_error", &format!("create_dir_all failed: {}", err));
+    }
+
+    let tmp_path = format!("/usr/local/bin/.msl-init.tmp.{}", std::process::id());
+    if let Err(err) = fs::copy(source, &tmp_path) {
+        return error_response(request_id, op, "internal_error", &format!("copy failed: {}", err));
+    }
+    if let Err(err) = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o755)) {
+        let _ = fs::remove_file(&tmp_path);
+        return error_response(request_id, op, "internal_error", &format!("chmod failed: {}", err));
+    }
+    if let Err(err) = fs::rename(&tmp_path, destination) {
+        let _ = fs::remove_file(&tmp_path);
+        return error_response(request_id, op, "internal_error", &format!("rename failed: {}", err));
+    }
+
+    let msl_link = Path::new("/usr/local/bin/msl");
+    let _ = fs::remove_file(msl_link);
+    if let Err(err) = symlink("msl-init", msl_link) {
+        return error_response(request_id, op, "internal_error", &format!("symlink failed: {}", err));
+    }
+
+    ok_response(
+        request_id,
+        op,
+        Some("\"meta\":{\"status\":\"updated\"}".to_string()),
     )
 }
 
