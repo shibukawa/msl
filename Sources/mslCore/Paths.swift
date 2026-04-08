@@ -108,6 +108,14 @@ public struct MSLPaths {
         distroDirectory(named: name).appendingPathComponent("source.json", isDirectory: false)
     }
 
+    public func distroTmpDirectory(named name: String) -> URL {
+        distroDirectory(named: name).appendingPathComponent("tmp", isDirectory: true)
+    }
+
+    public func distroEphemeralTmpDiskFile(named name: String) -> URL {
+        distroTmpDirectory(named: name).appendingPathComponent("ephemeral-tmp.raw", isDirectory: false)
+    }
+
     public func distroCloudInitDirectory(named name: String) -> URL {
         distroDirectory(named: name).appendingPathComponent("cloud-init", isDirectory: true)
     }

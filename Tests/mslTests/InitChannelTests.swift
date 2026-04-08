@@ -1,4 +1,5 @@
 import XCTest
+import Darwin
 @testable import mslCore
 
 final class InitChannelTests: XCTestCase {
@@ -117,6 +118,84 @@ final class InitChannelTests: XCTestCase {
         XCTAssertEqual(decoded.meta?["version"], "1")
     }
 
+    func testPtyResizeResponseDecodesStringMetaFields() throws {
+        let response = InitChannelResponse(
+            requestId: "req-pty-resize-1",
+            op: "pty_resize",
+            status: "ok",
+            meta: ["rows": "27", "cols": "120"]
+        )
+        let raw = try JSONEncoder().encode(response)
+
+        let client = InitChannelClient(socketPath: "/tmp/does-not-exist.sock")
+        let decoded = try client.decode(raw)
+        XCTAssertTrue(decoded.ok)
+        XCTAssertEqual(decoded.op, "pty_resize")
+        XCTAssertEqual(decoded.meta?["rows"], "27")
+        XCTAssertEqual(decoded.meta?["cols"], "120")
+    }
+
+    func testJSONRPCFrameRoundTrip() throws {
+        let client = InitChannelClient(socketPath: "/tmp/does-not-exist.sock")
+        let request = InitChannelRequest(op: "ping")
+
+        let frame = try client.makeJSONRPCRequestFrame(request)
+        let decodedFrame = try client.decodeFrame(frame)
+        XCTAssertEqual(decodedFrame.opcode, .jsonRPCRequest)
+        XCTAssertTrue(decodedFrame.header.isEmpty)
+
+        let decodedRequest = try JSONDecoder().decode(InitChannelRequest.self, from: decodedFrame.payload)
+        XCTAssertEqual(decodedRequest.requestId, request.requestId)
+        XCTAssertEqual(decodedRequest.op, "ping")
+    }
+
+    func testProcRequestEncodeDecodeRoundTrip() throws {
+        let client = InitChannelClient(socketPath: "/tmp/does-not-exist.sock")
+        let request = InitChannelRequest(
+            op: "proc_write",
+            timeoutMs: 250,
+            procId: "proc-1",
+            dataBase64: "dW5hbWUgLW0K"
+        )
+
+        let encoded = try client.encode(request)
+        let decoded = try JSONDecoder().decode(InitChannelRequest.self, from: encoded)
+        XCTAssertEqual(decoded.op, "proc_write")
+        XCTAssertEqual(decoded.procId, "proc-1")
+        XCTAssertEqual(decoded.dataBase64, "dW5hbWUgLW0K")
+        XCTAssertEqual(decoded.timeoutMs, 250)
+    }
+
+    func testProcResponseDecodeRoundTrip() throws {
+        let response = InitChannelResponse(
+            requestId: "req-proc-1",
+            op: "proc_read",
+            status: "ok",
+            exitCode: 0,
+            procId: "proc-1",
+            stdoutBase64: "eDg2XzY0Cg==",
+            stderrBase64: "",
+            chunks: [
+                InitChannelStreamChunk(stream: "stdout", dataBase64: "Zm9v"),
+                InitChannelStreamChunk(stream: "stderr", dataBase64: "YmFy")
+            ]
+        )
+        let encoded = try JSONEncoder().encode(response)
+
+        let client = InitChannelClient(socketPath: "/tmp/does-not-exist.sock")
+        let decoded = try client.decode(encoded)
+        XCTAssertTrue(decoded.ok)
+        XCTAssertEqual(decoded.procId, "proc-1")
+        XCTAssertEqual(decoded.stdoutBase64, "eDg2XzY0Cg==")
+        XCTAssertEqual(decoded.stderrBase64, "")
+        XCTAssertEqual(decoded.exitCode, 0)
+        XCTAssertEqual(decoded.chunks?.count, 2)
+        XCTAssertEqual(decoded.chunks?.first?.stream, "stdout")
+        XCTAssertEqual(decoded.chunks?.first?.dataBase64, "Zm9v")
+        XCTAssertEqual(decoded.chunks?.last?.stream, "stderr")
+        XCTAssertEqual(decoded.chunks?.last?.dataBase64, "YmFy")
+    }
+
     func testSendFallsBackToFileHandoff() throws {
         let root = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("msl-init-handoff-tests-\(UUID().uuidString)", isDirectory: true)
@@ -146,7 +225,10 @@ final class InitChannelTests: XCTestCase {
                 status: "ok",
                 meta: ["server": "test"]
             )
-            if let data = try? JSONEncoder().encode(response) {
+            if
+                let payload = try? JSONEncoder().encode(response),
+                let data = try? client.encodeFrame(opcode: .jsonRPCResponse, header: Data(), payload: payload)
+            {
                 try? data.write(to: ack, options: .atomic)
             }
         }
@@ -171,5 +253,70 @@ final class InitChannelTests: XCTestCase {
             }
             XCTAssertTrue(runtime.message.contains("/tmp/msl-init-no-such.sock"))
         }
+    }
+
+    func testProcWriteReusesPersistentSidebandConnection() throws {
+        var fds: [Int32] = [0, 0]
+        XCTAssertEqual(socketpair(AF_UNIX, SOCK_STREAM, 0, &fds), 0)
+        defer {
+            _ = close(fds[0])
+            _ = close(fds[1])
+        }
+
+        let serverFD = fds[1]
+        let serverReady = expectation(description: "server processed proc_write requests")
+        DispatchQueue.global().async {
+            let helper = InitChannelClient(socketPath: "/tmp/does-not-exist.sock")
+            defer { serverReady.fulfill() }
+            do {
+                for _ in 0..<2 {
+                    let frame = try helper.readFrameForTest(from: serverFD, op: "proc_write")
+                    let decoded = try helper.decodeFrame(frame)
+                    XCTAssertEqual(decoded.opcode, .procWriteRequest)
+                    let requestHeader = try JSONSerialization.jsonObject(with: decoded.header) as? [String: Any]
+                    let requestId = requestHeader?["requestId"] as? String ?? ""
+                    let procId = requestHeader?["procId"] as? String ?? ""
+                    let header = """
+                    {"version":1,"requestId":"\(requestId)","op":"proc_write","status":"ok","procId":"\(procId)"}
+                    """
+                    let response = try helper.encodeFrame(
+                        opcode: .procWriteResponse,
+                        header: Data(header.utf8),
+                        payload: Data()
+                    )
+                    response.withUnsafeBytes { raw in
+                        guard let base = raw.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
+                        var offset = 0
+                        while offset < raw.count {
+                            let written = write(serverFD, base.advanced(by: offset), raw.count - offset)
+                            XCTAssertGreaterThanOrEqual(written, 0)
+                            offset += written
+                        }
+                    }
+                }
+            } catch {
+                XCTFail("server side failed: \(error)")
+            }
+        }
+
+        var connectorCalls = 0
+        let client = InitChannelClient(
+            socketPath: "/tmp/does-not-exist.sock",
+            sidebandConnector: {
+                connectorCalls += 1
+                return (fds[0], nil)
+            },
+            sidebandSupported: true,
+            allowSocketFallback: false,
+            allowStreamingOnVsock: true
+        )
+
+        let response1 = try client.procWrite(procId: "proc-1", data: Data("hello".utf8), timeoutMs: 1000)
+        let response2 = try client.procWrite(procId: "proc-1", data: Data("world".utf8), timeoutMs: 1000)
+
+        XCTAssertTrue(response1.ok)
+        XCTAssertTrue(response2.ok)
+        XCTAssertEqual(connectorCalls, 1)
+        wait(for: [serverReady], timeout: 2)
     }
 }

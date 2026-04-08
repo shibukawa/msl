@@ -401,7 +401,8 @@ final class DistributionManager {
             workspacePolicy: initialWorkspacePolicy(),
             compressionPolicy: compressionPolicy,
             networkPolicy: initialNetworkPolicy(),
-            cacheSharing: initialCacheSharing
+            cacheSharing: initialCacheSharing,
+            tmpStorage: DistributionInstanceMetadata.defaultTmpStoragePolicy(forNewInstanceNamed: name)
         )
         try writeJSON(sourceRecord, to: sourceFile)
         try writeJSON(metadata, to: metadataFile)
@@ -545,7 +546,8 @@ final class DistributionManager {
                 workspacePolicy: initialWorkspacePolicy(),
                 compressionPolicy: compressionPolicy,
                 networkPolicy: initialNetworkPolicy(),
-                cacheSharing: initialCacheSharing
+                cacheSharing: initialCacheSharing,
+                tmpStorage: DistributionInstanceMetadata.defaultTmpStoragePolicy(forNewInstanceNamed: name)
             )
             try writeJSON(sourceRecord, to: sourceFile)
             try writeJSON(metadata, to: metadataFile)
@@ -654,7 +656,8 @@ final class DistributionManager {
             workspacePolicy: initialWorkspacePolicy(),
             compressionPolicy: compressionPolicy,
             networkPolicy: initialNetworkPolicy(),
-            cacheSharing: initialCacheSharing
+            cacheSharing: initialCacheSharing,
+            tmpStorage: DistributionInstanceMetadata.defaultTmpStoragePolicy(forNewInstanceNamed: name)
         )
         try writeJSON(sourceRecord, to: sourceFile)
         try writeJSON(metadata, to: metadataFile)
@@ -712,10 +715,30 @@ final class DistributionManager {
                     "init_mode": manifestDefaultMode
                 ])
             }
+            let validatedTmpStorage = try metadata.resolveValidatedTmpStoragePolicy(
+                applyEnvironmentOverride: false
+            )
+            if let existing = metadata.tmpStorage {
+                if existing.mode != validatedTmpStorage.mode ||
+                    existing.sizeMiB != validatedTmpStorage.sizeMiB ||
+                    existing.resetOnStop != validatedTmpStorage.resetOnStop {
+                    metadata.tmpStorage = validatedTmpStorage
+                    didMutate = true
+                    logger.log("tmp_storage_policy_normalized", fields: [
+                        "instance": metadata.name,
+                        "metadata": metadataURL.path,
+                        "mode": validatedTmpStorage.mode,
+                        "size_mib": String(validatedTmpStorage.sizeMiB),
+                        "reset_on_stop": validatedTmpStorage.resetOnStop ? "true" : "false"
+                    ])
+                }
+            }
             if didMutate {
                 try writeJSON(metadata, to: metadataURL)
             }
             return metadata
+        } catch let error as MSLRuntimeError {
+            throw error
         } catch {
             logger.log("metadata_rebuild_started", fields: [
                 "metadata": metadataURL.path,
@@ -1234,11 +1257,15 @@ final class DistributionManager {
         return "_imagewriter"
     }
 
+    static func imagewriterStopArguments(instanceName: String) -> [String] {
+        ["--instance", instanceName, "stop"]
+    }
+
     private func stopImagewriterInstance(mslExecutablePath: String, instanceName: String) {
         do {
             let result = try process.run(
                 mslExecutablePath,
-                ["--instance", instanceName, "--stop"],
+                Self.imagewriterStopArguments(instanceName: instanceName),
                 captureOutput: true,
                 environment: [:]
             )
@@ -1359,7 +1386,8 @@ final class DistributionManager {
             networkPolicy: initialNetworkPolicy(),
             cacheSharing: defaultCacheSharingPolicy(
                 distroFamily: sourceRecord.distro ?? inferDistroFamily(from: sourceRecord.manifestId)
-            )
+            ),
+            tmpStorage: nil
         )
         try writeJSON(metadata, to: metadataURL)
         return metadata
@@ -1801,6 +1829,15 @@ final class DistributionManager {
             try fileManager.removeItem(at: guestMSL)
         }
         try fileManager.createSymbolicLink(atPath: guestMSL.path, withDestinationPath: "msl-init")
+        let guestCode = rootfsDir.appendingPathComponent("usr/local/bin/code", isDirectory: false)
+        if fileManager.fileExists(atPath: guestCode.path) {
+            try fileManager.removeItem(at: guestCode)
+        }
+        do {
+            try fileManager.linkItem(at: destinations[1], to: guestCode)
+        } catch {
+            try fileManager.createSymbolicLink(atPath: guestCode.path, withDestinationPath: "msl-init")
+        }
         try normalizeRootFstabForVirtualDisk(rootfsDir: rootfsDir)
 
         guard let runtimeProfile,
@@ -1995,7 +2032,7 @@ final class DistributionManager {
         logger.log("guest_fstab_root_source_normalized", fields: [
             "path": fstab.path,
             "from": normalized.originalRootSource ?? "unknown",
-            "to": "/dev/vda"
+            "to": "/dev/vda (nodiscard)"
         ])
     }
 
@@ -2030,7 +2067,7 @@ final class DistributionManager {
                     originalRootSource = parts[0]
                 }
                 if !normalizedRootWritten {
-                    let normalizedRoot = "/dev/vda\t/\tauto\tdefaults\t0\t1"
+                    let normalizedRoot = "/dev/vda\t/\tauto\tdefaults,nodiscard\t0\t1"
                     let rebuilt = parts.joined(separator: "\t")
                     if rebuilt != normalizedRoot || !tail.isEmpty {
                         changed = true

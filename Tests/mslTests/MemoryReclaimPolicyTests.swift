@@ -162,4 +162,25 @@ final class MemoryReclaimPolicyTests: XCTestCase {
         """
         XCTAssertEqual(MemoryReclaimPolicyResolver.parseCacheUsageKB(meminfo), 970_000)
     }
+
+    func testBackgroundMaintenanceSuspendsForActiveSessions() {
+        XCTAssertTrue(MemoryReclaimPolicyResolver.shouldSuspendBackgroundMaintenance(
+            activeSessionCount: 1,
+            nowMs: 100_000,
+            lastGuestActivityEpochMs: 0
+        ))
+    }
+
+    func testBackgroundMaintenanceSuspendsForRecentGuestActivity() {
+        XCTAssertTrue(MemoryReclaimPolicyResolver.shouldSuspendBackgroundMaintenance(
+            activeSessionCount: 0,
+            nowMs: 100_000,
+            lastGuestActivityEpochMs: 90_001
+        ))
+        XCTAssertFalse(MemoryReclaimPolicyResolver.shouldSuspendBackgroundMaintenance(
+            activeSessionCount: 0,
+            nowMs: 100_000,
+            lastGuestActivityEpochMs: 80_000
+        ))
+    }
 }

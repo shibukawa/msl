@@ -1,9 +1,224 @@
 import Foundation
 import Darwin
 
+struct AttachedCodeOpenRequest: Equatable {
+    let targetPath: String
+
+    static func parse(_ raw: String) -> AttachedCodeOpenRequest? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasPrefix("OPEN:") else { return nil }
+        let payload = String(trimmed.dropFirst("OPEN:".count))
+        guard !payload.isEmpty else { return nil }
+        guard payload.hasPrefix("/") else { return nil }
+        guard payload.utf8.count <= 4096 else { return nil }
+        guard !payload.contains("\u{0000}") else { return nil }
+        guard payload.unicodeScalars.allSatisfy({ $0.value >= 0x20 || $0.value == 0x09 }) else { return nil }
+        guard isAllowedGuestPath(payload) else { return nil }
+        return AttachedCodeOpenRequest(targetPath: payload)
+    }
+
+    private static func isAllowedGuestPath(_ path: String) -> Bool {
+        let prefixes = ["/home", "/mnt/macos", "/mnt/msl"]
+        for prefix in prefixes {
+            if path == prefix || path.hasPrefix(prefix + "/") {
+                return true
+            }
+        }
+        return false
+    }
+}
+
+enum AttachedOpenForwardError: Error {
+    case codeCLINotFound
+    case codeCommandFailed(exitCode: Int32)
+    case processLaunchFailed(String)
+
+    var reasonCode: String {
+        switch self {
+        case .codeCLINotFound:
+            return "code_cli_not_found"
+        case .codeCommandFailed:
+            return "code_command_failed"
+        case .processLaunchFailed:
+            return "process_launch_failed"
+        }
+    }
+}
+
+struct AttachedContainerRemoteAuthorityConfig: Codable {
+    var containerName: String
+    var settings: [String: String]?
+}
+
+struct AttachedOpenLaunchTarget: Equatable {
+    var instanceName: String
+    var vmID: String
+    var socketPath: String
+}
+
+func resolveAttachedOpenInstanceName(
+    sourceInstance: String?,
+    currentRuntimeInstanceName: String
+) -> String {
+    let trimmed = sourceInstance?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    return trimmed.isEmpty ? currentRuntimeInstanceName : trimmed
+}
+
+func resolveAttachedOpenLaunchTarget(
+    sourceInstance: String?,
+    currentRuntimeInstanceName: String
+) -> AttachedOpenLaunchTarget {
+    let instanceName = resolveAttachedOpenInstanceName(
+        sourceInstance: sourceInstance,
+        currentRuntimeInstanceName: currentRuntimeInstanceName
+    )
+    return AttachedOpenLaunchTarget(
+        instanceName: instanceName,
+        vmID: AttachedContainerIdentity.vmID(forInstance: instanceName),
+        socketPath: AttachedContainerIdentity.socketPath(forInstance: instanceName)
+    )
+}
+
+func buildAttachedContainerAuthorityString(
+    vmID: String,
+    socketPath: String
+) throws -> String {
+    let containerName = vmID.hasPrefix("/") ? vmID : "/\(vmID)"
+    let payload = AttachedContainerRemoteAuthorityConfig(
+        containerName: containerName,
+        settings: ["host": "unix://\(socketPath)"]
+    )
+    let json = try JSONEncoder().encode(payload)
+    let hex = json.map { String(format: "%02x", $0) }.joined()
+    return "attached-container+\(hex)"
+}
+
 /// VMオーナーデーモンプロセス。VM の起動・保持、vsock 管理、
 /// control socket でCLI からのリクエストを受け付ける。
 public final class DaemonServer {
+    private enum HostProcEvent {
+        case stdout(Data)
+        case stderr(Data)
+        case exited(Int32, String?)
+        case streamsClosed
+        case failed(String)
+    }
+
+    private enum HostPtyEvent {
+        case output(Data)
+        case exited(Int32, String?)
+        case streamsClosed
+        case failed(String)
+    }
+
+    private final class HostProcEventBuffer {
+        private let condition = NSCondition()
+        private var events: [HostProcEvent] = []
+        private var exitCode: Int32?
+        private var exitReason: String?
+        private var streamsClosed = false
+        private var failure: String?
+
+        func push(_ event: HostProcEvent) {
+            condition.lock()
+            switch event {
+            case .exited(let code, let reason):
+                exitCode = code
+                exitReason = reason
+            case .streamsClosed:
+                streamsClosed = true
+            case .failed(let message):
+                failure = message
+            default:
+                break
+            }
+            events.append(event)
+            condition.broadcast()
+            condition.unlock()
+        }
+
+        func collect(timeoutMs: Int) -> (events: [HostProcEvent], exitCode: Int32?, exitReason: String?, finalize: Bool, failure: String?) {
+            condition.lock()
+            defer { condition.unlock() }
+
+            if events.isEmpty && failure == nil && !(streamsClosed && exitCode != nil) {
+                if timeoutMs > 0 {
+                    _ = condition.wait(until: Date().addingTimeInterval(TimeInterval(timeoutMs) / 1000.0))
+                } else {
+                    condition.wait()
+                }
+            }
+
+            let drained = events
+            events.removeAll(keepingCapacity: true)
+            let finalize = streamsClosed && exitCode != nil && events.isEmpty
+            return (drained, exitCode, exitReason, finalize, failure)
+        }
+    }
+
+    private final class HostPtyEventBuffer {
+        private let condition = NSCondition()
+        private var events: [HostPtyEvent] = []
+        private var exitCode: Int32?
+        private var exitReason: String?
+        private var streamsClosed = false
+        private var failure: String?
+
+        func push(_ event: HostPtyEvent) {
+            condition.lock()
+            switch event {
+            case .exited(let code, let reason):
+                exitCode = code
+                exitReason = reason
+            case .streamsClosed:
+                streamsClosed = true
+            case .failed(let message):
+                failure = message
+            default:
+                break
+            }
+            events.append(event)
+            condition.broadcast()
+            condition.unlock()
+        }
+
+        func collect(timeoutMs: Int, maxBytes: Int) -> (payload: Data, exitCode: Int32?, exitReason: String?, finalize: Bool, failure: String?) {
+            condition.lock()
+            defer { condition.unlock() }
+
+            if events.isEmpty && failure == nil && !(streamsClosed && exitCode != nil) {
+                if timeoutMs > 0 {
+                    _ = condition.wait(until: Date().addingTimeInterval(TimeInterval(timeoutMs) / 1000.0))
+                } else {
+                    condition.wait()
+                }
+            }
+
+            var payload = Data()
+            var drainedCount = 0
+            for event in events {
+                switch event {
+                case .output(let data):
+                    if payload.count + data.count > maxBytes && !payload.isEmpty {
+                        break
+                    }
+                    payload.append(data)
+                    drainedCount += 1
+                case .exited, .streamsClosed, .failed:
+                    drainedCount += 1
+                }
+                if payload.count >= maxBytes {
+                    break
+                }
+            }
+            if drainedCount > 0 {
+                events.removeFirst(drainedCount)
+            }
+            let finalize = streamsClosed && exitCode != nil && events.isEmpty
+            return (payload, exitCode, exitReason, finalize, failure)
+        }
+    }
+
     private struct ConvergedRuntimeUserResult {
         var runtimeUser: RuntimeUserState
         var adminGroup: String
@@ -22,12 +237,18 @@ public final class DaemonServer {
     private let instanceRegistry = InstanceRuntimeRegistry()
     private let launchOriginTracker = LaunchOriginTracker()
     private let logRouter: RuntimeLogRouter
+    private let sessionEventLock = NSLock()
+    private var procEventBuffers: [String: HostProcEventBuffer] = [:]
+    private var ptyEventBuffers: [String: HostPtyEventBuffer] = [:]
+    private var procSubscriptionSources: [String: DispatchSourceRead] = [:]
+    private var ptySubscriptionSources: [String: DispatchSourceRead] = [:]
     private var activeInstanceName: String?
 
     private var initClient: InitChannelClient?
     private var vmRunner: VirtualMachineRunner?
     private var controlServer: RuntimeControlServer?
     private var eventBus: DaemonEventBus?
+    private var attachedContainerDaemons: [String: AttachedContainerDaemon] = [:]
     private var forwarder: PortForwardingManager?
     private var runtimeMetadataURL: URL?
     private let dnsStateLock = NSLock()
@@ -41,9 +262,11 @@ public final class DaemonServer {
         "search_domain_count": "0",
         "last_reconcile_epoch_ms": "0"
     ]
-    private let dnsMonitorQueue = DispatchQueue(label: "msl.daemon.dns-monitor")
+    private let housekeepingQueue = DispatchQueue(label: "msl.daemon.housekeeping")
     private var dnsMonitorTimer: DispatchSourceTimer?
     private var lastHostResolverSnapshotHash: String?
+    private var backgroundDNSReconcileRunning = false
+    private var backgroundDNSReconcilePendingSource: String?
 
     private let stopSemaphore = DispatchSemaphore(value: 0)
     private var idleTimerSources: [String: DispatchSourceTimer] = [:]
@@ -61,12 +284,140 @@ public final class DaemonServer {
     private var lastHostPressureReclaimEpochMs: Int64?
     private var lastCacheCapReclaimEpochMs: Int64?
     private var cacheOverCapActive: Bool = false
-    private let autoPortQueue = DispatchQueue(label: "msl.daemon.port-auto")
     private var autoPortTimer: DispatchSourceTimer?
     private let portMappingsSnapshotLock = NSLock()
     private var effectivePortMappingsSnapshot: EffectivePortMappings = .empty
     private var autoPortErrorsByHostPort: [Int: String] = [:]
+    private var autoPortNextAllowedEpochMs: Int64 = 0
     private var cacheShareEnvAdditions: [String: String] = [:]
+    private let autoImageCompactThresholdBytes: Int64
+    private let autoImageCompactThresholdPercent: Double
+    private let autoImageCompactCooldownMs: Int64
+    private static let readInitVersionScript = """
+    if [ -x /usr/local/bin/msl-init ]; then
+      /usr/local/bin/msl-init version 2>/dev/null || /usr/local/bin/msl-init --version 2>/dev/null || sha256sum /usr/local/bin/msl-init 2>/dev/null | awk '{print $1}'
+    fi
+    """
+    private static let autoRefreshInitScript = """
+    set -eu
+    src="$1"
+    dst="/usr/local/bin/msl-init"
+    tmp="/usr/local/bin/.msl-init.tmp.$$"
+    if [ ! -f "$src" ]; then
+      echo "source_missing" >&2
+      exit 20
+    fi
+    mkdir -p /usr/local/bin
+    if [ -f "$dst" ] && cmp -s "$src" "$dst"; then
+      printf "skipped"
+      exit 0
+    fi
+    cp "$src" "$tmp"
+    chmod 0755 "$tmp"
+    mv "$tmp" "$dst"
+    ln -sf /usr/local/bin/msl-init /usr/local/bin/msl
+    ln -sf /usr/local/bin/msl-init /usr/local/bin/code
+    printf "updated"
+    """
+    private static let autoTrimScript = """
+    set -eu
+    if ! command -v fstrim >/dev/null 2>&1; then
+      echo "fstrim_missing" >&2
+      exit 127
+    fi
+    fstrim -av >/dev/null 2>&1 || fstrim -a >/dev/null 2>&1
+    """
+    private static let inspectSnapshotScript = """
+    set -eu
+    if command -v du >/dev/null 2>&1; then
+      apparent_kib="$(du -sx --apparent-size / 2>/dev/null | awk '{print $1}' || true)"
+      actual_kib="$(du -sx / 2>/dev/null | awk '{print $1}' || true)"
+      case "$apparent_kib" in ''|*[!0-9]*) apparent_kib='' ;; esac
+      case "$actual_kib" in ''|*[!0-9]*) actual_kib='' ;; esac
+      if [ -n "$apparent_kib" ]; then
+        echo "du_apparent_bytes=$((apparent_kib * 1024))"
+      fi
+      if [ -n "$actual_kib" ]; then
+        echo "du_actual_bytes=$((actual_kib * 1024))"
+      fi
+    fi
+    """
+    private static let tmpStoragePrepareScript = """
+    set -eu
+    label="$1"
+    phase="resolve"
+    root_src="$(findmnt -n -o SOURCE / 2>/dev/null || true)"
+    is_device_mounted() {
+      dev="$1"
+      awk -v d="$dev" '$1 == d { found=1 } END { exit(found ? 0 : 1) }' /proc/mounts
+    }
+    dev="$(blkid -L "$label" 2>/dev/null || true)"
+    if [ -z "$dev" ]; then
+      dev="$(blkid -t LABEL="$label" -o device 2>/dev/null | head -n1 || true)"
+    fi
+    if [ -z "$dev" ]; then
+      for cand in /dev/vd[b-z] /dev/sd[b-z] /dev/xvd[b-z]; do
+        [ -b "$cand" ] || continue
+        [ -n "$root_src" ] && [ "$cand" = "$root_src" ] && continue
+        if is_device_mounted "$cand"; then
+          continue
+        fi
+        dev="$cand"
+        break
+      done
+    fi
+    if [ -z "$dev" ]; then
+      echo "phase=resolve label=$label device_not_found" >&2
+      exit 41
+    fi
+    mkdir -p /run/msl/tmp
+    if mountpoint -q /run/msl/tmp; then
+      umount /run/msl/tmp >/dev/null 2>&1 || true
+    fi
+    phase="mkfs_check"
+    fstype="$(blkid -o value -s TYPE "$dev" 2>/dev/null || true)"
+    if [ "$fstype" != "ext4" ]; then
+      phase="mount_probe"
+      mount_error=""
+      probe_try=0
+      while [ "$probe_try" -lt 10 ]; do
+        if mount -t ext4 -o rw,nosuid,nodev "$dev" /run/msl/tmp >/tmp/msl-tmp-mount.out 2>/tmp/msl-tmp-mount.err; then
+          fstype="ext4"
+          break
+        fi
+        mount_error="$(cat /tmp/msl-tmp-mount.err 2>/dev/null || true)"
+        probe_try=$((probe_try + 1))
+        sleep 0.2
+      done
+      rm -f /tmp/msl-tmp-mount.out /tmp/msl-tmp-mount.err >/dev/null 2>&1 || true
+      if [ "$fstype" != "ext4" ]; then
+        phase="mkfs"
+        mkfs_cmd=""
+        if command -v mkfs.ext4 >/dev/null 2>&1; then
+          mkfs_cmd="mkfs.ext4"
+        elif command -v mke2fs >/dev/null 2>&1; then
+          mkfs_cmd="mke2fs"
+        else
+          echo "phase=mkfs mkfs_ext4_not_found mount_probe_error=${mount_error:-none}" >&2
+          exit 127
+        fi
+        "$mkfs_cmd" -q -F -L "$label" -E lazy_itable_init=1,lazy_journal_init=1 "$dev" >/dev/null
+      fi
+    fi
+    phase="mount"
+    if ! mountpoint -q /run/msl/tmp; then
+      mount -t ext4 -o rw,nosuid,nodev "$dev" /run/msl/tmp
+    fi
+    chmod 1777 /run/msl/tmp
+    phase="bind"
+    mkdir -p /tmp
+    if mountpoint -q /tmp; then
+      umount /tmp >/dev/null 2>&1 || true
+    fi
+    mount --bind /run/msl/tmp /tmp
+    chmod 1777 /tmp
+    echo "phase=done"
+    """
     private static let legacyHostSharePrepareScript = """
     set -eu
     share_root="$1"
@@ -115,7 +466,7 @@ public final class DaemonServer {
       printf "reused"
     fi
     """
-    private static let cacheSharePrepareScript = """
+    static let cacheSharePrepareScript = """
     set -eu
     cache_root="$1"; shift
     runtime_home="$1"; shift
@@ -141,9 +492,19 @@ public final class DaemonServer {
 
     applied=0
     fallback=0
+    fallback_reasons=""
 
     is_mount_target() {
       awk -v target="$1" '$5 == target { found=1 } END { exit(found ? 0 : 1) }' /proc/self/mountinfo
+    }
+
+    add_fallback_reason() {
+      reason="$1"
+      if [ -z "$fallback_reasons" ]; then
+        fallback_reasons="$reason"
+      else
+        fallback_reasons="$fallback_reasons,$reason"
+      fi
     }
 
     ensure_dir() {
@@ -169,15 +530,44 @@ public final class DaemonServer {
       return 1
     }
 
+    unmount_target() {
+      target="$1"
+      if umount "$target" 2>/dev/null; then
+        return 0
+      fi
+      if command -v sudo >/dev/null 2>&1; then
+        sudo -n umount "$target" 2>/dev/null && return 0
+      fi
+      return 1
+    }
+
+    ensure_writable_dir() {
+      dir="$1"
+      probe="$dir/.msl-write-test.$$"
+      if : > "$probe" 2>/dev/null; then
+        rm -f "$probe" 2>/dev/null || true
+        return 0
+      fi
+      if command -v sudo >/dev/null 2>&1; then
+        if sudo -n sh -c ': > "$1" && rm -f "$1"' sh "$probe" 2>/dev/null; then
+          return 0
+        fi
+      fi
+      return 1
+    }
+
     ensure_bind_mount() {
       src="$1"
       dst="$2"
+      reason="${3:-bind_mount_failed}"
       if [ ! -e "$src" ]; then
         fallback=$((fallback+1))
+        add_fallback_reason "$reason:source_missing"
         return 0
       fi
       if ! ensure_dir "$dst"; then
         fallback=$((fallback+1))
+        add_fallback_reason "$reason:target_unavailable"
         return 0
       fi
       if is_mount_target "$dst"; then
@@ -187,6 +577,7 @@ public final class DaemonServer {
         applied=1
       else
         fallback=$((fallback+1))
+        add_fallback_reason "$reason"
       fi
       return 0
     }
@@ -222,10 +613,18 @@ public final class DaemonServer {
     if [ "$enable_apt" = "1" ] && command -v apt-get >/dev/null 2>&1; then
       release_key="ubuntu-${version_id:-unknown}"
       archives_src="$cache_root/apt/$release_key/archives"
-      lists_src="$cache_root/apt/$release_key/lists"
-      mkdir -p "$archives_src/partial" "$lists_src/partial" 2>/dev/null || true
-      ensure_bind_mount "$archives_src" "/var/cache/apt/archives"
-      ensure_bind_mount "$lists_src" "/var/lib/apt/lists"
+      mkdir -p "$archives_src/partial" 2>/dev/null || true
+      ensure_bind_mount "$archives_src" "/var/cache/apt/archives" "apt_archives_bind_failed"
+      if is_mount_target "/var/cache/apt/archives"; then
+        if ! ensure_writable_dir "/var/cache/apt/archives/partial"; then
+          fallback=$((fallback+1))
+          if unmount_target "/var/cache/apt/archives"; then
+            add_fallback_reason "apt_archives_unwritable"
+          else
+            add_fallback_reason "apt_archives_unwritable_unmount_failed"
+          fi
+        fi
+      fi
     fi
 
     if [ "$enable_apk" = "1" ] && command -v apk >/dev/null 2>&1; then
@@ -326,12 +725,17 @@ public final class DaemonServer {
     fi
 
     status="reused"
-    if [ "$fallback" -gt 0 ]; then
+    if [ "$applied" -eq 1 ] && [ "$fallback" -gt 0 ]; then
       status="partial"
     elif [ "$applied" -eq 1 ]; then
       status="applied"
+    elif [ "$fallback" -gt 0 ]; then
+      status="fallback"
     fi
-    printf "%s" "$status"
+    printf "status=%s\n" "$status"
+    if [ -n "$fallback_reasons" ]; then
+      printf "reason=%s\n" "$fallback_reasons"
+    fi
     """
 
     public init(
@@ -359,12 +763,19 @@ public final class DaemonServer {
         self.logRouter = RuntimeLogRouter(paths: paths, fileManager: fileManager)
         self.executablePath = executablePath
         self.explicitInstanceName = explicitInstanceName?.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.autoImageCompactThresholdBytes = 0
+        self.autoImageCompactThresholdPercent = 0
+        self.autoImageCompactCooldownMs = 0
     }
 
     /// Main daemon entry point. Blocks until idle timeout or explicit stop.
     public func run() throws -> Never {
         logger.log("daemon_started", fields: ["pid": String(getpid())])
         let startupStartMs = daemonMonotonicMs()
+        let startupEpochMs = nowEpochMs()
+        let bootstrapInstanceName = explicitInstanceName ?? "default"
+
+        updateStateStarting(step: .daemonLaunch, instanceName: bootstrapInstanceName, startupEpochMs: startupEpochMs)
 
         // 1. Bootstrap
         let bootstrapStartMs = daemonMonotonicMs()
@@ -375,10 +786,13 @@ public final class DaemonServer {
             "phase": "bootstrap_total",
             "elapsed_ms": String(max(0, daemonMonotonicMs() - bootstrapStartMs))
         ])
-
+        updateStateStepCompleted(step: .daemonLaunch, instanceName: bootstrapInstanceName)
+        updateStateStarting(step: .startupRecovery, instanceName: bootstrapInstanceName)
         try performStartupRecovery()
+        updateStateStepCompleted(step: .startupRecovery, instanceName: bootstrapInstanceName)
 
         let metadataResolveStartMs = daemonMonotonicMs()
+        updateStateStarting(step: .runtimeMetadataResolve, instanceName: bootstrapInstanceName, startupEpochMs: startupEpochMs)
         let metadataURL = try resolveRuntimeMetadataURL(explicitInstanceName: explicitInstanceName)
         let instanceName = metadataURL.deletingLastPathComponent().lastPathComponent
         let instanceContext = instanceRegistry.context(for: instanceName)
@@ -413,8 +827,11 @@ public final class DaemonServer {
             "service_manager": bootProfile.serviceManager ?? "-",
             "source": bootProfile.profileSource
         ])
+        updateStateStepCompleted(step: .runtimeMetadataResolve, instanceName: instanceName)
+        updateStateStarting(step: .vmConfigurationBuild, instanceName: instanceName)
 
         // 2. Start VM and get init channel client
+        var activeBootStep: StartupStep = .vmConfigurationBuild
         let runner = VirtualMachineRunner(
             paths: paths,
             metadataURL: metadataURL,
@@ -422,6 +839,29 @@ public final class DaemonServer {
             logger: logger,
             initProbeHandler: { [weak self] probe in
                 self?.updateInitChannelState(probe)
+            },
+            codeOpenRequestHandler: { [weak self] payload in
+                self?.handleGuestCodeOpenPayload(payload, sourceInstance: instanceName)
+            },
+            backgroundMemoryMaintenanceAllowed: { [weak self] in
+                !(self?.isBackgroundMemoryMaintenanceSuspended(instanceName: instanceName) ?? false)
+            },
+            startupPhaseObserver: { [weak self] phase in
+                guard let self else { return }
+                switch phase {
+                case "vm_configuration_build":
+                    activeBootStep = .vmStart
+                    self.updateStateStepCompleted(step: .vmConfigurationBuild, instanceName: instanceName)
+                    self.updateStateStarting(step: .vmStart, instanceName: instanceName)
+                case "vm_start":
+                    activeBootStep = .initHandshakeWait
+                    self.updateStateStepCompleted(step: .vmStart, instanceName: instanceName)
+                    self.updateStateStarting(step: .initHandshakeWait, instanceName: instanceName)
+                case "init_handshake_wait":
+                    self.updateStateStepCompleted(step: .initHandshakeWait, instanceName: instanceName)
+                default:
+                    break
+                }
             }
         )
         self.vmRunner = runner
@@ -438,6 +878,23 @@ public final class DaemonServer {
             }
             client = resolvedClient
         } catch {
+            let bootFailureCode: String
+            switch activeBootStep {
+            case .vmConfigurationBuild:
+                bootFailureCode = "vm_configuration_build_failed"
+            case .vmStart:
+                bootFailureCode = "vm_start_failed"
+            case .initHandshakeWait:
+                bootFailureCode = "init_handshake_wait_failed"
+            default:
+                bootFailureCode = "vm_start_failed"
+            }
+            updateStateBootFailed(
+                step: activeBootStep,
+                instanceName: instanceName,
+                code: bootFailureCode,
+                message: String(describing: error)
+            )
             logger.log("daemon_vm_start_failed", fields: ["error": String(describing: error)])
             logRouter.logVM(
                 instance: instanceName,
@@ -452,20 +909,79 @@ public final class DaemonServer {
             )
             instanceContext.lifecycleState = .error
             instanceContext.lastError = String(describing: error)
-            updateStateStopped()
+            updateStateStopped(lastError: String(describing: error))
             Foundation.exit(1)
         }
         self.initClient = client
         instanceContext.initClient = client
+        if client.supportsDedicatedSideband {
+            instanceContext.initWriteClient = client.makeSidebandClient()
+            instanceContext.initReadClient = client.makeSidebandClient()
+            instanceContext.housekeepingClient = instanceContext.initReadClient?.makeSidebandClient()
+        } else {
+            instanceContext.initWriteClient = nil
+            instanceContext.initReadClient = nil
+            instanceContext.housekeepingClient = nil
+        }
 
+        logger.log("daemon_startup_step_started", fields: [
+            "instance": instanceName,
+            "step": "tmp_storage_prepare"
+        ])
+        do {
+            try prepareTmpStorageOnStartup(client: client, metadataURL: metadataURL, instanceName: instanceName)
+        } catch {
+            logger.log("daemon_vm_start_failed", fields: ["error": String(describing: error)])
+            logRouter.logVM(
+                instance: instanceName,
+                event: "daemon_instance_boot_failed",
+                fields: ["op": "tmp_storage_prepare", "result": "failed", "error": String(describing: error)]
+            )
+            publishInstanceStateEvent(
+                instance: instanceName,
+                state: "Error",
+                reason: "tmp_storage_prepare_failed",
+                error: String(describing: error)
+            )
+            instanceContext.lifecycleState = .error
+            instanceContext.lastError = String(describing: error)
+            runner.stopRunningVM()
+            updateStateStopped(lastError: String(describing: error))
+            Foundation.exit(1)
+        }
+        logger.log("daemon_startup_step_completed", fields: [
+            "instance": instanceName,
+            "step": "tmp_storage_prepare"
+        ])
+        logger.log("daemon_startup_step_started", fields: [
+            "instance": instanceName,
+            "step": "host_share_prepare"
+        ])
         prepareHostShareRootMountOnStartup(client: client)
+        logger.log("daemon_startup_step_completed", fields: [
+            "instance": instanceName,
+            "step": "host_share_prepare"
+        ])
+        logger.log("daemon_startup_step_started", fields: [
+            "instance": instanceName,
+            "step": "clock_sync"
+        ])
         syncGuestClockAtStartup(client: client, instanceName: instanceName)
+        logger.log("daemon_startup_step_completed", fields: [
+            "instance": instanceName,
+            "step": "clock_sync"
+        ])
         logger.log("startup_total_duration_ms", fields: [
             "elapsed_ms": String(max(0, daemonMonotonicMs() - startupStartMs)),
             "instance": instanceName
         ])
 
         // 3. Converge runtime user (Step9)
+        logger.log("daemon_startup_step_started", fields: [
+            "instance": instanceName,
+            "step": "user_converge"
+        ])
+        updateStateStarting(step: .userConverge, instanceName: instanceName)
         do {
             let firstBootPending = initialMetadata.bootstrap?.firstBootPending ?? true
             logger.log("su_bootstrap_started", fields: [
@@ -493,6 +1009,12 @@ public final class DaemonServer {
                 "gid": String(resolved.runtimeUser.gid)
             ])
         } catch {
+            updateStateBootFailed(
+                step: .userConverge,
+                instanceName: instanceName,
+                code: "user_converge_failed",
+                message: String(describing: error)
+            )
             logger.log("user_convergence_failed", fields: [
                 "instance": instanceName,
                 "metadata": metadataURL.path,
@@ -525,15 +1047,27 @@ public final class DaemonServer {
             updateStateStopped()
             Foundation.exit(1)
         }
+        updateStateStepCompleted(step: .userConverge, instanceName: instanceName)
+        logger.log("daemon_startup_step_completed", fields: [
+            "instance": instanceName,
+            "step": "user_converge"
+        ])
         configureMemoryReclaimPolicy()
         ensureGuestMSLCommandAlias(client: client)
-        let dnsStartup = handleDNSReconcile(RuntimeControlRequest(op: "dns_reconcile", dnsSource: "startup"))
-        if !dnsStartup.ok {
-            logger.log("dns_reconcile_failed", fields: [
-                "dns_source": "startup",
-                "error": dnsStartup.error ?? "unknown"
-            ])
-        }
+        logger.log("daemon_startup_step_started", fields: [
+            "instance": instanceName,
+            "step": "vscode_root_state"
+        ])
+        updateStateStarting(step: .vscodeRootState, instanceName: instanceName)
+        ensureRootVSCodeServerDirectories(client: client, instanceName: instanceName)
+        updateStateStepCompleted(step: .vscodeRootState, instanceName: instanceName)
+        logger.log("daemon_startup_step_completed", fields: [
+            "instance": instanceName,
+            "step": "vscode_root_state"
+        ])
+        updateStateStarting(step: .dnsReconcile, instanceName: instanceName)
+        scheduleBackgroundDNSReconcile(instanceName: instanceName, source: "startup")
+        updateStateStepCompleted(step: .dnsReconcile, instanceName: instanceName)
         startDNSMonitorLoop()
 
         // 4. Set up port forwarding
@@ -547,59 +1081,70 @@ public final class DaemonServer {
         // 5. Start control socket server
         let controlSocketPath = paths.runtimeControlSocketFile.path
         let eventSocketPath = paths.runtimeEventSocketFile.path
-        let server = RuntimeControlServer(socketPath: controlSocketPath) { [weak self] request in
-            self?.handleControlRequest(request) ?? RuntimeControlResponse(ok: false, error: "daemon unavailable")
-        }
+        let server = RuntimeControlServer(
+            socketPath: controlSocketPath,
+            handler: { [weak self] request in
+                self?.handleControlRequest(request) ?? RuntimeControlResponse(ok: false, error: "daemon unavailable")
+            },
+            streamHandler: { [weak self] request, fd in
+                self?.handleControlStreamRequest(request, fd: fd) ?? false
+            }
+        )
         self.controlServer = server
         let bus = DaemonEventBus(socketPath: eventSocketPath, logger: logger)
         self.eventBus = bus
-
         do {
+            updateStateStarting(step: .controlSocketStart, instanceName: instanceName)
             try server.start()
             logger.log("daemon_control_socket_started", fields: ["path": controlSocketPath])
+            updateStateStepCompleted(step: .controlSocketStart, instanceName: instanceName)
         } catch {
+            updateStateBootFailed(
+                step: .controlSocketStart,
+                instanceName: instanceName,
+                code: "control_socket_start_failed",
+                message: String(describing: error)
+            )
             logger.log("daemon_control_socket_failed", fields: ["error": String(describing: error)])
             runner.stopRunningVM()
             Foundation.exit(1)
         }
         do {
+            updateStateStarting(step: .eventSocketStart, instanceName: instanceName)
             try bus.start()
             logger.log("daemon_event_socket_started", fields: ["path": eventSocketPath])
+            updateStateStepCompleted(step: .eventSocketStart, instanceName: instanceName)
         } catch {
+            updateStateBootFailed(
+                step: .eventSocketStart,
+                instanceName: instanceName,
+                code: "event_socket_start_failed",
+                message: String(describing: error)
+            )
             logger.log("daemon_event_socket_failed", fields: ["error": String(describing: error)])
+            server.stop()
+            runner.stopRunningVM()
+            Foundation.exit(1)
+        }
+        do {
+            updateStateStarting(step: .attachedDaemonStart, instanceName: instanceName)
+            try ensureAttachedContainerDaemonStarted(instanceName: instanceName)
+            updateStateStepCompleted(step: .attachedDaemonStart, instanceName: instanceName)
+        } catch {
+            updateStateBootFailed(
+                step: .attachedDaemonStart,
+                instanceName: instanceName,
+                code: "attached_daemon_start_failed",
+                message: String(describing: error)
+            )
+            bus.stop()
             server.stop()
             runner.stopRunningVM()
             Foundation.exit(1)
         }
 
         // 6. Update state
-        try lock.withExclusiveLock {
-            var state = try store.loadState()
-            state.vmState = .running
-            state.distro = instanceName
-            state.lastTransitionEpochMs = nowEpochMs()
-            state.runtimeHostPid = Int32(getpid())
-            state.runtimeControlSocket = controlSocketPath
-            state.daemonHostPid = Int32(getpid())
-            state.daemonControlSocket = controlSocketPath
-            state.daemonEventSocket = eventSocketPath
-            state.activeSessionCount = 0
-            state.idleTimer = IdleTimerState(armed: false, deadlineEpochMs: nil)
-            state.runtimeUser = instanceContext.runtimeUser
-            upsertInstanceState(
-                &state,
-                instanceName: instanceName,
-                lifecycleState: .running,
-                activeSessionCount: 0,
-                idleTimer: state.idleTimer,
-                runtimeHostPid: state.runtimeHostPid,
-                runtimeControlSocket: state.runtimeControlSocket,
-                runtimeUser: instanceContext.runtimeUser,
-                initChannel: state.initChannel,
-                lastError: nil
-            )
-            try store.saveState(state)
-        }
+        updateStateRunning(instanceName: instanceName, controlSocketPath: controlSocketPath, eventSocketPath: eventSocketPath)
         instanceContext.lifecycleState = .running
         instanceContext.lastError = nil
         instanceContext.clearBootError()
@@ -626,6 +1171,24 @@ public final class DaemonServer {
     }
 
     private func performStartupRecovery() throws {
+        let targetInstanceName = explicitInstanceName
+            ?? (try? defaultInstanceStore.loadDefaultInstanceName())
+            ?? "default"
+        let otherDaemons = (try? DaemonClient.listDaemonProcesses())?.filter { process in
+            process.isDaemon
+                && process.pid != getpid()
+                && (targetInstanceName.isEmpty || process.instanceName == targetInstanceName)
+                && (kill(process.pid, 0) == 0 || errno == EPERM)
+        } ?? []
+        if let existingDaemon = otherDaemons.first {
+            logger.log("daemon_startup_recovery_existing_daemon_detected", fields: [
+                "instance": targetInstanceName,
+                "existing_pid": String(existingDaemon.pid),
+                "current_pid": String(getpid())
+            ])
+            throw MSLRuntimeError("daemon already running for instance \(targetInstanceName)")
+        }
+
         let staleSessions = try sessions.reconcile()
         if !staleSessions.isEmpty {
             try sessions.clearAllAndTerminate()
@@ -721,12 +1284,408 @@ public final class DaemonServer {
         return explicitInstanceName ?? "default"
     }
 
+    private func handleGuestCodeOpenPayload(_ payload: String, sourceInstance: String? = nil) {
+        logger.log("attached_open_requested", fields: [
+            "raw": payload,
+            "source_instance": sourceInstance ?? "-"
+        ])
+        guard let request = AttachedCodeOpenRequest.parse(payload) else {
+            logger.log("attached_open_rejected", fields: ["reason": "invalid_payload"])
+            return
+        }
+
+        let currentInstanceName = currentRuntimeInstanceName()
+        let launchTarget = resolveAttachedOpenLaunchTarget(
+            sourceInstance: sourceInstance,
+            currentRuntimeInstanceName: currentInstanceName
+        )
+
+        do {
+            try launchHostVSCodeAttachedOpen(
+                vmID: launchTarget.vmID,
+                targetPath: request.targetPath,
+                socketPath: launchTarget.socketPath
+            )
+            logger.log("attached_open_completed", fields: [
+                "instance": launchTarget.instanceName,
+                "current_instance": currentInstanceName,
+                "source_instance": sourceInstance ?? "-",
+                "vm_id": launchTarget.vmID,
+                "target": request.targetPath
+            ])
+        } catch {
+            let reason = (error as? AttachedOpenForwardError)?.reasonCode ?? "open_forward_failed"
+            logger.log("attached_open_failed", fields: [
+                "instance": launchTarget.instanceName,
+                "current_instance": currentInstanceName,
+                "source_instance": sourceInstance ?? "-",
+                "vm_id": launchTarget.vmID,
+                "target": request.targetPath,
+                "reason": reason,
+                "error": String(describing: error)
+            ])
+        }
+    }
+
+    private func launchHostVSCodeAttachedOpen(
+        vmID: String,
+        targetPath: String,
+        socketPath: String
+    ) throws {
+        let attemptID = UUID().uuidString.lowercased()
+        let processExecutor = ProcessExecutor()
+        guard let codePath = processExecutor.findExecutable(["code"]) else {
+            throw AttachedOpenForwardError.codeCLINotFound
+        }
+
+        let authority = try buildAttachedContainerAuthority(
+            vmID: vmID,
+            socketPath: socketPath
+        )
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: codePath)
+        process.arguments = ["--remote", authority, targetPath]
+        process.standardInput = nil
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
+        var env = ProcessInfo.processInfo.environment
+        env["DOCKER_HOST"] = "unix://\(socketPath)"
+        env["MSL_ATTACHED_OPEN_ATTEMPT_ID"] = attemptID
+        process.environment = env
+        let outputState = AttachedOpenOutputState()
+        attachAttachedOpenPipeLogger(
+            pipe: stdoutPipe,
+            attemptID: attemptID,
+            vmID: vmID,
+            stream: "stdout",
+            state: outputState,
+            logger: logger
+        )
+        attachAttachedOpenPipeLogger(
+            pipe: stderrPipe,
+            attemptID: attemptID,
+            vmID: vmID,
+            stream: "stderr",
+            state: outputState,
+            logger: logger
+        )
+        process.terminationHandler = { [logger] proc in
+            logger.log("attached_open_forward_exited", fields: [
+                "attempt_id": attemptID,
+                "vm_id": vmID,
+                "termination_status": String(proc.terminationStatus),
+                "termination_reason": String(proc.terminationReason.rawValue),
+                "stdout_preview": outputState.preview(for: "stdout"),
+                "stderr_preview": outputState.preview(for: "stderr"),
+                "stdout_bytes": String(outputState.byteCount(for: "stdout")),
+                "stderr_bytes": String(outputState.byteCount(for: "stderr"))
+            ])
+        }
+
+        logger.log("attached_open_forward_started", fields: [
+            "attempt_id": attemptID,
+            "vm_id": vmID,
+            "target": targetPath,
+            "socket": socketPath,
+            "authority": authority,
+            "code_path": codePath
+        ])
+        do {
+            try process.run()
+        } catch {
+            throw AttachedOpenForwardError.processLaunchFailed(String(describing: error))
+        }
+        logger.log("attached_open_forward_spawned", fields: [
+            "attempt_id": attemptID,
+            "vm_id": vmID,
+            "pid": String(process.processIdentifier)
+        ])
+        logger.log("attached_open_forward_completed", fields: [
+            "attempt_id": attemptID,
+            "vm_id": vmID,
+            "target": targetPath,
+            "spawn_mode": "detached"
+        ])
+    }
+
+    private func attachAttachedOpenPipeLogger(
+        pipe: Pipe,
+        attemptID: String,
+        vmID: String,
+        stream: String,
+        state: AttachedOpenOutputState,
+        logger: MSLLogger
+    ) {
+        let handle = pipe.fileHandleForReading
+        handle.readabilityHandler = { readable in
+            let data = readable.availableData
+            if data.isEmpty {
+                readable.readabilityHandler = nil
+                return
+            }
+            state.append(data, for: stream)
+            logger.log("attached_open_forward_stream", fields: [
+                "attempt_id": attemptID,
+                "vm_id": vmID,
+                "stream": stream,
+                "bytes": String(data.count),
+                "preview": String(decoding: data.prefix(256), as: UTF8.self)
+            ])
+        }
+    }
+
+    private final class AttachedOpenOutputState {
+        private let lock = NSLock()
+        private var previews: [String: Data] = [:]
+        private var counts: [String: Int] = [:]
+        private let maxPreviewBytes = 512
+
+        func append(_ data: Data, for stream: String) {
+            lock.lock()
+            defer { lock.unlock() }
+            counts[stream, default: 0] += data.count
+            var preview = previews[stream] ?? Data()
+            if preview.count < maxPreviewBytes {
+                let remaining = maxPreviewBytes - preview.count
+                preview.append(data.prefix(remaining))
+                previews[stream] = preview
+            }
+        }
+
+        func preview(for stream: String) -> String {
+            lock.lock()
+            defer { lock.unlock() }
+            let data = previews[stream] ?? Data()
+            return String(decoding: data, as: UTF8.self)
+        }
+
+        func byteCount(for stream: String) -> Int {
+            lock.lock()
+            defer { lock.unlock() }
+            return counts[stream] ?? 0
+        }
+    }
+
+    private func buildAttachedContainerAuthority(
+        vmID: String,
+        socketPath: String
+    ) throws -> String {
+        try buildAttachedContainerAuthorityString(vmID: vmID, socketPath: socketPath)
+    }
+
     private func legacyVMState(for lifecycle: InstanceLifecycleState) -> VMState {
         switch lifecycle {
         case .running:
             return .running
         default:
             return .stopped
+        }
+    }
+
+    private enum StartupStep: Int {
+        case daemonLaunch = 1
+        case startupRecovery = 2
+        case runtimeMetadataResolve = 3
+        case vmConfigurationBuild = 4
+        case vmStart = 5
+        case initHandshakeWait = 6
+        case userConverge = 7
+        case vscodeRootState = 8
+        case dnsReconcile = 9
+        case controlSocketStart = 10
+        case eventSocketStart = 11
+        case attachedDaemonStart = 12
+        case ready = 13
+
+        var name: String {
+            switch self {
+            case .daemonLaunch: return "daemon_launch"
+            case .startupRecovery: return "startup_recovery"
+            case .runtimeMetadataResolve: return "runtime_metadata_resolve"
+            case .vmConfigurationBuild: return "vm_configuration_build"
+            case .vmStart: return "vm_start"
+            case .initHandshakeWait: return "init_handshake_wait"
+            case .userConverge: return "user_converge"
+            case .vscodeRootState: return "vscode_root_state"
+            case .dnsReconcile: return "dns_reconcile"
+            case .controlSocketStart: return "control_socket_start"
+            case .eventSocketStart: return "event_socket_start"
+            case .attachedDaemonStart: return "attached_daemon_start"
+            case .ready: return "ready"
+            }
+        }
+    }
+
+    private func updateStateStarting(step: StartupStep, instanceName: String, startupEpochMs: Int64? = nil) {
+        do {
+            try lock.withExclusiveLock {
+                var state = try store.loadState()
+                let epoch = startupEpochMs ?? state.startupEpochMs ?? nowEpochMs()
+                state.distro = instanceName
+                state.vmState = .stopped
+                state.lifecycleState = .starting
+                state.startupEpochMs = epoch
+                state.startupStep = step.rawValue
+                state.startupStepName = step.name
+                state.startupStepStatus = .inProgress
+                state.lastErrorCode = nil
+                state.lastErrorMessage = nil
+                state.lastTransitionEpochMs = nowEpochMs()
+                upsertInstanceState(
+                    &state,
+                    instanceName: instanceName,
+                    lifecycleState: .booting,
+                    activeSessionCount: 0,
+                    idleTimer: IdleTimerState(armed: false, deadlineEpochMs: nil),
+                    runtimeHostPid: Int32(getpid()),
+                    runtimeControlSocket: nil,
+                    runtimeUser: nil,
+                    initChannel: state.initChannel,
+                    lastError: nil,
+                    lastErrorCode: nil,
+                    lastErrorMessage: nil,
+                    startupEpochMs: epoch,
+                    startupStep: step.rawValue,
+                    startupStepName: step.name,
+                    startupStepStatus: .inProgress
+                )
+                try store.saveState(state)
+            }
+        } catch {
+            logger.log("daemon_state_update_error", fields: ["error": String(describing: error), "step": step.name])
+        }
+    }
+
+    private func updateStateStepCompleted(step: StartupStep, instanceName: String) {
+        do {
+            try lock.withExclusiveLock {
+                var state = try store.loadState()
+                state.startupStep = step.rawValue
+                state.startupStepName = step.name
+                state.startupStepStatus = .completed
+                state.lastTransitionEpochMs = nowEpochMs()
+                upsertInstanceState(
+                    &state,
+                    instanceName: instanceName,
+                    lifecycleState: .booting,
+                    activeSessionCount: 0,
+                    idleTimer: IdleTimerState(armed: false, deadlineEpochMs: nil),
+                    runtimeHostPid: Int32(getpid()),
+                    runtimeControlSocket: nil,
+                    runtimeUser: instanceRegistry.context(for: instanceName).runtimeUser,
+                    initChannel: state.initChannel,
+                    lastError: nil,
+                    lastErrorCode: nil,
+                    lastErrorMessage: nil,
+                    startupEpochMs: state.startupEpochMs,
+                    startupStep: step.rawValue,
+                    startupStepName: step.name,
+                    startupStepStatus: .completed
+                )
+                try store.saveState(state)
+            }
+        } catch {
+            logger.log("daemon_state_update_error", fields: ["error": String(describing: error), "step": step.name])
+        }
+    }
+
+    private func updateStateBootFailed(
+        step: StartupStep,
+        instanceName: String,
+        code: String,
+        message: String
+    ) {
+        do {
+            try lock.withExclusiveLock {
+                var state = try store.loadState()
+                state.distro = instanceName
+                state.vmState = .stopped
+                state.lifecycleState = .error
+                state.activeSessionCount = 0
+                state.idleTimer = IdleTimerState(armed: false, deadlineEpochMs: nil)
+                state.runtimeHostPid = nil
+                state.runtimeControlSocket = nil
+                state.daemonHostPid = nil
+                state.daemonControlSocket = nil
+                state.daemonEventSocket = nil
+                state.runtimeUser = nil
+                state.startupStep = step.rawValue
+                state.startupStepName = step.name
+                state.startupStepStatus = .failed
+                state.lastErrorCode = code
+                state.lastErrorMessage = message
+                state.lastTransitionEpochMs = nowEpochMs()
+                upsertInstanceState(
+                    &state,
+                    instanceName: instanceName,
+                    lifecycleState: .error,
+                    activeSessionCount: 0,
+                    idleTimer: state.idleTimer,
+                    runtimeHostPid: nil,
+                    runtimeControlSocket: nil,
+                    runtimeUser: nil,
+                    initChannel: state.initChannel,
+                    lastError: message,
+                    lastErrorCode: code,
+                    lastErrorMessage: message,
+                    startupEpochMs: state.startupEpochMs,
+                    startupStep: step.rawValue,
+                    startupStepName: step.name,
+                    startupStepStatus: .failed
+                )
+                try store.saveState(state)
+            }
+        } catch {
+            logger.log("daemon_state_update_error", fields: ["error": String(describing: error), "step": step.name])
+        }
+    }
+
+    private func updateStateRunning(instanceName: String, controlSocketPath: String, eventSocketPath: String) {
+        do {
+            try lock.withExclusiveLock {
+                var state = try store.loadState()
+                let runtimeUser = instanceRegistry.context(for: instanceName).runtimeUser
+                state.vmState = .running
+                state.lifecycleState = .running
+                state.distro = instanceName
+                state.lastTransitionEpochMs = nowEpochMs()
+                state.runtimeHostPid = Int32(getpid())
+                state.runtimeControlSocket = controlSocketPath
+                state.daemonHostPid = Int32(getpid())
+                state.daemonControlSocket = controlSocketPath
+                state.daemonEventSocket = eventSocketPath
+                state.activeSessionCount = 0
+                state.idleTimer = IdleTimerState(armed: false, deadlineEpochMs: nil)
+                state.runtimeUser = runtimeUser
+                state.startupStep = StartupStep.ready.rawValue
+                state.startupStepName = StartupStep.ready.name
+                state.startupStepStatus = .completed
+                state.lastErrorCode = nil
+                state.lastErrorMessage = nil
+                upsertInstanceState(
+                    &state,
+                    instanceName: instanceName,
+                    lifecycleState: .running,
+                    activeSessionCount: 0,
+                    idleTimer: state.idleTimer,
+                    runtimeHostPid: state.runtimeHostPid,
+                    runtimeControlSocket: state.runtimeControlSocket,
+                    runtimeUser: runtimeUser,
+                    initChannel: state.initChannel,
+                    lastError: nil,
+                    lastErrorCode: nil,
+                    lastErrorMessage: nil,
+                    startupEpochMs: state.startupEpochMs,
+                    startupStep: StartupStep.ready.rawValue,
+                    startupStepName: StartupStep.ready.name,
+                    startupStepStatus: .completed
+                )
+                try store.saveState(state)
+            }
+        } catch {
+            logger.log("daemon_state_update_error", fields: ["error": String(describing: error), "step": StartupStep.ready.name])
         }
     }
 
@@ -740,11 +1699,26 @@ public final class DaemonServer {
         runtimeControlSocket: String?,
         runtimeUser: RuntimeUserState?,
         initChannel: InitChannelState?,
-        lastError: String?
+        lastError: String?,
+        lastErrorCode: String? = nil,
+        lastErrorMessage: String? = nil,
+        startupEpochMs: Int64? = nil,
+        startupStep: Int? = nil,
+        startupStepName: String? = nil,
+        startupStepStatus: StartupStepStatus? = nil
     ) {
         var entries = state.instances ?? []
         if let existingIndex = entries.firstIndex(where: { $0.instance == instanceName }) {
             entries[existingIndex].vmState = legacyVMState(for: lifecycleState)
+            entries[existingIndex].lifecycleState = {
+                switch lifecycleState {
+                case .running: return .running
+                case .booting: return .starting
+                case .stopping: return .stopping
+                case .error: return .error
+                case .stopped: return .stopped
+                }
+            }()
             entries[existingIndex].activeSessionCount = activeSessionCount
             entries[existingIndex].idleTimer = idleTimer
             entries[existingIndex].runtimeHostPid = runtimeHostPid
@@ -752,12 +1726,27 @@ public final class DaemonServer {
             entries[existingIndex].runtimeUser = runtimeUser
             entries[existingIndex].initChannel = initChannel
             entries[existingIndex].lastError = lastError
+            entries[existingIndex].lastErrorCode = lastErrorCode
+            entries[existingIndex].lastErrorMessage = lastErrorMessage ?? lastError
+            entries[existingIndex].startupEpochMs = startupEpochMs
+            entries[existingIndex].startupStep = startupStep
+            entries[existingIndex].startupStepName = startupStepName
+            entries[existingIndex].startupStepStatus = startupStepStatus
             entries[existingIndex].lastTransitionEpochMs = nowEpochMs()
         } else {
             entries.append(
                 RuntimeInstanceState(
                     instance: instanceName,
                     vmState: legacyVMState(for: lifecycleState),
+                    lifecycleState: {
+                        switch lifecycleState {
+                        case .running: return .running
+                        case .booting: return .starting
+                        case .stopping: return .stopping
+                        case .error: return .error
+                        case .stopped: return .stopped
+                        }
+                    }(),
                     activeSessionCount: activeSessionCount,
                     idleTimer: idleTimer,
                     runtimeUser: runtimeUser,
@@ -765,6 +1754,12 @@ public final class DaemonServer {
                     runtimeHostPid: runtimeHostPid,
                     runtimeControlSocket: runtimeControlSocket,
                     lastError: lastError,
+                    lastErrorCode: lastErrorCode,
+                    lastErrorMessage: lastErrorMessage ?? lastError,
+                    startupEpochMs: startupEpochMs,
+                    startupStep: startupStep,
+                    startupStepName: startupStepName,
+                    startupStepStatus: startupStepStatus,
                     lastTransitionEpochMs: nowEpochMs()
                 )
             )
@@ -848,6 +1843,16 @@ public final class DaemonServer {
             return handlePtyResize(request)
         case "pty_close":
             return handlePtyClose(request)
+        case "proc_open":
+            return handleProcOpen(request)
+        case "proc_read":
+            return handleProcRead(request)
+        case "proc_write":
+            return handleProcWrite(request)
+        case "proc_stdin_close":
+            return handleProcStdinClose(request)
+        case "proc_close":
+            return handleProcClose(request)
 
         // --- session management ---
         case "session_register":
@@ -881,6 +1886,17 @@ public final class DaemonServer {
 
         default:
             return RuntimeControlResponse(ok: false, error: "unsupported op: \(request.op)")
+        }
+    }
+
+    private func handleControlStreamRequest(_ request: RuntimeControlRequest, fd: Int32) -> Bool {
+        switch request.op {
+        case "proc_subscribe":
+            return handleProcSubscribeStream(request, fd: fd)
+        case "pty_subscribe":
+            return handlePtySubscribeStream(request, fd: fd)
+        default:
+            return false
         }
     }
 
@@ -930,6 +1946,12 @@ public final class DaemonServer {
             logger: logger,
             initProbeHandler: { [weak self] probe in
                 self?.updateInitChannelState(probe)
+            },
+            codeOpenRequestHandler: { [weak self] payload in
+                self?.handleGuestCodeOpenPayload(payload, sourceInstance: instanceName)
+            },
+            backgroundMemoryMaintenanceAllowed: { [weak self] in
+                !(self?.isBackgroundMemoryMaintenanceSuspended(instanceName: instanceName) ?? false)
             }
         )
         context.vmRunner = runner
@@ -943,6 +1965,20 @@ public final class DaemonServer {
                 throw MSLRuntimeError("instance boot did not provide init channel")
             }
             context.initClient = resolvedClient
+            if resolvedClient.supportsDedicatedSideband {
+                context.initWriteClient = resolvedClient.makeSidebandClient()
+                context.initReadClient = resolvedClient.makeSidebandClient()
+                context.housekeepingClient = context.initReadClient?.makeSidebandClient()
+            } else {
+                context.initWriteClient = nil
+                context.initReadClient = nil
+                context.housekeepingClient = nil
+            }
+            try prepareTmpStorageOnStartup(
+                client: resolvedClient,
+                metadataURL: metadataURL,
+                instanceName: instanceName
+            )
             prepareHostShareRootMountOnStartup(client: resolvedClient)
             syncGuestClockAtStartup(client: resolvedClient, instanceName: instanceName)
             let resolved = try convergeRuntimeUser(
@@ -970,6 +2006,7 @@ public final class DaemonServer {
                 )
                 try store.saveState(state)
             }
+            try ensureAttachedContainerDaemonStarted(instanceName: instanceName)
             context.lifecycleState = .running
             context.lastError = nil
             publishInstanceStateEvent(instance: instanceName, state: "Running", reason: "boot_ready")
@@ -980,6 +2017,9 @@ public final class DaemonServer {
             context.vmRunner?.stopRunningVM()
             context.vmRunner = nil
             context.initClient = nil
+            context.initWriteClient = nil
+            context.initReadClient = nil
+            context.housekeepingClient = nil
             publishInstanceStateEvent(
                 instance: instanceName,
                 state: "Error",
@@ -995,11 +2035,11 @@ public final class DaemonServer {
               let client = context.initClient ?? initClient else {
             return RuntimeControlResponse(ok: false, error: "instance_not_running")
         }
-        maybeReconcileDNSBeforeGuestOperation(instanceName: context.instanceName)
         guard let argv = request.argv, !argv.isEmpty else {
             return RuntimeControlResponse(ok: false, error: "missing argv")
         }
         let execTarget = resolveCWDForwarding(argv: argv, cwd: request.cwd)
+        let envAdditions = mergedExecEnvAdditions(request.envAdditions)
 
         noteGuestActivity()
         // 0 means no timeout for guest exec.
@@ -1016,7 +2056,7 @@ public final class DaemonServer {
             let initReq = InitChannelRequest(
                 op: "exec",
                 argv: execTarget.argv,
-                envAdditions: cacheShareEnvAdditions.isEmpty ? nil : cacheShareEnvAdditions,
+                envAdditions: envAdditions,
                 runAsRoot: request.runAsRoot,
                 cwd: execTarget.cwd,
                 timeoutMs: timeoutMs
@@ -1271,30 +2311,47 @@ public final class DaemonServer {
                     guestCacheRoot: guestCacheRoot,
                     policy: policy
                 )
-                let status = response.stdout?
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                    .lowercased()
+                var status: String?
+                var reason: String?
+                if let stdout = response.stdout {
+                    for line in stdout.split(separator: "\n") {
+                        let trimmed = String(line).trimmingCharacters(in: .whitespacesAndNewlines)
+                        if trimmed.hasPrefix("status=") {
+                            status = String(trimmed.dropFirst("status=".count)).lowercased()
+                        } else if trimmed.hasPrefix("reason=") {
+                            reason = String(trimmed.dropFirst("reason=".count))
+                        }
+                    }
+                }
                 let resolvedStatus: String
-                if status == "applied" || status == "reused" || status == "partial" {
+                if status == "applied" || status == "reused" || status == "partial" || status == "fallback" {
                     resolvedStatus = status ?? "applied"
                 } else {
                     resolvedStatus = "applied"
                 }
-                logger.log("cache_share_applied", fields: [
+                var fields: [String: String] = [
                     "status": resolvedStatus,
                     "policy_source": policySource,
                     "guest_cache_root": guestCacheRoot,
                     "host_cache_root": hostCacheRoot,
                     "enabled_tools": String(enabledToolCount),
                     "runtime_home": runtimeHome
-                ])
-                return RuntimeControlResponse(ok: true, meta: [
+                ]
+                if let reason, !reason.isEmpty {
+                    fields["reason"] = reason
+                }
+                logger.log("cache_share_applied", fields: fields)
+                var meta: [String: String] = [
                     "status": resolvedStatus,
                     "guest_cache_root": guestCacheRoot,
                     "host_cache_root": hostCacheRoot,
                     "enabled_tools": String(enabledToolCount),
                     "runtime_home": runtimeHome,
-                ])
+                ]
+                if let reason, !reason.isEmpty {
+                    meta["reason"] = reason
+                }
+                return RuntimeControlResponse(ok: true, meta: meta)
             }
 
             let errorMessage = response.error?.message ?? response.stderr ?? "cache_share_prepare failed"
@@ -1330,20 +2387,31 @@ public final class DaemonServer {
               let client = context.initClient ?? initClient else {
             return RuntimeControlResponse(ok: false, error: "instance_not_running")
         }
-        maybeReconcileDNSBeforeGuestOperation(instanceName: context.instanceName)
+        let readClient = context.initReadClient ?? context.initClient ?? initClient
         let defaultShell = context.runtimeUser?.shell ?? "/bin/sh"
         let argv = request.argv ?? [defaultShell, "-l"]
         let ptyTarget = resolveCWDForwarding(argv: argv, cwd: request.cwd)
+        let envAdditions = mergedExecEnvAdditions(request.envAdditions)
         do {
             let resp = try client.ptyOpen(
                 argv: ptyTarget.argv,
                 cwd: ptyTarget.cwd,
-                envAdditions: cacheShareEnvAdditions.isEmpty ? nil : cacheShareEnvAdditions,
+                envAdditions: envAdditions,
+                runAsRoot: request.runAsRoot,
                 rows: request.rows,
                 cols: request.cols,
                 timeoutMs: 3_000
             )
             if resp.ok, let ptyId = resp.ptyId {
+                _ = registerPtyEventBuffer(ptyId: ptyId)
+                if let readClient {
+                    startPtySubscription(
+                        client: readClient,
+                        ptyId: ptyId,
+                        instanceName: context.instanceName,
+                        sessionId: request.sessionId
+                    )
+                }
                 logSessionScopedEvent(
                     sessionID: request.sessionId,
                     fallbackInstance: context.instanceName,
@@ -1359,33 +2427,60 @@ public final class DaemonServer {
     }
 
     private func handlePtyRead(_ request: RuntimeControlRequest) -> RuntimeControlResponse {
-        guard let context = resolveContext(for: request),
-              let client = context.initClient ?? initClient else {
+        guard let context = resolveContext(for: request) else {
             return RuntimeControlResponse(ok: false, error: "instance_not_running")
         }
         guard let ptyId = request.ptyId else {
             return RuntimeControlResponse(ok: false, error: "missing ptyId")
         }
-        do {
-            let resp = try client.ptyRead(ptyId: ptyId, timeoutMs: request.timeoutMs ?? 1_000)
-            if resp.ok, let payload = resp.dataBase64, !payload.isEmpty {
-                logSessionScopedEvent(
-                    sessionID: request.sessionId,
-                    fallbackInstance: context.instanceName,
-                    event: "session_pty_output",
-                    fields: ["op": "pty_read", "pty_id": ptyId, "bytes_b64_len": String(payload.count)]
-                )
-            }
-            return RuntimeControlResponse(
-                ok: resp.ok,
-                error: resp.error?.message,
-                exitCode: resp.exitCode,
-                dataBase64: resp.dataBase64,
-                meta: resp.meta
-            )
-        } catch {
-            return RuntimeControlResponse(ok: false, error: String(describing: error))
+        guard let buffer = lookupPtyEventBuffer(ptyId: ptyId) else {
+            return RuntimeControlResponse(ok: false, error: "unknown ptyId")
         }
+        if !hasPtySubscriptionSource(ptyId: ptyId),
+           let client = context.initClient ?? initClient {
+            do {
+                let resp = try client.ptyRead(ptyId: ptyId, timeoutMs: request.timeoutMs ?? 1_000)
+                return RuntimeControlResponse(
+                    ok: resp.ok,
+                    error: resp.error?.message,
+                    exitCode: resp.exitCode,
+                    dataBase64: resp.dataBase64,
+                    meta: resp.meta,
+                    rawData: resp.rawData
+                )
+            } catch {
+                return RuntimeControlResponse(ok: false, error: String(describing: error))
+            }
+        }
+        let outcome = buffer.collect(timeoutMs: request.timeoutMs ?? 1_000, maxBytes: 16 * 1024)
+        if let failure = outcome.failure {
+            return RuntimeControlResponse(ok: false, error: failure)
+        }
+        if !outcome.payload.isEmpty {
+            logSessionScopedEvent(
+                sessionID: request.sessionId,
+                fallbackInstance: context.instanceName,
+                event: "session_pty_output",
+                fields: ["op": "pty_read", "pty_id": ptyId, "bytes": String(outcome.payload.count)]
+            )
+        }
+        if outcome.finalize {
+            removePtyEventBuffer(ptyId: ptyId)
+        }
+        var meta: [String: String]? = nil
+        if let exitCode = outcome.exitCode {
+            meta = ["exitCode": String(exitCode)]
+            if let exitReason = outcome.exitReason {
+                meta?["exitReason"] = exitReason
+            }
+        }
+        return RuntimeControlResponse(
+            ok: true,
+            exitCode: outcome.exitCode,
+            dataBase64: outcome.payload.isEmpty ? nil : outcome.payload.base64EncodedString(),
+            meta: meta,
+            rawData: outcome.payload.isEmpty ? nil : outcome.payload
+        )
     }
 
     private func resolveCWDForwarding(argv: [String], cwd: String?) -> (argv: [String], cwd: String?) {
@@ -1404,6 +2499,16 @@ public final class DaemonServer {
             ] + argv,
             nil
         )
+    }
+
+    private func mergedExecEnvAdditions(_ requestEnvAdditions: [String: String]?) -> [String: String]? {
+        var merged = cacheShareEnvAdditions
+        if let requestEnvAdditions {
+            for (key, value) in requestEnvAdditions {
+                merged[key] = value
+            }
+        }
+        return merged.isEmpty ? nil : merged
     }
 
     private func handleLegacyWorkspacePrepare(
@@ -1545,6 +2650,72 @@ public final class DaemonServer {
         }
     }
 
+    private func prepareTmpStorageOnStartup(
+        client: InitChannelClient,
+        metadataURL: URL,
+        instanceName: String
+    ) throws {
+        let metadata = try distributionManager.readOrRebuildInstanceMetadata(at: metadataURL)
+        let policy = try metadata.resolveValidatedTmpStoragePolicy()
+        guard policy.mode == "ephemeral" else { return }
+        let label = tmpStorageLabel(instanceName: instanceName)
+        let response = try client.send(InitChannelRequest(
+            op: "exec",
+            argv: ["/bin/sh", "-lc", Self.tmpStoragePrepareScript, "msl-tmp-prepare", label],
+            runAsRoot: true,
+            timeoutMs: 15_000
+        ))
+        let exitCode = response.exitCode ?? 0
+        if response.ok, exitCode == 0 {
+            logger.log("tmp_mount_succeeded", fields: [
+                "instance": instanceName,
+                "mode": policy.mode,
+                "size_mib": String(policy.sizeMiB)
+            ])
+            return
+        }
+        let detail = response.error?.message ?? response.stderr ?? "tmp prepare failed"
+        logger.log("tmp_mount_failed", fields: [
+            "instance": instanceName,
+            "phase": "mount",
+            "exit_code": String(exitCode),
+            "detail": detail
+        ])
+        throw MSLRuntimeError("tmp mount failed for instance '\(instanceName)': \(detail)")
+    }
+
+    private func resetTmpStorageAfterStop(metadataURL: URL?, instanceName: String) {
+        guard let metadataURL else { return }
+        do {
+            let metadata = try distributionManager.readOrRebuildInstanceMetadata(at: metadataURL)
+            let policy = try metadata.resolveValidatedTmpStoragePolicy()
+            guard policy.mode == "ephemeral", policy.resetOnStop else { return }
+            let tmpDiskURL = paths.distroEphemeralTmpDiskFile(named: instanceName)
+            if FileManager.default.fileExists(atPath: tmpDiskURL.path) {
+                try FileManager.default.removeItem(at: tmpDiskURL)
+            }
+            logger.log("tmp_reset_succeeded", fields: [
+                "instance": instanceName,
+                "path": tmpDiskURL.path
+            ])
+        } catch {
+            logger.log("tmp_reset_failed", fields: [
+                "instance": instanceName,
+                "error": String(describing: error)
+            ])
+        }
+    }
+
+    private func tmpStorageLabel(instanceName: String) -> String {
+        let mapped = instanceName.lowercased().map { ch -> Character in
+            if ch.isLetter || ch.isNumber || ch == "-" || ch == "_" {
+                return ch
+            }
+            return "-"
+        }
+        return "msl-\(String(mapped))-tmp"
+    }
+
     private func resolveConfiguredHostShareRoot() -> String {
         let raw = ProcessInfo.processInfo.environment["MSL_HOST_SHARE_ROOT"]?
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1554,14 +2725,130 @@ public final class DaemonServer {
         return raw
     }
 
+    private func parseKeyValueLines(_ text: String) -> [String: Int64] {
+        var result: [String: Int64] = [:]
+        for line in text.split(separator: "\n") {
+            let parts = line.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+            guard parts.count == 2 else { continue }
+            let key = String(parts[0]).trimmingCharacters(in: .whitespacesAndNewlines)
+            let valueText = String(parts[1]).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !key.isEmpty, let value = Int64(valueText) else { continue }
+            result[key] = value
+        }
+        return result
+    }
+
+    private func guestVisibleHostPath(hostPath: String, hostShareRoot: String) -> String? {
+        guard hostPath.hasPrefix("/") else {
+            return nil
+        }
+        let normalizedRoot = hostShareRoot.hasSuffix("/") && hostShareRoot.count > 1
+            ? String(hostShareRoot.dropLast())
+            : hostShareRoot
+        if normalizedRoot == "/" {
+            return "/mnt/macos" + hostPath
+        }
+        if hostPath == normalizedRoot {
+            return "/mnt/macos"
+        }
+        if hostPath.hasPrefix(normalizedRoot + "/") {
+            let suffix = String(hostPath.dropFirst(normalizedRoot.count))
+            return "/mnt/macos" + suffix
+        }
+        return nil
+    }
+
+    private func guestVisibleHostPathCandidates(hostPath: String, hostShareRoot: String) -> [String] {
+        guard hostPath.hasPrefix("/") else {
+            return []
+        }
+        var candidates: [String] = []
+        if let mapped = guestVisibleHostPath(hostPath: hostPath, hostShareRoot: hostShareRoot) {
+            candidates.append(mapped)
+        }
+        if hostShareRoot != "/" {
+            if !candidates.contains(hostPath) {
+                candidates.append(hostPath)
+            }
+        }
+        return candidates
+    }
+
+    private func isInitSourceMissing(_ response: InitChannelResponse) -> Bool {
+        if response.exitCode == 20 {
+            return true
+        }
+        if let message = response.error?.message.lowercased(), message.contains("source_missing") {
+            return true
+        }
+        if let stderr = response.stderr?.lowercased(), stderr.contains("source_missing") {
+            return true
+        }
+        return false
+    }
+
+    private func readGuestInitVersion(client: InitChannelClient) -> String? {
+        do {
+            let response = try client.send(InitChannelRequest(
+                op: "exec",
+                argv: ["/bin/sh", "-lc", Self.readInitVersionScript],
+                timeoutMs: 2_000
+            ))
+            guard response.ok, (response.exitCode ?? 1) == 0 else {
+                return nil
+            }
+            let value = response.stdout?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return value.isEmpty ? nil : value
+        } catch {
+            return nil
+        }
+    }
+
+    private func readHostInitVersion(at path: String) -> String? {
+        let sidecar = path + ".version"
+        guard FileManager.default.isReadableFile(atPath: sidecar),
+              let data = FileManager.default.contents(atPath: sidecar),
+              let value = String(data: data, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+              !value.isEmpty else {
+            return nil
+        }
+        return value
+    }
+
+    private func allocatedBytes(of fileURL: URL) -> Int64? {
+        let values = try? fileURL.resourceValues(forKeys: [.totalFileAllocatedSizeKey, .fileAllocatedSizeKey])
+        if let total = values?.totalFileAllocatedSize {
+            return Int64(total)
+        }
+        if let allocated = values?.fileAllocatedSize {
+            return Int64(allocated)
+        }
+        return nil
+    }
+
+    private func logicalBytes(of fileURL: URL) -> Int64? {
+        let values = try? fileURL.resourceValues(forKeys: [.fileSizeKey])
+        guard let size = values?.fileSize else {
+            return nil
+        }
+        return Int64(size)
+    }
+
     private func handlePtyWrite(_ request: RuntimeControlRequest) -> RuntimeControlResponse {
         guard let context = resolveContext(for: request),
               let client = context.initClient ?? initClient else {
             return RuntimeControlResponse(ok: false, error: "instance_not_running")
         }
-        guard let ptyId = request.ptyId, let b64 = request.dataBase64,
-              let data = Data(base64Encoded: b64) else {
-            return RuntimeControlResponse(ok: false, error: "missing ptyId or dataBase64")
+        guard let ptyId = request.ptyId else {
+            return RuntimeControlResponse(ok: false, error: "missing ptyId")
+        }
+        let data = request.rawData ?? {
+            guard let b64 = request.dataBase64 else { return nil }
+            return Data(base64Encoded: b64)
+        }()
+        guard let data else {
+            return RuntimeControlResponse(ok: false, error: "missing ptyId or data")
         }
         noteGuestActivity()
         do {
@@ -1620,9 +2907,832 @@ public final class DaemonServer {
                 event: "session_pty_closed",
                 fields: ["op": "pty_close", "pty_id": ptyId, "result": resp.ok ? "ok" : "failed"]
             )
+            removePtyEventBuffer(ptyId: ptyId)
             return RuntimeControlResponse(ok: resp.ok, error: resp.error?.message, exitCode: resp.exitCode)
         } catch {
             return RuntimeControlResponse(ok: false, error: String(describing: error))
+        }
+    }
+
+    private func registerProcEventBuffer(procId: String) -> HostProcEventBuffer {
+        let buffer = HostProcEventBuffer()
+        sessionEventLock.lock()
+        procEventBuffers[procId] = buffer
+        sessionEventLock.unlock()
+        return buffer
+    }
+
+    private func registerPtyEventBuffer(ptyId: String) -> HostPtyEventBuffer {
+        let buffer = HostPtyEventBuffer()
+        sessionEventLock.lock()
+        ptyEventBuffers[ptyId] = buffer
+        sessionEventLock.unlock()
+        return buffer
+    }
+
+    private func lookupProcEventBuffer(procId: String) -> HostProcEventBuffer? {
+        sessionEventLock.lock()
+        defer { sessionEventLock.unlock() }
+        return procEventBuffers[procId]
+    }
+
+    private func lookupPtyEventBuffer(ptyId: String) -> HostPtyEventBuffer? {
+        sessionEventLock.lock()
+        defer { sessionEventLock.unlock() }
+        return ptyEventBuffers[ptyId]
+    }
+
+    private func hasProcSubscriptionSource(procId: String) -> Bool {
+        sessionEventLock.lock()
+        defer { sessionEventLock.unlock() }
+        return procSubscriptionSources[procId] != nil
+    }
+
+    private func hasPtySubscriptionSource(ptyId: String) -> Bool {
+        sessionEventLock.lock()
+        defer { sessionEventLock.unlock() }
+        return ptySubscriptionSources[ptyId] != nil
+    }
+
+    private func removeProcEventBuffer(procId: String) {
+        sessionEventLock.lock()
+        procEventBuffers.removeValue(forKey: procId)
+        let source = procSubscriptionSources.removeValue(forKey: procId)
+        sessionEventLock.unlock()
+        source?.cancel()
+    }
+
+    private func removePtyEventBuffer(ptyId: String) {
+        sessionEventLock.lock()
+        ptyEventBuffers.removeValue(forKey: ptyId)
+        let source = ptySubscriptionSources.removeValue(forKey: ptyId)
+        sessionEventLock.unlock()
+        source?.cancel()
+    }
+
+    private func removeProcSubscriptionSource(procId: String) {
+        sessionEventLock.lock()
+        let source = procSubscriptionSources.removeValue(forKey: procId)
+        sessionEventLock.unlock()
+        source?.cancel()
+    }
+
+    private func removePtySubscriptionSource(ptyId: String) {
+        sessionEventLock.lock()
+        let source = ptySubscriptionSources.removeValue(forKey: ptyId)
+        sessionEventLock.unlock()
+        source?.cancel()
+    }
+
+    private func storeProcSubscriptionSource(_ source: DispatchSourceRead, procId: String) {
+        sessionEventLock.lock()
+        procSubscriptionSources[procId] = source
+        sessionEventLock.unlock()
+    }
+
+    private func storePtySubscriptionSource(_ source: DispatchSourceRead, ptyId: String) {
+        sessionEventLock.lock()
+        ptySubscriptionSources[ptyId] = source
+        sessionEventLock.unlock()
+    }
+
+    private func startProcSubscription(
+        client: InitChannelClient,
+        procId: String,
+        instanceName: String,
+        sessionId: String?
+    ) {
+        guard let buffer = lookupProcEventBuffer(procId: procId) else { return }
+        do {
+            let stream = try client.procSubscribe(procId: procId)
+            let queue = DispatchQueue(label: "msl.proc-subscribe.\(procId)")
+            let source = DispatchSource.makeReadSource(fileDescriptor: stream.fileDescriptor, queue: queue)
+            storeProcSubscriptionSource(source, procId: procId)
+            logger.log("attached_exec_subscribe_started", fields: [
+                "proc_id": procId,
+                "instance": instanceName
+            ])
+            source.setEventHandler { [weak self, source] in
+                guard let self else { return }
+                var sawExit = false
+                var sawStreamsClosed = false
+                do {
+                    while let event = try stream.nextEvent() {
+                        self.logger.log("session_proc_event", fields: [
+                            "proc_id": procId,
+                            "instance": instanceName,
+                            "kind": event.kind.rawValue,
+                            "bytes": String(event.data.count),
+                            "exit_code": event.exitCode.map(String.init) ?? ""
+                        ])
+                        switch event.kind {
+                        case .stdout:
+                            buffer.push(.stdout(event.data))
+                        case .stderr:
+                            buffer.push(.stderr(event.data))
+                        case .exited:
+                            sawExit = true
+                            buffer.push(.exited(event.exitCode ?? 0, event.text))
+                        case .streamsClosed:
+                            sawStreamsClosed = true
+                            buffer.push(.streamsClosed)
+                        }
+                        if sawExit && sawStreamsClosed {
+                            self.removeProcSubscriptionSource(procId: procId)
+                            source.cancel()
+                            return
+                        }
+                    }
+                    self.removeProcSubscriptionSource(procId: procId)
+                    source.cancel()
+                } catch {
+                    buffer.push(.failed(String(describing: error)))
+                    self.logger.log("session_proc_event", fields: [
+                        "proc_id": procId,
+                        "instance": instanceName,
+                        "kind": "failed",
+                        "error": String(describing: error)
+                    ])
+                    self.removeProcSubscriptionSource(procId: procId)
+                    source.cancel()
+                }
+            }
+            source.resume()
+        } catch {
+            logger.log("session_proc_event", fields: [
+                "proc_id": procId,
+                "instance": instanceName,
+                "transport": "compat_proc_read",
+                "kind": "subscribe_failed_fallback",
+                "error": String(describing: error)
+            ])
+            logger.log("attached_exec_transport_fallback_used", fields: [
+                "instance": instanceName,
+                "proc_id": procId,
+                "transport": "compat_proc_read"
+            ])
+        }
+    }
+
+    private func handleProcSubscribeStream(_ request: RuntimeControlRequest, fd: Int32) -> Bool {
+        guard let context = resolveContext(for: request),
+              let procId = request.procId,
+              let buffer = lookupProcEventBuffer(procId: procId) else {
+            return false
+        }
+        logger.log("attached_exec_subscribe_started", fields: [
+            "proc_id": procId,
+            "instance": context.instanceName,
+            "transport": "runtime_control"
+        ])
+        while true {
+            let outcome = buffer.collect(timeoutMs: 1_000)
+            if let failure = outcome.failure {
+                logger.log("session_proc_event", fields: [
+                    "proc_id": procId,
+                    "instance": context.instanceName,
+                    "kind": "runtime_control_failed",
+                    "error": failure
+                ])
+                return false
+            }
+            for event in outcome.events {
+                let frame: Data
+                do {
+                    switch event {
+                    case .stdout(let data):
+                        frame = try encodeRuntimeControlProcEventFrame(procId: procId, kind: .stdout, payload: data)
+                    case .stderr(let data):
+                        frame = try encodeRuntimeControlProcEventFrame(procId: procId, kind: .stderr, payload: data)
+                    case .exited(let code, let reason):
+                        frame = try encodeRuntimeControlProcEventFrame(procId: procId, kind: .exited, payload: Data(), exitCode: code, text: reason)
+                    case .streamsClosed:
+                        frame = try encodeRuntimeControlProcEventFrame(procId: procId, kind: .streamsClosed, payload: Data())
+                    case .failed(let message):
+                        logger.log("session_proc_event", fields: [
+                            "proc_id": procId,
+                            "instance": context.instanceName,
+                            "kind": "runtime_control_failed",
+                            "error": message
+                        ])
+                        return false
+                    }
+                    try runtimeControlWriteAll(fd: fd, data: frame)
+                } catch {
+                    logger.log("session_proc_event", fields: [
+                        "proc_id": procId,
+                        "instance": context.instanceName,
+                        "kind": "runtime_control_stream_write_failed",
+                        "error": String(describing: error)
+                    ])
+                    return false
+                }
+            }
+            if outcome.finalize {
+                removeProcEventBuffer(procId: procId)
+                return true
+            }
+        }
+    }
+
+    private func startPtySubscription(
+        client: InitChannelClient,
+        ptyId: String,
+        instanceName: String,
+        sessionId: String?
+    ) {
+        guard let buffer = lookupPtyEventBuffer(ptyId: ptyId) else { return }
+        do {
+            let stream = try client.ptySubscribe(ptyId: ptyId)
+            let queue = DispatchQueue(label: "msl.pty-subscribe.\(ptyId)")
+            let source = DispatchSource.makeReadSource(fileDescriptor: stream.fileDescriptor, queue: queue)
+            storePtySubscriptionSource(source, ptyId: ptyId)
+            logger.log("attached_exec_subscribe_started", fields: [
+                "pty_id": ptyId,
+                "instance": instanceName
+            ])
+            source.setEventHandler { [weak self, source] in
+                guard let self else { return }
+                var sawExit = false
+                var sawStreamsClosed = false
+                do {
+                    while let event = try stream.nextEvent() {
+                        self.logger.log("session_pty_event", fields: [
+                            "pty_id": ptyId,
+                            "instance": instanceName,
+                            "kind": event.kind.rawValue,
+                            "bytes": String(event.data.count),
+                            "exit_code": event.exitCode.map(String.init) ?? ""
+                        ])
+                        switch event.kind {
+                        case .output:
+                            buffer.push(.output(event.data))
+                        case .exited:
+                            sawExit = true
+                            buffer.push(.exited(event.exitCode ?? 0, event.text))
+                        case .streamsClosed:
+                            sawStreamsClosed = true
+                            buffer.push(.streamsClosed)
+                        }
+                        if sawExit && sawStreamsClosed {
+                            self.removePtySubscriptionSource(ptyId: ptyId)
+                            source.cancel()
+                            return
+                        }
+                    }
+                    self.removePtySubscriptionSource(ptyId: ptyId)
+                    source.cancel()
+                } catch {
+                    self.logger.log("session_pty_event", fields: [
+                        "pty_id": ptyId,
+                        "instance": instanceName,
+                        "kind": "failed",
+                        "error": String(describing: error)
+                    ])
+                    self.logger.log("attached_exec_transport_fallback_used", fields: [
+                        "instance": instanceName,
+                        "pty_id": ptyId,
+                        "transport": "compat_pty_read_after_subscribe_failure"
+                    ])
+                    self.removePtySubscriptionSource(ptyId: ptyId)
+                    source.cancel()
+                }
+            }
+            source.resume()
+        } catch {
+            logger.log("session_pty_event", fields: [
+                "pty_id": ptyId,
+                "instance": instanceName,
+                "transport": "compat_pty_read",
+                "kind": "subscribe_failed_fallback",
+                "error": String(describing: error)
+            ])
+            logger.log("attached_exec_transport_fallback_used", fields: [
+                "instance": instanceName,
+                "pty_id": ptyId,
+                "transport": "compat_pty_read"
+            ])
+        }
+    }
+
+    private func handlePtySubscribeStream(_ request: RuntimeControlRequest, fd: Int32) -> Bool {
+        guard let context = resolveContext(for: request),
+              let ptyId = request.ptyId,
+              let buffer = lookupPtyEventBuffer(ptyId: ptyId) else {
+            return false
+        }
+        logger.log("attached_exec_subscribe_started", fields: [
+            "pty_id": ptyId,
+            "instance": context.instanceName,
+            "transport": "runtime_control"
+        ])
+        var didEmitExit = false
+        while true {
+            let outcome = buffer.collect(timeoutMs: 1_000, maxBytes: 64 * 1024)
+            if let failure = outcome.failure {
+                logger.log("session_pty_event", fields: [
+                    "pty_id": ptyId,
+                    "instance": context.instanceName,
+                    "kind": "runtime_control_failed",
+                    "error": failure
+                ])
+                return false
+            }
+            if !outcome.payload.isEmpty {
+                do {
+                    let frame = try encodeRuntimeControlPtyEventFrame(ptyId: ptyId, kind: .output, payload: outcome.payload)
+                    try runtimeControlWriteAll(fd: fd, data: frame)
+                } catch {
+                    logger.log("session_pty_event", fields: [
+                        "pty_id": ptyId,
+                        "instance": context.instanceName,
+                        "kind": "runtime_control_stream_write_failed",
+                        "error": String(describing: error)
+                    ])
+                    return false
+                }
+            }
+            if let exitCode = outcome.exitCode, !didEmitExit {
+                do {
+                    let frame = try encodeRuntimeControlPtyEventFrame(
+                        ptyId: ptyId,
+                        kind: .exited,
+                        payload: Data(),
+                        exitCode: exitCode,
+                        text: outcome.exitReason
+                    )
+                    try runtimeControlWriteAll(fd: fd, data: frame)
+                    didEmitExit = true
+                } catch {
+                    logger.log("session_pty_event", fields: [
+                        "pty_id": ptyId,
+                        "instance": context.instanceName,
+                        "kind": "runtime_control_stream_write_failed",
+                        "error": String(describing: error)
+                    ])
+                    return false
+                }
+            }
+            if outcome.finalize {
+                do {
+                    let closed = try encodeRuntimeControlPtyEventFrame(ptyId: ptyId, kind: .streamsClosed, payload: Data())
+                    try runtimeControlWriteAll(fd: fd, data: closed)
+                } catch {
+                    logger.log("session_pty_event", fields: [
+                        "pty_id": ptyId,
+                        "instance": context.instanceName,
+                        "kind": "runtime_control_stream_write_failed",
+                        "error": String(describing: error)
+                    ])
+                    return false
+                }
+                removePtyEventBuffer(ptyId: ptyId)
+                return true
+            }
+        }
+    }
+
+    private func encodeRuntimeControlProcEventFrame(
+        procId: String,
+        kind: RuntimeControlProcEventKind,
+        payload: Data,
+        exitCode: Int32? = nil,
+        text: String? = nil
+    ) throws -> Data {
+        let header = RuntimeControlEventHeader(
+            kind: kind.rawValue,
+            ptyId: nil,
+            procId: procId,
+            exitCode: exitCode,
+            text: text
+        )
+        return try runtimeControlEncodeFrame(
+            opcode: .procEvent,
+            header: try JSONEncoder().encode(header),
+            payload: payload
+        )
+    }
+
+    private func encodeRuntimeControlPtyEventFrame(
+        ptyId: String,
+        kind: RuntimeControlPtyEventKind,
+        payload: Data,
+        exitCode: Int32? = nil,
+        text: String? = nil
+    ) throws -> Data {
+        let header = RuntimeControlEventHeader(
+            kind: kind.rawValue,
+            ptyId: ptyId,
+            procId: nil,
+            exitCode: exitCode,
+            text: text
+        )
+        return try runtimeControlEncodeFrame(
+            opcode: .ptyEvent,
+            header: try JSONEncoder().encode(header),
+            payload: payload
+        )
+    }
+
+    private func handleProcOpen(_ request: RuntimeControlRequest) -> RuntimeControlResponse {
+        guard let context = resolveContext(for: request),
+              let client = context.initClient ?? initClient else {
+            return RuntimeControlResponse(ok: false, error: "instance_not_running")
+        }
+        guard let readClient = context.initReadClient ?? context.initClient ?? initClient else {
+            return RuntimeControlResponse(ok: false, error: "instance_not_running")
+        }
+        guard let argv = request.argv, !argv.isEmpty else {
+            return RuntimeControlResponse(ok: false, error: "missing argv")
+        }
+        let procTarget = resolveCWDForwarding(argv: argv, cwd: request.cwd)
+        let envAdditions = mergedExecEnvAdditions(request.envAdditions)
+        logSessionScopedEvent(
+            sessionID: request.sessionId,
+            fallbackInstance: context.instanceName,
+            event: "proc_open_send_started",
+            fields: [
+                "argv0": argv[0],
+                "transport": "control",
+                "run_as_root": request.runAsRoot == true ? "true" : "false"
+            ]
+        )
+        do {
+            let resp = try client.procOpen(
+                argv: procTarget.argv,
+                cwd: procTarget.cwd,
+                envAdditions: envAdditions,
+                runAsRoot: request.runAsRoot,
+                timeoutMs: 3_000
+            )
+            logSessionScopedEvent(
+                sessionID: request.sessionId,
+                fallbackInstance: context.instanceName,
+                event: "proc_open_response_received",
+                fields: [
+                    "argv0": argv[0],
+                    "transport": "control",
+                    "ok": resp.ok ? "true" : "false",
+                    "proc_id": resp.procId ?? "",
+                    "error": resp.error?.message ?? ""
+                ]
+            )
+            if resp.ok, let procId = resp.procId {
+                _ = registerProcEventBuffer(procId: procId)
+                startProcSubscription(
+                    client: readClient,
+                    procId: procId,
+                    instanceName: context.instanceName,
+                    sessionId: request.sessionId
+                )
+                logSessionScopedEvent(
+                    sessionID: request.sessionId,
+                    fallbackInstance: context.instanceName,
+                    event: "session_proc_opened",
+                    fields: ["op": "proc_open", "proc_id": procId]
+                )
+                return RuntimeControlResponse(ok: true, procId: procId)
+            }
+            return RuntimeControlResponse(ok: false, error: resp.error?.message ?? "proc_open failed")
+        } catch {
+            let message = String(describing: error)
+            logSessionScopedEvent(
+                sessionID: request.sessionId,
+                fallbackInstance: context.instanceName,
+                event: "proc_open_send_failed",
+                fields: [
+                    "argv0": argv[0],
+                    "transport": "control",
+                    "error": message
+                ]
+            )
+            invalidateTransportIfNeeded(
+                context: context,
+                sessionID: request.sessionId,
+                reason: "proc_open_transport_failed",
+                message: message
+            )
+            return RuntimeControlResponse(ok: false, error: String(describing: error))
+        }
+    }
+
+    private func handleProcRead(_ request: RuntimeControlRequest) -> RuntimeControlResponse {
+        guard let context = resolveContext(for: request) else {
+            return RuntimeControlResponse(ok: false, error: "instance_not_running")
+        }
+        guard let procId = request.procId else {
+            return RuntimeControlResponse(ok: false, error: "missing procId")
+        }
+        guard let buffer = lookupProcEventBuffer(procId: procId) else {
+            return RuntimeControlResponse(ok: false, error: "unknown procId")
+        }
+        if !hasProcSubscriptionSource(procId: procId),
+           let client = context.initClient ?? initClient {
+            do {
+                let resp = try client.procRead(procId: procId, timeoutMs: request.timeoutMs ?? 200)
+                let mappedChunks = resp.chunks?.map { chunk in
+                    var mapped = RuntimeControlStreamChunk(stream: chunk.stream, dataBase64: chunk.dataBase64)
+                    mapped.rawData = chunk.rawData
+                    return mapped
+                }
+                return RuntimeControlResponse(
+                    ok: resp.ok,
+                    error: resp.error?.message,
+                    exitCode: resp.exitCode,
+                    stdoutBase64: resp.stdoutBase64,
+                    stderrBase64: resp.stderrBase64,
+                    chunks: mappedChunks,
+                    meta: resp.meta,
+                    rawStdout: resp.rawStdout,
+                    rawStderr: resp.rawStderr
+                )
+            } catch {
+                return RuntimeControlResponse(ok: false, error: String(describing: error))
+            }
+        }
+        let outcome = buffer.collect(timeoutMs: request.timeoutMs ?? 200)
+        if let failure = outcome.failure {
+            return RuntimeControlResponse(ok: false, error: failure)
+        }
+        var stdout = Data()
+        var stderr = Data()
+        var chunks: [RuntimeControlStreamChunk] = []
+        for event in outcome.events {
+            switch event {
+            case .stdout(let data):
+                stdout.append(data)
+                var chunk = RuntimeControlStreamChunk(stream: "stdout", dataBase64: data.base64EncodedString())
+                chunk.rawData = data
+                chunks.append(chunk)
+            case .stderr(let data):
+                stderr.append(data)
+                var chunk = RuntimeControlStreamChunk(stream: "stderr", dataBase64: data.base64EncodedString())
+                chunk.rawData = data
+                chunks.append(chunk)
+            case .exited, .streamsClosed, .failed:
+                break
+            }
+        }
+        if !stdout.isEmpty || !stderr.isEmpty || !chunks.isEmpty {
+            var fields: [String: String] = ["op": "proc_read", "proc_id": procId]
+            if !stdout.isEmpty { fields["stdout_len"] = String(stdout.count) }
+            if !stderr.isEmpty { fields["stderr_len"] = String(stderr.count) }
+            if !chunks.isEmpty { fields["chunk_count"] = String(chunks.count) }
+            if let exitCode = outcome.exitCode { fields["exit_code"] = String(exitCode) }
+            if let exitReason = outcome.exitReason { fields["exit_reason"] = exitReason }
+            logSessionScopedEvent(
+                sessionID: request.sessionId,
+                fallbackInstance: context.instanceName,
+                event: "session_proc_output",
+                fields: fields
+            )
+        }
+        if outcome.finalize {
+            removeProcEventBuffer(procId: procId)
+        }
+        var meta: [String: String]? = nil
+        if let exitCode = outcome.exitCode {
+            meta = ["exitCode": String(exitCode)]
+            if let exitReason = outcome.exitReason {
+                meta?["exitReason"] = exitReason
+            }
+        }
+        return RuntimeControlResponse(
+            ok: true,
+            exitCode: outcome.exitCode,
+            stdoutBase64: stdout.isEmpty ? nil : stdout.base64EncodedString(),
+            stderrBase64: stderr.isEmpty ? nil : stderr.base64EncodedString(),
+            chunks: chunks.isEmpty ? nil : chunks,
+            meta: meta,
+            rawStdout: stdout.isEmpty ? nil : stdout,
+            rawStderr: stderr.isEmpty ? nil : stderr
+        )
+    }
+
+    private func handleProcWrite(_ request: RuntimeControlRequest) -> RuntimeControlResponse {
+        guard let context = resolveContext(for: request),
+              let client = context.initWriteClient ?? context.initClient ?? initClient else {
+            return RuntimeControlResponse(ok: false, error: "instance_not_running")
+        }
+        guard let procId = request.procId else {
+            return RuntimeControlResponse(ok: false, error: "missing procId")
+        }
+        let data = request.rawData ?? {
+            guard let b64 = request.dataBase64 else { return nil }
+            return Data(base64Encoded: b64)
+        }()
+        guard let data else {
+            return RuntimeControlResponse(ok: false, error: "missing procId or data")
+        }
+        noteGuestActivity()
+        let startedAt = Date()
+        do {
+            let resp = try client.procWrite(procId: procId, data: data, timeoutMs: request.timeoutMs ?? 10_000)
+            if resp.ok {
+                var fields: [String: String] = [
+                    "op": "proc_write",
+                    "proc_id": procId,
+                    "bytes": String(data.count),
+                    "init_channel_ms": String(Int(Date().timeIntervalSince(startedAt) * 1000))
+                ]
+                if let meta = resp.meta {
+                    if let queueSendMs = meta["queueSendMs"] {
+                        fields["guest_queue_send_ms"] = queueSendMs
+                    }
+                    if let bytes = meta["bytes"] {
+                        fields["guest_bytes"] = bytes
+                    }
+                }
+                logSessionScopedEvent(
+                    sessionID: request.sessionId,
+                    fallbackInstance: context.instanceName,
+                    event: "session_proc_input",
+                    fields: fields
+                )
+            }
+            return RuntimeControlResponse(ok: resp.ok, error: resp.error?.message)
+        } catch {
+            invalidateTransportIfNeeded(
+                context: context,
+                sessionID: request.sessionId,
+                reason: "proc_write_transport_failed",
+                message: String(describing: error)
+            )
+            return RuntimeControlResponse(ok: false, error: String(describing: error))
+        }
+    }
+
+    private func handleProcStdinClose(_ request: RuntimeControlRequest) -> RuntimeControlResponse {
+        guard let context = resolveContext(for: request),
+              let client = context.initWriteClient ?? context.initClient ?? initClient else {
+            return RuntimeControlResponse(ok: false, error: "instance_not_running")
+        }
+        guard let procId = request.procId else {
+            return RuntimeControlResponse(ok: false, error: "missing procId")
+        }
+        do {
+            let resp = try client.procStdinClose(procId: procId, timeoutMs: 500)
+            if resp.ok {
+                var fields: [String: String] = ["op": "proc_stdin_close", "proc_id": procId]
+                if let meta = resp.meta {
+                    if let alreadyClosed = meta["alreadyClosed"] {
+                        fields["already_closed"] = alreadyClosed
+                    }
+                    if let childAlive = meta["childAlive"] {
+                        fields["child_alive"] = childAlive
+                    }
+                    if let closeReason = meta["closeReason"] {
+                        fields["close_reason"] = closeReason
+                    }
+                    if let closed = meta["closed"] {
+                        fields["closed"] = closed
+                    }
+                }
+                logSessionScopedEvent(
+                    sessionID: request.sessionId,
+                    fallbackInstance: context.instanceName,
+                    event: "session_proc_stdin_closed",
+                    fields: fields
+                )
+            }
+            return RuntimeControlResponse(ok: resp.ok, error: resp.error?.message, meta: resp.meta)
+        } catch {
+            invalidateTransportIfNeeded(
+                context: context,
+                sessionID: request.sessionId,
+                reason: "proc_stdin_close_transport_failed",
+                message: String(describing: error)
+            )
+            return RuntimeControlResponse(ok: false, error: String(describing: error))
+        }
+    }
+
+    private func isTransportFailureMessage(_ message: String) -> Bool {
+        let lowered = message.lowercased()
+        return lowered.contains("broken pipe")
+            || lowered.contains("connection closed")
+            || lowered.contains("unexpected eof")
+            || lowered.contains("eof")
+            || lowered.contains("pollhup")
+            || lowered.contains("pollerr")
+            || lowered.contains("read timeout")
+            || lowered.contains("timeout")
+    }
+
+    private func invalidateTransportIfNeeded(
+        context: InstanceRuntimeContext,
+        sessionID: String?,
+        reason: String,
+        message: String
+    ) {
+        guard isTransportFailureMessage(message) else {
+            return
+        }
+        invalidateInstanceTransport(
+            context: context,
+            sessionID: sessionID,
+            reason: reason,
+            message: message
+        )
+    }
+
+    private func invalidateInstanceTransport(
+        context: InstanceRuntimeContext,
+        sessionID: String?,
+        reason: String,
+        message: String
+    ) {
+        logSessionScopedEvent(
+            sessionID: sessionID,
+            fallbackInstance: context.instanceName,
+            event: "instance_transport_invalidated",
+            fields: [
+                "reason": reason,
+                "error": message
+            ]
+        )
+        context.lastError = message
+        context.initClient = nil
+        context.initWriteClient = nil
+        context.initReadClient = nil
+        context.housekeepingClient = nil
+        context.lifecycleState = .error
+        context.vmRunner?.stopRunningVM()
+        context.vmRunner = nil
+        context.clearBootError()
+        publishInstanceStateEvent(
+            instance: context.instanceName,
+            state: "Error",
+            reason: reason,
+            error: message
+        )
+        try? lock.withExclusiveLock {
+            var state = try store.loadState()
+            let existing = state.instances?.first(where: { $0.instance == context.instanceName })
+            upsertInstanceState(
+                &state,
+                instanceName: context.instanceName,
+                lifecycleState: .error,
+                activeSessionCount: existing?.activeSessionCount ?? 0,
+                idleTimer: existing?.idleTimer ?? IdleTimerState(armed: false, deadlineEpochMs: nil),
+                runtimeHostPid: existing?.runtimeHostPid ?? state.runtimeHostPid,
+                runtimeControlSocket: existing?.runtimeControlSocket ?? state.runtimeControlSocket,
+                runtimeUser: existing?.runtimeUser,
+                initChannel: existing?.initChannel,
+                lastError: message
+            )
+            try store.saveState(state)
+        }
+    }
+
+    private func handleProcClose(_ request: RuntimeControlRequest) -> RuntimeControlResponse {
+        guard let context = resolveContext(for: request),
+              let client = context.initWriteClient ?? context.initClient ?? initClient else {
+            return RuntimeControlResponse(ok: false, error: "instance_not_running")
+        }
+        guard let procId = request.procId else {
+            return RuntimeControlResponse(ok: false, error: "missing procId")
+        }
+        do {
+            let resp = try client.procClose(procId: procId, timeoutMs: 500)
+            var fields: [String: String] = ["op": "proc_close", "proc_id": procId, "result": resp.ok ? "ok" : "failed"]
+            if let meta = resp.meta {
+                if let exitCode = meta["exitCode"] {
+                    fields["exit_code"] = exitCode
+                }
+                if let exitReason = meta["exitReason"] {
+                    fields["exit_reason"] = exitReason
+                }
+                if let closeAction = meta["closeAction"] {
+                    fields["close_action"] = closeAction
+                }
+                if let closed = meta["closed"] {
+                    fields["closed"] = closed
+                }
+            }
+            logSessionScopedEvent(
+                sessionID: request.sessionId,
+                fallbackInstance: context.instanceName,
+                event: "session_proc_closed",
+                fields: fields
+            )
+            removeProcEventBuffer(procId: procId)
+            return RuntimeControlResponse(ok: resp.ok, error: resp.error?.message, exitCode: resp.exitCode, meta: resp.meta)
+        } catch {
+            let message = String(describing: error)
+            logSessionScopedEvent(
+                sessionID: request.sessionId,
+                fallbackInstance: context.instanceName,
+                event: "session_proc_closed",
+                fields: [
+                    "op": "proc_close",
+                    "proc_id": procId,
+                    "result": "transport_failed",
+                    "error": message
+                ]
+            )
+            removeProcEventBuffer(procId: procId)
+            return RuntimeControlResponse(ok: false, error: message)
         }
     }
 
@@ -1870,11 +3980,41 @@ public final class DaemonServer {
         dnsReconcileLock.lock()
         defer { dnsReconcileLock.unlock() }
         let instanceName = resolveTargetInstanceName(request)
+        let dnsSource = request.dnsSource?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+            ? request.dnsSource!.trimmingCharacters(in: .whitespacesAndNewlines)
+            : "manual"
+        let isBackgroundRequest = ["startup", "host_change", "stale_guard"].contains(dnsSource)
         guard let context = resolveContext(for: RuntimeControlRequest(
             op: request.op,
             instance: instanceName,
             sessionId: request.sessionId
-        )), let client = context.initClient ?? initClient else {
+        )) else {
+            return RuntimeControlResponse(ok: false, error: "instance_not_running")
+        }
+        let client = isBackgroundRequest
+            ? housekeepingClient(for: instanceName)
+            : (context.initClient ?? initClient)
+        guard let client else {
+            if isBackgroundRequest {
+                logger.log("housekeeping_client_unavailable", fields: [
+                    "instance": instanceName,
+                    "request_source": "housekeeping",
+                    "kind": "dns_reconcile",
+                    "source": dnsSource
+                ])
+                return updateDNSStateAndRespond(
+                    instanceName: instanceName,
+                    mode: currentDNSMetaSnapshot(instanceName: instanceName)["dns_mode"] ?? "host",
+                    status: "deferred",
+                    action: "skipped",
+                    source: dnsSource,
+                    nameserverCount: 0,
+                    searchDomainCount: 0,
+                    snapshotHash: "",
+                    errorClass: "housekeeping_unavailable",
+                    error: "housekeeping client unavailable"
+                )
+            }
             return RuntimeControlResponse(ok: false, error: "instance_not_running")
         }
         let metadataURL = context.metadataURL
@@ -1882,11 +4022,10 @@ public final class DaemonServer {
         guard let metadataURL else {
             return RuntimeControlResponse(ok: false, error: "runtime metadata unavailable")
         }
-
-        let dnsSource = request.dnsSource?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
-            ? request.dnsSource!.trimmingCharacters(in: .whitespacesAndNewlines)
-            : "manual"
-        logger.log("dns_reconcile_started", fields: ["dns_source": dnsSource])
+        logger.log("dns_reconcile_started", fields: [
+            "dns_source": dnsSource,
+            "request_source": isBackgroundRequest ? "housekeeping" : "user"
+        ])
 
         do {
             let metadata = try distributionManager.readOrRebuildInstanceMetadata(at: metadataURL)
@@ -2120,10 +4259,10 @@ public final class DaemonServer {
         return runtimeDNSMeta
     }
 
-    private func ensureGuestTransportReadyViaExec(client: InitChannelClient) -> (ok: Bool, error: String?) {
-        let script = """
+    static let guestTransportReadyScript = """
         set -eu
-        UDHCP_SCRIPT=/tmp/msl-udhcpc-script.sh
+        UDHCP_SCRIPT="$(mktemp /tmp/msl-udhcpc-script.XXXXXX)"
+        trap 'rm -f "$UDHCP_SCRIPT"' EXIT
         cat > "$UDHCP_SCRIPT" <<'EOF'
         #!/bin/sh
         set -eu
@@ -2196,6 +4335,250 @@ public final class DaemonServer {
         has_transport
         """
 
+    static func makeVSCodeServerDirectoriesCommand(home: String) -> String {
+        let safeHome = home.isEmpty ? "/root" : home
+        return """
+    mkdir -p '\(safeHome)/.vscode-server/extensionsCache' '\(safeHome)/.vscode-server/extensions' '\(safeHome)/.vscode-server/data/Machine'
+    if [ -d '\(safeHome)/.vscode-server/bin' ]; then
+      find '\(safeHome)/.vscode-server/bin' -mindepth 1 -maxdepth 1 -type d | while read -r dir; do
+        if [ -e "$dir/product.json" ] && ! cat "$dir/product.json" >/dev/null 2>&1; then
+          rm -rf "$dir"
+        fi
+      done
+    fi
+    root_fstype="$(findmnt -n -o FSTYPE / 2>/dev/null || true)"
+    if [ "$root_fstype" = "btrfs" ]; then
+      if [ -f /etc/fstab ]; then
+        tmp="$(mktemp /tmp/msl-fstab.XXXXXX)"
+        awk '
+          BEGIN { root_done=0 }
+          /^[[:space:]]*#/ || NF < 2 { print; next }
+          {
+            if ($2 == "/") {
+              if (root_done == 0) {
+                print "/dev/vda / auto defaults,nodiscard 0 1"
+                root_done = 1
+              }
+              next
+            }
+            print
+          }
+        ' /etc/fstab > "$tmp"
+        cat "$tmp" > /etc/fstab
+        rm -f "$tmp"
+      fi
+      mount -o remount,nodiscard / >/dev/null 2>&1 || true
+    fi
+    """
+    }
+
+    static func makeVSCodeRuntimeStateDirectoriesCommand() -> String {
+        return """
+    mkdir -p /var/devcontainer
+    """
+    }
+
+    static func makeVSCodeRootStateMarkerCreateCommand(location: String) -> String {
+        let safeLocation = shellSingleQuote(location)
+        let safeDirectory = shellSingleQuote((location as NSString).deletingLastPathComponent)
+        return "test ! -f \(safeLocation) && set -o noclobber && mkdir -p \(safeDirectory) && { > \(safeLocation) ; } 2> /dev/null"
+    }
+
+    static func makeVSCodePatchEtcEnvironmentCommand(env: [String: String]) -> String {
+        let lines = env.keys.sorted().map { key -> String in
+            let value = env[key] ?? ""
+            let escapedValue = value
+                .replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "\"", with: "\\\"")
+            return "\(key)=\"\(escapedValue)\""
+        }
+        return """
+    cat >> /etc/environment <<'etcEnvironmentEOF'
+
+    \(lines.joined(separator: "\n"))
+    etcEnvironmentEOF
+    """
+    }
+
+    static func makeVSCodePatchEtcProfileCommand() -> String {
+        "sed -i -E 's/((^|\\\\s)PATH=)([^\\\\$]*)$/\\\\1\\${PATH:-\\\\3}/g' /etc/profile || true"
+    }
+
+    static func makeVSCodeRuntimeEnvironment(user: String, home: String, shell: String) -> [String: String] {
+        [
+            "HOME": home.isEmpty ? "/root" : home,
+            "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "SHELL": shell.isEmpty ? "/bin/sh" : shell,
+            "USER": user.isEmpty ? "root" : user
+        ]
+    }
+
+    private static func shellSingleQuote(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
+    private static func nonEmpty(_ value: String) -> String? {
+        value.isEmpty ? nil : value
+    }
+
+    private struct VSCodeRootShellCommandResult {
+        var exitCode: Int32
+        var stdout: String
+        var stderr: String
+    }
+
+    private func ensureVSCodeRootState(
+        client: InitChannelClient,
+        instanceName: String,
+        runtimeHome: String,
+        runtimeUser: String,
+        runtimeShell: String
+    ) {
+        let rootEnv = Self.makeVSCodeRuntimeEnvironment(
+            user: runtimeUser,
+            home: runtimeHome,
+            shell: runtimeShell
+        )
+        let environmentMarker = "/var/devcontainer/.patchEtcEnvironmentMarker"
+        let profileMarker = "/var/devcontainer/.patchEtcProfileMarker"
+
+        do {
+            let prepare = try runVSCodeRootCommand(
+                client: client,
+                command: Self.makeVSCodeRuntimeStateDirectoriesCommand(),
+                timeoutMs: 2_000
+            )
+            guard prepare.exitCode == 0 else {
+                logger.log("root_state_prepare_failed", fields: [
+                    "instance": instanceName,
+                    "exit_code": String(prepare.exitCode),
+                    "stderr": Self.nonEmpty(prepare.stderr) ?? Self.nonEmpty(prepare.stdout) ?? "unknown"
+                ])
+                return
+            }
+            logger.log("vscode_runtime_state_dirs_ensured", fields: [
+                "instance": instanceName,
+                "scope": "root",
+                "home": runtimeHome,
+                "devcontainer_dir": "/var/devcontainer"
+            ])
+        } catch {
+            logger.log("root_state_prepare_failed", fields: [
+                "instance": instanceName,
+                "error": String(describing: error)
+            ])
+            return
+        }
+
+        ensureVSCodeRootPatch(
+            client: client,
+            instanceName: instanceName,
+            markerPath: environmentMarker,
+            patchCommand: Self.makeVSCodePatchEtcEnvironmentCommand(env: rootEnv),
+            logName: "patchEtcEnvironment"
+        )
+        ensureVSCodeRootPatch(
+            client: client,
+            instanceName: instanceName,
+            markerPath: profileMarker,
+            patchCommand: Self.makeVSCodePatchEtcProfileCommand(),
+            logName: "patchEtcProfile"
+        )
+    }
+
+    private func ensureVSCodeRootPatch(
+        client: InitChannelClient,
+        instanceName: String,
+        markerPath: String,
+        patchCommand: String,
+        logName: String
+    ) {
+        do {
+            let exists = try runVSCodeRootCommand(
+                client: client,
+                command: "test -f \(Self.shellSingleQuote(markerPath))",
+                timeoutMs: 2_000
+            )
+            if exists.exitCode == 0 {
+                logger.log("vscode_root_patch_skipped", fields: [
+                    "instance": instanceName,
+                    "marker": markerPath,
+                    "patch": logName,
+                    "reason": "marker_exists"
+                ])
+                return
+            }
+
+            let create = try runVSCodeRootCommand(
+                client: client,
+                command: Self.makeVSCodeRootStateMarkerCreateCommand(location: markerPath),
+                timeoutMs: 2_000
+            )
+            guard create.exitCode == 0 else {
+                logger.log("root_patch_exec_failed", fields: [
+                    "instance": instanceName,
+                    "marker": markerPath,
+                    "patch": logName,
+                    "phase": "create_marker",
+                    "exit_code": String(create.exitCode),
+                    "stderr": Self.nonEmpty(create.stderr) ?? Self.nonEmpty(create.stdout) ?? "unknown"
+                ])
+                return
+            }
+
+            let patch = try runVSCodeRootCommand(
+                client: client,
+                command: patchCommand,
+                timeoutMs: 4_000
+            )
+            guard patch.exitCode == 0 else {
+                logger.log("root_patch_exec_failed", fields: [
+                    "instance": instanceName,
+                    "marker": markerPath,
+                    "patch": logName,
+                    "phase": "apply_patch",
+                    "exit_code": String(patch.exitCode),
+                    "stderr": Self.nonEmpty(patch.stderr) ?? Self.nonEmpty(patch.stdout) ?? "unknown"
+                ])
+                return
+            }
+
+            logger.log("vscode_root_patch_applied", fields: [
+                "instance": instanceName,
+                "marker": markerPath,
+                "patch": logName
+            ])
+        } catch {
+            logger.log("root_patch_exec_failed", fields: [
+                "instance": instanceName,
+                "marker": markerPath,
+                "patch": logName,
+                "error": String(describing: error)
+            ])
+        }
+    }
+
+    private func runVSCodeRootCommand(
+        client: InitChannelClient,
+        command: String,
+        timeoutMs: Int
+    ) throws -> VSCodeRootShellCommandResult {
+        let response = try client.send(InitChannelRequest(
+            op: "exec",
+            argv: ["/bin/sh", "-lc", command],
+            runAsRoot: true,
+            timeoutMs: timeoutMs
+        ))
+        return VSCodeRootShellCommandResult(
+            exitCode: response.exitCode ?? (response.ok ? 0 : 1),
+            stdout: response.stdout ?? "",
+            stderr: response.stderr ?? response.error?.message ?? ""
+        )
+    }
+
+    private func ensureGuestTransportReadyViaExec(client: InitChannelClient) -> (ok: Bool, error: String?) {
+        let script = Self.guestTransportReadyScript
+
         do {
             let response = try client.send(InitChannelRequest(
                 op: "exec",
@@ -2212,27 +4595,104 @@ public final class DaemonServer {
         }
     }
 
-    private func maybeReconcileDNSBeforeGuestOperation(instanceName: String) {
-        let meta = currentDNSMetaSnapshot(instanceName: instanceName)
-        if meta["dns_mode"] == "unmanaged" {
-            return
+    private func ensureRootVSCodeServerDirectories(client: InitChannelClient, instanceName: String) {
+        let runtime = instanceRegistry.context(for: instanceName).runtimeUser
+        let runtimeHome = runtime?.home ?? "/root"
+        let runtimeUser = runtime?.name ?? "root"
+        let runtimeShell = runtime?.shell ?? "/bin/sh"
+        do {
+            let response = try client.send(InitChannelRequest(
+                op: "exec",
+                argv: ["/bin/sh", "-lc", Self.makeVSCodeServerDirectoriesCommand(home: runtimeHome)],
+                runAsRoot: runtimeUser == "root",
+                timeoutMs: 2_000
+            ))
+            let exitCode = response.exitCode ?? 0
+            if response.ok, exitCode == 0 {
+                logger.log("vscode_server_dirs_ensured", fields: [
+                    "instance": instanceName,
+                    "scope": runtimeUser,
+                    "home": runtimeHome
+                ])
+            } else {
+                logger.log("vscode_server_dirs_ensure_failed", fields: [
+                    "instance": instanceName,
+                    "scope": runtimeUser,
+                    "home": runtimeHome,
+                    "exit_code": String(exitCode),
+                    "error": response.error?.message ?? response.stderr ?? "unknown"
+                ])
+            }
+        } catch {
+            logger.log("vscode_server_dirs_ensure_failed", fields: [
+                "instance": instanceName,
+                "scope": runtimeUser,
+                "home": runtimeHome,
+                "error": String(describing: error)
+            ])
         }
-        let now = nowEpochMs()
-        let lastReconcileMs = Int64(meta["last_reconcile_epoch_ms"] ?? "0") ?? 0
-        let snapshot = HostResolverSnapshotProvider().capture()
-        let lastHash = meta["snapshot_hash"] ?? ""
-        if !lastHash.isEmpty && snapshot.hash != lastHash {
-            _ = handleDNSReconcile(RuntimeControlRequest(op: "dns_reconcile", instance: instanceName, dnsSource: "stale_guard"))
-            return
-        }
-        if now - lastReconcileMs >= 60_000 {
-            _ = handleDNSReconcile(RuntimeControlRequest(op: "dns_reconcile", instance: instanceName, dnsSource: "stale_guard"))
+        ensureVSCodeRootState(
+            client: client,
+            instanceName: instanceName,
+            runtimeHome: runtimeHome,
+            runtimeUser: runtimeUser,
+            runtimeShell: runtimeShell
+        )
+    }
+
+    private func housekeepingClient(for instanceName: String) -> InitChannelClient? {
+        let context = instanceRegistry.context(for: instanceName)
+        return context.housekeepingClient
+    }
+
+    private func scheduleBackgroundDNSReconcile(instanceName: String, source: String) {
+        housekeepingQueue.async { [weak self] in
+            guard let self else { return }
+            if self.backgroundDNSReconcileRunning {
+                self.backgroundDNSReconcilePendingSource = source
+                self.logger.log("housekeeping_exec_skipped", fields: [
+                    "instance": instanceName,
+                    "request_source": "housekeeping",
+                    "kind": "dns_reconcile",
+                    "reason": "coalesced",
+                    "source": source
+                ])
+                return
+            }
+            self.backgroundDNSReconcileRunning = true
+            defer {
+                self.backgroundDNSReconcileRunning = false
+                if let pendingSource = self.backgroundDNSReconcilePendingSource {
+                    self.backgroundDNSReconcilePendingSource = nil
+                    self.scheduleBackgroundDNSReconcile(instanceName: instanceName, source: pendingSource)
+                }
+            }
+
+            self.logger.log("housekeeping_exec_started", fields: [
+                "instance": instanceName,
+                "request_source": "housekeeping",
+                "kind": "dns_reconcile",
+                "source": source
+            ])
+            let response = self.handleDNSReconcile(RuntimeControlRequest(
+                op: "dns_reconcile",
+                instance: instanceName,
+                dnsSource: source
+            ))
+            if !response.ok {
+                self.logger.log("dns_reconcile_deferred", fields: [
+                    "instance": instanceName,
+                    "request_source": "housekeeping",
+                    "source": source,
+                    "error": response.error ?? "unknown"
+                ])
+            }
         }
     }
 
     private func startDNSMonitorLoop() {
         stopDNSMonitorLoop()
-        let source = DispatchSource.makeTimerSource(queue: dnsMonitorQueue)
+        let source = DispatchSource.makeTimerSource(queue: housekeepingQueue)
         source.schedule(deadline: .now() + .seconds(5), repeating: .seconds(5))
         source.setEventHandler { [weak self] in
             guard let self else { return }
@@ -2247,7 +4707,14 @@ public final class DaemonServer {
                 return
             }
             if self.lastHostResolverSnapshotHash != snapshot.hash {
-                _ = self.handleDNSReconcile(RuntimeControlRequest(op: "dns_reconcile", instance: instanceName, dnsSource: "host_change"))
+                self.scheduleBackgroundDNSReconcile(instanceName: instanceName, source: "host_change")
+                self.lastHostResolverSnapshotHash = snapshot.hash
+                return
+            }
+            let now = nowEpochMs()
+            let lastReconcileMs = Int64(meta["last_reconcile_epoch_ms"] ?? "0") ?? 0
+            if now - lastReconcileMs >= 60_000 {
+                self.scheduleBackgroundDNSReconcile(instanceName: instanceName, source: "stale_guard")
             }
         }
         source.resume()
@@ -2559,14 +5026,25 @@ public final class DaemonServer {
 
     private func stopInstanceRuntime(instanceName: String, reason: String) {
         let context = instanceRegistry.context(for: instanceName)
+        let metadataURL = context.metadataURL
         context.lifecycleState = .stopping
         context.vmRunner?.stopRunningVM()
+        resetTmpStorageAfterStop(
+            metadataURL: metadataURL,
+            instanceName: instanceName
+        )
         context.vmRunner = nil
         context.initClient = nil
+        context.initWriteClient = nil
+        context.initReadClient = nil
+        context.housekeepingClient = nil
         context.runtimeUser = nil
         context.lifecycleState = .stopped
         context.lastError = nil
         context.clearBootError()
+        if let attachedDaemon = attachedContainerDaemons.removeValue(forKey: instanceName) {
+            attachedDaemon.stop()
+        }
 
         do {
             try lock.withExclusiveLock {
@@ -2650,6 +5128,10 @@ public final class DaemonServer {
         disarmAllIdleTimers()
         controlServer?.stop()
         eventBus?.stop()
+        for daemon in attachedContainerDaemons.values {
+            daemon.stop()
+        }
+        attachedContainerDaemons.removeAll()
         forwarder?.stopAll()
         if let activeInstanceName {
             instanceRegistry.context(for: activeInstanceName).lifecycleState = .stopping
@@ -2667,12 +5149,14 @@ public final class DaemonServer {
         logger.log("daemon_stopped")
     }
 
-    private func updateStateStopped() {
+    private func updateStateStopped(lastError: String? = nil, clearError: Bool? = nil) {
         do {
             try lock.withExclusiveLock {
                 var state = try store.loadState()
                 let instanceName = currentRuntimeInstanceName()
+                let shouldClearError = clearError ?? (lastError == nil)
                 state.vmState = .stopped
+                state.lifecycleState = shouldClearError ? .stopped : .error
                 state.activeSessionCount = 0
                 state.idleTimer = IdleTimerState(armed: false, deadlineEpochMs: nil)
                 state.lastTransitionEpochMs = nowEpochMs()
@@ -2682,17 +5166,33 @@ public final class DaemonServer {
                 state.daemonControlSocket = nil
                 state.daemonEventSocket = nil
                 state.runtimeUser = nil
+                if shouldClearError {
+                    state.startupEpochMs = nil
+                    state.startupStep = nil
+                    state.startupStepName = nil
+                    state.startupStepStatus = nil
+                    state.lastErrorCode = nil
+                    state.lastErrorMessage = nil
+                } else {
+                    state.lastErrorMessage = lastError
+                }
                 upsertInstanceState(
                     &state,
                     instanceName: instanceName,
-                    lifecycleState: .stopped,
+                    lifecycleState: shouldClearError ? .stopped : .error,
                     activeSessionCount: 0,
                     idleTimer: state.idleTimer,
                     runtimeHostPid: nil,
                     runtimeControlSocket: nil,
                     runtimeUser: nil,
                     initChannel: state.initChannel,
-                    lastError: nil
+                    lastError: shouldClearError ? nil : lastError,
+                    lastErrorCode: shouldClearError ? nil : state.lastErrorCode,
+                    lastErrorMessage: shouldClearError ? nil : state.lastErrorMessage,
+                    startupEpochMs: state.startupEpochMs,
+                    startupStep: state.startupStep,
+                    startupStepName: state.startupStepName,
+                    startupStepStatus: shouldClearError ? nil : state.startupStepStatus
                 )
                 try store.saveState(state)
                 try sessions.clearAllAndTerminate()
@@ -2714,13 +5214,40 @@ public final class DaemonServer {
         publishInstanceStateEvent(instance: instanceName, state: "Stopped", reason: "daemon_shutdown")
     }
 
+    private func ensureAttachedContainerDaemonStarted(instanceName: String) throws {
+        if let existing = attachedContainerDaemons[instanceName] {
+            try existing.start()
+            logger.log("daemon_attached_socket_started", fields: [
+                "path": existing.socketPath,
+                "instance": instanceName
+            ])
+            return
+        }
+
+        let attachedDaemon = AttachedContainerDaemon(
+            paths: paths,
+            lock: lock,
+            store: store,
+            logger: logger,
+            executablePath: executablePath,
+            explicitInstanceName: instanceName,
+            distributionManager: distributionManager
+        )
+        try attachedDaemon.start()
+        attachedContainerDaemons[instanceName] = attachedDaemon
+        logger.log("daemon_attached_socket_started", fields: [
+            "path": attachedDaemon.socketPath,
+            "instance": instanceName
+        ])
+    }
+
     private func convergeRuntimeUser(
         client: InitChannelClient,
         metadataURL: URL,
         instanceName: String
     ) throws -> ConvergedRuntimeUserResult {
         let policy = try distributionManager.resolveUserConvergencePolicy(metadataURL: metadataURL)
-        let hostUser = resolveHostUserContext(policy: policy)
+        let hostUser = resolveHostUserContext(policy: policy, instanceName: instanceName)
 
         logger.log("user_convergence_started", fields: [
             "instance": instanceName,
@@ -2787,12 +5314,21 @@ public final class DaemonServer {
         return ConvergedRuntimeUserResult(runtimeUser: runtimeUser, adminGroup: policy.adminGroup)
     }
 
-    private func resolveHostUserContext(policy: UserConvergencePolicy) -> InitConvergeUserSpec {
+    private func resolveHostUserContext(
+        policy: UserConvergencePolicy,
+        instanceName: String
+    ) -> InitConvergeUserSpec {
         let env = ProcessInfo.processInfo.environment
         let forceRoot = env["MSL_RUNTIME_USER_ROOT"]?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
-        if forceRoot == "1" || forceRoot == "true" || forceRoot == "yes" {
+        let forceRootRequested = forceRoot == "1" || forceRoot == "true" || forceRoot == "yes"
+        let forceRootAll = env["MSL_RUNTIME_USER_ROOT_SCOPE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() == "all"
+        let internalInstance = distributionManager.isReservedInternalInstanceName(instanceName)
+
+        if forceRootRequested && (internalInstance || forceRootAll) {
             return InitConvergeUserSpec(
                 username: "root",
                 uid: 0,
@@ -2801,6 +5337,13 @@ public final class DaemonServer {
                 preferredShell: "/bin/sh",
                 failOnUIDConflict: false
             )
+        }
+        if forceRootRequested && !internalInstance && !forceRootAll {
+            logger.log("runtime_user_force_root_ignored", fields: [
+                "instance": instanceName,
+                "reason": "non_internal_instance",
+                "hint": "set MSL_RUNTIME_USER_ROOT_SCOPE=all to force root for all instances"
+            ])
         }
         let envUser = env["USER"]?.trimmingCharacters(in: .whitespacesAndNewlines)
         let userName = (envUser?.isEmpty == false ? envUser! : NSUserName())
@@ -2824,7 +5367,7 @@ public final class DaemonServer {
     private func startAutoPortForwardLoop() {
         stopAutoPortForwardLoop()
 
-        let timer = DispatchSource.makeTimerSource(queue: autoPortQueue)
+        let timer = DispatchSource.makeTimerSource(queue: housekeepingQueue)
         timer.schedule(deadline: .now() + .seconds(1), repeating: .seconds(5))
         timer.setEventHandler { [weak self] in
             self?.syncAutoPortMappingsTick()
@@ -2832,9 +5375,15 @@ public final class DaemonServer {
         timer.resume()
         autoPortTimer = timer
 
-        autoPortQueue.async { [weak self] in
+        housekeepingQueue.async { [weak self] in
             self?.syncAutoPortMappingsTick()
         }
+    }
+
+    private func autoPortProbeClient() -> InitChannelClient? {
+        let instanceName = currentRuntimeInstanceName()
+        let context = instanceRegistry.context(for: instanceName)
+        return context.housekeepingClient
     }
 
     private func stopAutoPortForwardLoop() {
@@ -2843,26 +5392,45 @@ public final class DaemonServer {
         portMappingsSnapshotLock.lock()
         autoPortErrorsByHostPort.removeAll()
         portMappingsSnapshotLock.unlock()
+        autoPortNextAllowedEpochMs = 0
     }
 
     private func syncAutoPortMappingsTick() {
-        guard let client = initClient else {
+        let now = nowEpochMs()
+        if now < autoPortNextAllowedEpochMs {
+            return
+        }
+        guard let client = autoPortProbeClient() else {
+            logger.log("auto_port_probe_deferred", fields: [
+                "instance": currentRuntimeInstanceName(),
+                "request_source": "housekeeping",
+                "reason": "housekeeping_client_unavailable"
+            ])
             return
         }
         guard let autoHostPorts = probeAutoForwardHostPorts(client: client) else {
+            autoPortNextAllowedEpochMs = now + 5_000
             return
         }
+        autoPortNextAllowedEpochMs = 0
         syncEffectivePortMappings(autoHostPorts: autoHostPorts, reason: "auto_probe")
     }
 
     private func schedulePortMappingsRefresh(reason: String) {
-        autoPortQueue.async { [weak self] in
+        housekeepingQueue.async { [weak self] in
             guard let self else { return }
-            if let client = self.initClient,
+            if let client = self.autoPortProbeClient(),
                let autoHostPorts = self.probeAutoForwardHostPorts(client: client) {
+                self.autoPortNextAllowedEpochMs = 0
                 self.syncEffectivePortMappings(autoHostPorts: autoHostPorts, reason: reason)
                 return
             }
+            self.logger.log("auto_port_probe_deferred", fields: [
+                "instance": self.currentRuntimeInstanceName(),
+                "request_source": "housekeeping",
+                "reason": "housekeeping_client_unavailable",
+                "trigger": reason
+            ])
             let current = self.currentEffectivePortMappingsSnapshot()
             self.syncEffectivePortMappings(autoHostPorts: current.autoHostPorts, reason: reason)
         }
@@ -2899,6 +5467,11 @@ public final class DaemonServer {
 
     private func probeAutoForwardHostPorts(client: InitChannelClient) -> Set<Int>? {
         do {
+            logger.log("housekeeping_exec_started", fields: [
+                "instance": currentRuntimeInstanceName(),
+                "request_source": "housekeeping",
+                "kind": "auto_port_probe"
+            ])
             let response = try client.send(InitChannelRequest(
                 op: "exec",
                 argv: ["/bin/cat", "/proc/net/tcp"],
@@ -3007,7 +5580,7 @@ public final class DaemonServer {
                 argv: [
                     "/bin/sh",
                     "-lc",
-                    "mkdir -p /usr/local/bin; ln -sf /usr/local/bin/msl-init /usr/local/bin/msl"
+                    "mkdir -p /usr/local/bin; ln -sf /usr/local/bin/msl-init /usr/local/bin/msl; ln -sf /usr/local/bin/msl-init /usr/local/bin/code"
                 ],
                 timeoutMs: 2_000
             ))
@@ -3028,6 +5601,21 @@ public final class DaemonServer {
         reclaimStateQueue.sync {
             lastGuestActivityEpochMs = now
         }
+    }
+
+    private func isBackgroundMemoryMaintenanceSuspended(instanceName: String? = nil) -> Bool {
+        let now = nowEpochMs()
+        let activeInstance = instanceName ?? activeInstanceName ?? currentRuntimeInstanceName()
+        let activeSessionCount: Int = (try? lock.withExclusiveLock(timeoutSec: 1) {
+            let state = try store.loadState()
+            return state.instances?.first(where: { $0.instance == activeInstance })?.activeSessionCount ?? 0
+        }) ?? 0
+        let lastActivity = reclaimStateQueue.sync { lastGuestActivityEpochMs }
+        return MemoryReclaimPolicyResolver.shouldSuspendBackgroundMaintenance(
+            activeSessionCount: activeSessionCount,
+            nowMs: now,
+            lastGuestActivityEpochMs: lastActivity
+        )
     }
 
     private func startMemoryReclaimLoop() {
@@ -3085,6 +5673,9 @@ public final class DaemonServer {
     }
 
     private func evaluateMemoryReclaimOnTimer() {
+        if isBackgroundMemoryMaintenanceSuspended() {
+            return
+        }
         let now = nowEpochMs()
         let snapshot = reclaimStateQueue.sync { () -> (Int64, Int64?, Int64?, Int64?, Int64?) in
             (
@@ -3190,6 +5781,9 @@ public final class DaemonServer {
     }
 
     private func handleHostMemoryPressure(level: String) {
+        if isBackgroundMemoryMaintenanceSuspended() {
+            return
+        }
         let now = nowEpochMs()
         let shouldTrigger = reclaimStateQueue.sync {
             MemoryReclaimPolicyResolver.shouldTriggerHostPressure(

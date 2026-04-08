@@ -14,13 +14,15 @@ final class StateStoreTests: XCTestCase {
         let store = StateStore(paths: paths)
         var state = RuntimeState.initial(nowMs: nowEpochMs())
         state.vmState = .running
+        state.lifecycleState = .running
         state.activeSessionCount = 2
 
         try store.saveState(state)
         let loaded = try store.loadState()
 
-        XCTAssertEqual(loaded.schemaVersion, 2)
+        XCTAssertEqual(loaded.schemaVersion, 3)
         XCTAssertEqual(loaded.vmState, .running)
+        XCTAssertEqual(loaded.lifecycleState, .running)
         XCTAssertEqual(loaded.activeSessionCount, 2)
         XCTAssertEqual(loaded.instances?.first?.instance, loaded.distro)
     }
@@ -28,6 +30,7 @@ final class StateStoreTests: XCTestCase {
     func testInitialStateDefaults() {
         let state = RuntimeState.initial(nowMs: 100)
         XCTAssertEqual(state.vmState, .stopped)
+        XCTAssertEqual(state.lifecycleState, .stopped)
         XCTAssertEqual(state.activeSessionCount, 0)
         XCTAssertFalse(state.idleTimer.armed)
         XCTAssertNil(state.runtimeHostPid)
@@ -145,10 +148,11 @@ final class StateStoreTests: XCTestCase {
         let store = StateStore(paths: paths)
         let migrated = try store.loadState()
 
-        XCTAssertEqual(migrated.schemaVersion, 2)
+        XCTAssertEqual(migrated.schemaVersion, 3)
         XCTAssertEqual(migrated.instances?.count, 1)
         XCTAssertEqual(migrated.instances?.first?.instance, "legacy")
         XCTAssertEqual(migrated.instances?.first?.vmState, .running)
+        XCTAssertEqual(migrated.instances?.first?.lifecycleState, .running)
         XCTAssertEqual(migrated.instances?.first?.runtimeHostPid, 999)
         XCTAssertEqual(migrated.daemonHostPid, 999)
         XCTAssertEqual(migrated.daemonControlSocket, "/tmp/legacy.sock")

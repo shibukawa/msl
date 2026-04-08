@@ -220,6 +220,9 @@ public final class RuntimeManager {
         for key in flags.keys.sorted() {
             let value = flags[key] == true ? "true" : "false"
             print("tool.\(key)=\(value)")
+            if key == "apt", flags[key] == true {
+                print("tool.apt.mode=archives-only")
+            }
         }
         Foundation.exit(0)
     }
@@ -532,137 +535,66 @@ public final class RuntimeManager {
         // Enter raw mode
         let hostTerminal = HostTerminalState.capture()
         enterRawModeForShell()
-
-        // IO pump loop
-        let stdinFD = FileHandle.standardInput.fileDescriptor
-        var exitCode: Int32 = 0
-        var stdinOpen = true
-        var sawOutput = false
-        var consecutiveErrors = 0
-        let maxConsecutiveErrors = 50
-        var idleCount = 0
-        var lastRows = size.rows
-        var lastCols = size.cols
-
-        while true {
-            // Check window size changes
-            let currentSize = currentWindowSize()
-            if let r = currentSize.rows, let c = currentSize.cols,
-               r != lastRows || c != lastCols {
-                _ = try? daemonClient.send(RuntimeControlRequest(
-                    op: "pty_resize",
-                    ptyId: ptyId,
-                    rows: r,
-                    cols: c,
-                    sessionId: sessionID
-                ))
-                lastRows = r
-                lastCols = c
-            }
-
-            // Poll stdin
-            let stdinPollMs: Int32
-            if idleCount <= 2 {
-                stdinPollMs = 30
-            } else if idleCount <= 10 {
-                stdinPollMs = 100
-            } else {
-                stdinPollMs = 250
-            }
-
-            if stdinOpen {
-                var fds = [pollfd(fd: stdinFD, events: Int16(POLLIN), revents: 0)]
-                let ready = poll(&fds, 1, stdinPollMs)
-                if ready > 0, (fds[0].revents & Int16(POLLIN)) != 0 {
-                    var buffer = [UInt8](repeating: 0, count: 8192)
-                    let bytesRead = read(stdinFD, &buffer, buffer.count)
-                    if bytesRead == 0 {
-                        stdinOpen = false
-                    } else if bytesRead > 0 {
-                        // Check for detach key (Ctrl-])
-                        if let idx = buffer[..<bytesRead].firstIndex(of: 0x1d) {
-                            if idx > 0 {
-                                let data = Data(buffer[..<idx])
-                                _ = try? daemonClient.send(RuntimeControlRequest(
-                                    op: "pty_write",
-                                    ptyId: ptyId,
-                                    dataBase64: data.base64EncodedString(),
-                                    sessionId: sessionID
-                                ))
-                            }
-                            exitCode = 0
-                            break
-                        }
-
-                        let data = Data(buffer[..<bytesRead])
-                        do {
-                            _ = try daemonClient.send(RuntimeControlRequest(
-                                op: "pty_write",
-                                ptyId: ptyId,
-                                dataBase64: data.base64EncodedString(),
-                                sessionId: sessionID
-                            ))
-                            consecutiveErrors = 0
-                            idleCount = 0
-                        } catch {
-                            consecutiveErrors += 1
-                            if consecutiveErrors >= maxConsecutiveErrors { break }
-                            Thread.sleep(forTimeInterval: 0.5)
-                            continue
-                        }
+        let exitCode: Int32
+        do {
+            let result = try SessionStreamBridge.runPty(
+                daemonClient: daemonClient,
+                ptyID: ptyId,
+                sessionID: sessionID,
+                inputFD: FileHandle.standardInput.fileDescriptor,
+                detachByte: 0x1d,
+                onInputClosed: { [logger] reason, errnoValue in
+                    var fields: [String: String] = [
+                        "session": sessionID,
+                        "phase": "stdin",
+                        "event": reason
+                    ]
+                    if let errnoValue {
+                        fields["errno"] = String(errnoValue)
                     }
+                    logger.log("shell_attach_loop_breakpoint", fields: fields)
+                },
+                onOutput: { data in
+                    FileHandle.standardOutput.write(data)
+                    return true
+                },
+                onExitObserved: { [logger] code, reason in
+                    var fields: [String: String] = [
+                        "session": sessionID,
+                        "phase": "pty_subscribe",
+                        "event": "exit_code",
+                        "exit": String(code)
+                    ]
+                    if let reason {
+                        fields["exit_reason"] = reason
+                    }
+                    logger.log("shell_attach_loop_breakpoint", fields: fields)
+                },
+                resizeProvider: { [self] in currentWindowSize() },
+                onResize: { [logger] rows, cols in
+                    logger.log("shell_attach_loop_breakpoint", fields: [
+                        "session": sessionID,
+                        "phase": "pty_resize",
+                        "rows": String(rows),
+                        "cols": String(cols)
+                    ])
                 }
+            )
+            exitCode = result.exitCode
+        } catch {
+            hostTerminal.restore()
+            if shouldTerminateInteractiveShellAttach(for: error) {
+                logger.log("shell_attach_terminated_remote_stop", fields: [
+                    "session": sessionID,
+                    "phase": "pty_subscribe",
+                    "error": String(describing: error)
+                ])
+                _ = try? daemonClient.send(RuntimeControlRequest(op: "pty_close", ptyId: ptyId, sessionId: sessionID))
+                _ = try? daemonClient.send(RuntimeControlRequest(op: "session_unregister", sessionId: sessionID))
+                daemonClient.disconnect()
+                Foundation.exit(0)
             }
-
-            // Read PTY output
-            do {
-                let readResp = try daemonClient.send(RuntimeControlRequest(
-                    op: "pty_read",
-                    timeoutMs: 1_000,
-                    ptyId: ptyId,
-                    sessionId: sessionID
-                ))
-                guard readResp.ok else {
-                    let errMsg = readResp.error ?? "pty_read failed"
-                    throw MSLRuntimeError(errMsg)
-                }
-                consecutiveErrors = 0
-
-                let hasOutput: Bool
-                if let payload = readResp.dataBase64, let out = Data(base64Encoded: payload), !out.isEmpty {
-                    FileHandle.standardOutput.write(out)
-                    hasOutput = true
-                    idleCount = 0
-                    if !sawOutput { sawOutput = true }
-                } else {
-                    hasOutput = false
-                    idleCount += 1
-                }
-
-                if let code = readResp.exitCode {
-                    exitCode = code
-                    break
-                }
-                if let exitRaw = readResp.meta?["exitCode"], let code = Int32(exitRaw) {
-                    exitCode = code
-                    break
-                }
-
-                if !hasOutput {
-                    let sleepSec = min(0.05 + Double(idleCount) * 0.02, 0.5)
-                    Thread.sleep(forTimeInterval: sleepSec)
-                }
-            } catch {
-                consecutiveErrors += 1
-                let desc = String(describing: error)
-                let isTransient = desc.contains("timeout") || desc.contains("poll failed")
-                if isTransient && consecutiveErrors < maxConsecutiveErrors {
-                    let backoff = min(0.5 * pow(2.0, Double(consecutiveErrors - 1)), 5.0)
-                    Thread.sleep(forTimeInterval: backoff)
-                    continue
-                }
-                break
-            }
+            throw error
         }
 
         // Restore terminal
@@ -814,33 +746,31 @@ public final class RuntimeManager {
 
         // Send exec request
         let execTimeoutMs: Int? = timeoutSec > 0 ? timeoutSec * 1000 : nil
-        let resp = try daemonClient.send(RuntimeControlRequest(
-            op: "exec",
+        let openResp = try daemonClient.send(RuntimeControlRequest(
+            op: "proc_open",
             argv: argv,
             timeoutMs: execTimeoutMs,
             runAsRoot: shouldForceRootRuntimeUser(),
             sessionId: sessionID,
             cwd: execCwd
         ))
-
-        if resp.ok {
-            if let stdout = resp.stdout, !stdout.isEmpty {
-                let line = stdout.hasSuffix("\n") ? stdout : stdout + "\n"
-                FileHandle.standardOutput.write(Data(line.utf8))
+        guard openResp.ok, let procId = openResp.procId else {
+            let errMsg = openResp.error ?? "proc_open failed"
+            if shouldFallbackToLegacyExec(for: errMsg) {
+                logger.log("run_command_fallback_exec", fields: [
+                    "argv0": argv[0],
+                    "reason": errMsg
+                ])
+                _ = try? daemonClient.send(RuntimeControlRequest(op: "session_unregister", sessionId: sessionID))
+                daemonClient.disconnect()
+                try runCommandViaLegacyExec(
+                    argv: argv,
+                    timeoutSec: timeoutSec,
+                    targetInstanceName: target.instanceName,
+                    execCwd: execCwd,
+                    startMs: startMs
+                )
             }
-            if let stderr = resp.stderr, !stderr.isEmpty {
-                let line = stderr.hasSuffix("\n") ? stderr : stderr + "\n"
-                FileHandle.standardError.write(Data(line.utf8))
-            }
-            let code = resp.exitCode ?? 0
-            logger.log("run_command_completed", fields: [
-                "argv0": argv[0],
-                "exit_code": String(code),
-                "elapsed_ms": String(runtimeMonotonicMs() - startMs)
-            ])
-            Foundation.exit(code)
-        } else {
-            let errMsg = resp.error ?? "exec failed"
             logger.log("run_command_error", fields: [
                 "argv0": argv[0],
                 "error": errMsg,
@@ -849,6 +779,128 @@ public final class RuntimeManager {
             fputs("msl: \(errMsg)\n", stderr)
             Foundation.exit(1)
         }
+        defer {
+            _ = try? daemonClient.send(RuntimeControlRequest(op: "proc_close", procId: procId, sessionId: sessionID))
+        }
+
+        do {
+            let result = try SessionStreamBridge.runProc(
+                daemonClient: daemonClient,
+                procID: procId,
+                sessionID: sessionID,
+                inputFD: nil,
+                attachInput: false,
+                onOutput: { event in
+                    switch event.kind {
+                    case .stdout:
+                        FileHandle.standardOutput.write(event.data)
+                    case .stderr:
+                        FileHandle.standardError.write(event.data)
+                    }
+                    return true
+                }
+            )
+            let code = result.exitCode
+            logger.log("run_command_completed", fields: [
+                "argv0": argv[0],
+                "exit_code": String(code),
+                "elapsed_ms": String(runtimeMonotonicMs() - startMs)
+            ])
+            Foundation.exit(code)
+        } catch {
+            let errMsg = String(describing: error)
+            logger.log("run_command_error", fields: [
+                "argv0": argv[0],
+                "error": errMsg,
+                "elapsed_ms": String(runtimeMonotonicMs() - startMs)
+            ])
+            if shouldFallbackToLegacyExec(for: errMsg) {
+                logger.log("run_command_fallback_exec", fields: [
+                    "argv0": argv[0],
+                    "reason": errMsg
+                ])
+                _ = try? daemonClient.send(RuntimeControlRequest(op: "session_unregister", sessionId: sessionID))
+                daemonClient.disconnect()
+                try runCommandViaLegacyExec(
+                    argv: argv,
+                    timeoutSec: timeoutSec,
+                    targetInstanceName: target.instanceName,
+                    execCwd: execCwd,
+                    startMs: startMs
+                )
+            }
+            fputs("msl: \(errMsg)\n", stderr)
+            Foundation.exit(1)
+        }
+    }
+
+    private func shouldFallbackToLegacyExec(for errorMessage: String) -> Bool {
+        let lowered = errorMessage.lowercased()
+        return lowered.contains("vsock connection closed by guest")
+            || lowered.contains("vsock write failed: broken pipe")
+            || lowered.contains("broken pipe")
+            || lowered.contains("vsock read timeout")
+            || lowered.contains("read timeout")
+    }
+
+    private func runCommandViaLegacyExec(
+        argv: [String],
+        timeoutSec: Int,
+        targetInstanceName: String,
+        execCwd: String?,
+        startMs: Int64
+    ) throws -> Never {
+        try daemonClient.ensureConnected(
+            expectedInstanceName: targetInstanceName,
+            hostShareRoot: resolveWorkspaceHostShareRoot(),
+            callerCwd: currentCallerCwd()
+        )
+        prepareCacheSharingIfNeeded(instanceName: targetInstanceName)
+        let regResp = try daemonClient.send(RuntimeControlRequest(
+            op: "session_register",
+            instance: targetInstanceName,
+            callerCwd: currentCallerCwd()
+        ))
+        guard regResp.ok, let sessionID = regResp.sessionId else {
+            throw MSLRuntimeError("failed to register fallback session: \(regResp.error ?? "unknown")")
+        }
+        defer {
+            _ = try? daemonClient.send(RuntimeControlRequest(op: "session_unregister", sessionId: sessionID))
+            daemonClient.disconnect()
+        }
+
+        let execTimeoutMs: Int? = timeoutSec > 0 ? timeoutSec * 1000 : nil
+        let response = try daemonClient.send(RuntimeControlRequest(
+            op: "exec",
+            argv: argv,
+            timeoutMs: execTimeoutMs,
+            runAsRoot: shouldForceRootRuntimeUser(),
+            sessionId: sessionID,
+            cwd: execCwd
+        ))
+        if let stdout = response.stdout, !stdout.isEmpty {
+            FileHandle.standardOutput.write(Data(stdout.utf8))
+        }
+        if let stderr = response.stderr, !stderr.isEmpty {
+            FileHandle.standardError.write(Data(stderr.utf8))
+        }
+        let code = response.exitCode ?? (response.ok ? 0 : 1)
+        if response.ok {
+            logger.log("run_command_completed", fields: [
+                "argv0": argv[0],
+                "exit_code": String(code),
+                "elapsed_ms": String(runtimeMonotonicMs() - startMs),
+                "transport": "legacy_exec_fallback"
+            ])
+        } else {
+            logger.log("run_command_error", fields: [
+                "argv0": argv[0],
+                "error": response.error ?? "exec failed",
+                "elapsed_ms": String(runtimeMonotonicMs() - startMs),
+                "transport": "legacy_exec_fallback"
+            ])
+        }
+        Foundation.exit(code)
     }
 
     public func printStatus(instanceName: String? = nil, all: Bool = false) throws {
@@ -871,13 +923,20 @@ public final class RuntimeManager {
         let fallbackInstance = RuntimeInstanceState(
             instance: state.distro,
             vmState: state.vmState,
+            lifecycleState: state.lifecycleState,
             activeSessionCount: state.activeSessionCount,
             idleTimer: state.idleTimer,
             runtimeUser: state.runtimeUser,
             initChannel: state.initChannel,
             runtimeHostPid: state.runtimeHostPid,
             runtimeControlSocket: state.runtimeControlSocket,
-            lastError: nil,
+            lastError: state.lastErrorMessage,
+            lastErrorCode: state.lastErrorCode,
+            lastErrorMessage: state.lastErrorMessage,
+            startupEpochMs: state.startupEpochMs,
+            startupStep: state.startupStep,
+            startupStepName: state.startupStepName,
+            startupStepStatus: state.startupStepStatus,
             lastTransitionEpochMs: state.lastTransitionEpochMs
         )
         let instances = (state.instances?.isEmpty == false ? state.instances! : [fallbackInstance]).sorted {
@@ -885,12 +944,13 @@ public final class RuntimeManager {
         }
 
         if all {
-            print("INSTANCE\tSTATE\tSESSIONS\tIDLE\tPID\tLAST_ERROR")
+            print("INSTANCE\tSTATE\tLIFECYCLE\tSTEP\tSESSIONS\tIDLE\tPID\tLAST_ERROR")
             for entry in instances {
                 let idle = entry.idleTimer.armed ? "armed" : "not-armed"
                 let pid = entry.runtimeHostPid.map(String.init) ?? "-"
-                let lastError = entry.lastError?.replacingOccurrences(of: "\n", with: " ") ?? "-"
-                print("\(entry.instance)\t\(entry.vmState.rawValue)\t\(entry.activeSessionCount)\t\(idle)\t\(pid)\t\(lastError)")
+                let lastError = (entry.lastErrorMessage ?? entry.lastError)?.replacingOccurrences(of: "\n", with: " ") ?? "-"
+                let step = entry.startupStep.map { "\($0) \(entry.startupStepName ?? "-")" } ?? "-"
+                print("\(entry.instance)\t\(entry.vmState.rawValue)\t\(entry.lifecycleState.rawValue)\t\(step)\t\(entry.activeSessionCount)\t\(idle)\t\(pid)\t\(lastError)")
             }
             return
         }
@@ -901,8 +961,21 @@ public final class RuntimeManager {
         }
         print("instance: \(selected.instance)")
         print("state: \(selected.vmState.rawValue)")
+        print("lifecycle: \(selected.lifecycleState.rawValue)")
         print("activeSessions: \(selected.activeSessionCount)")
         print("idleTimer: \(selected.idleTimer.armed ? "armed" : "not-armed")")
+        if let step = selected.startupStep, let stepName = selected.startupStepName {
+            print("startupStep: \(step) \(stepName)")
+        }
+        if let stepStatus = selected.startupStepStatus {
+            print("startupStepStatus: \(stepStatus.rawValue)")
+        }
+        if let error = selected.lastErrorMessage ?? selected.lastError {
+            print("lastError: \(error)")
+        }
+        if let code = selected.lastErrorCode {
+            print("lastErrorCode: \(code)")
+        }
         if let deadline = selected.idleTimer.deadlineEpochMs {
             print("idleDeadlineEpochMs: \(deadline)")
         }
@@ -1362,6 +1435,48 @@ public final class RuntimeManager {
         return kill(pid, 0) == 0 || errno == EPERM
     }
 
+    func shouldTerminateInteractiveShellAttach(for error: Error?) -> Bool {
+        if hasInteractiveShellAttachStateEnded() {
+            return true
+        }
+        guard let error else {
+            return false
+        }
+        return Self.isInteractiveShellAttachDisconnectError(String(describing: error))
+    }
+
+    func hasInteractiveShellAttachStateEnded() -> Bool {
+        guard let state = try? lock.withExclusiveLock(timeoutSec: 1, { try store.loadState() }) else {
+            return false
+        }
+        let daemonPid = state.daemonHostPid ?? state.runtimeHostPid
+        guard let daemonPid else {
+            return true
+        }
+        if !isDaemonAlive(pid: daemonPid) {
+            return true
+        }
+        let socketPath = state.daemonControlSocket ?? state.runtimeControlSocket
+        if let socketPath, !socketPath.isEmpty, !fileManager.fileExists(atPath: socketPath) {
+            return true
+        }
+        return false
+    }
+
+    static func isInteractiveShellAttachDisconnectError(_ description: String) -> Bool {
+        let normalized = description.lowercased()
+        let needles = [
+            "broken pipe",
+            "connection refused",
+            "connection reset",
+            "connection aborted",
+            "socket is not connected",
+            "not connected to daemon",
+            "no such file or directory"
+        ]
+        return needles.contains { normalized.contains($0) }
+    }
+
     // MARK: - Legacy (serial-console / direct attach)
 
     private func runAttachedSession() -> Int32 {
@@ -1710,11 +1825,456 @@ public final class RuntimeManager {
         return raw == "1" || raw == "true" || raw == "yes"
     }
 
+    private func isInstanceRunningByName(_ instanceName: String) throws -> Bool {
+        try lock.withExclusiveLock {
+            try bootstrap.ensureBootstrapped(context: .runtime)
+            let state = try store.loadState()
+            return isInstanceRunning(state, instanceName: instanceName)
+        }
+    }
+
+    private func runtimeInstanceStateByName(_ instanceName: String) throws -> RuntimeInstanceState? {
+        try lock.withExclusiveLock {
+            try bootstrap.ensureBootstrapped(context: .runtime)
+            let state = try store.loadState()
+            if let matched = state.instances?.first(where: { $0.instance == instanceName }) {
+                return matched
+            }
+            if state.distro == instanceName {
+                return RuntimeInstanceState(
+                    instance: state.distro,
+                    vmState: state.vmState,
+                    activeSessionCount: state.activeSessionCount,
+                    idleTimer: state.idleTimer,
+                    runtimeUser: state.runtimeUser,
+                    initChannel: state.initChannel,
+                    runtimeHostPid: state.runtimeHostPid,
+                    runtimeControlSocket: state.runtimeControlSocket,
+                    lastError: nil,
+                    lastTransitionEpochMs: state.lastTransitionEpochMs
+                )
+            }
+            return nil
+        }
+    }
+
+    private func shouldAutoStopBeforeImageScan(instanceName: String) throws -> Bool {
+        guard let instance = try runtimeInstanceStateByName(instanceName) else {
+            return false
+        }
+        guard instance.vmState == .running else {
+            return false
+        }
+        // Only auto-stop when no interactive session is attached.
+        // If sessions are active, scan should keep the existing explicit failure behavior.
+        return instance.activeSessionCount == 0
+    }
+
+    private func mapHostPathToGuestVisible(_ hostPath: String, hostShareRoot: String) -> String? {
+        guard hostPath.hasPrefix("/") else {
+            return nil
+        }
+        let normalizedRoot = hostShareRoot.hasSuffix("/") && hostShareRoot.count > 1
+            ? String(hostShareRoot.dropLast())
+            : hostShareRoot
+        if normalizedRoot == "/" {
+            return "/mnt/macos" + hostPath
+        }
+        if hostPath == normalizedRoot {
+            return "/mnt/macos"
+        }
+        if hostPath.hasPrefix(normalizedRoot + "/") {
+            let suffix = String(hostPath.dropFirst(normalizedRoot.count))
+            return "/mnt/macos" + suffix
+        }
+        return nil
+    }
+
+    private func guestVisibleHostPathCandidates(_ hostPath: String, hostShareRoot: String) -> [String] {
+        guard hostPath.hasPrefix("/") else {
+            return []
+        }
+        var candidates: [String] = []
+        if let mapped = mapHostPathToGuestVisible(hostPath, hostShareRoot: hostShareRoot) {
+            candidates.append(mapped)
+        }
+        if hostShareRoot != "/" {
+            if !candidates.contains(hostPath) {
+                candidates.append(hostPath)
+            }
+        }
+        return candidates
+    }
+
+    private func isInitSourceMissing(response: RuntimeControlResponse) -> Bool {
+        if response.exitCode == 20 {
+            return true
+        }
+        if let error = response.error?.lowercased(), error.contains("source_missing") {
+            return true
+        }
+        if let stderr = response.stderr?.lowercased(), stderr.contains("source_missing") {
+            return true
+        }
+        return false
+    }
+
+    private func defaultImageExportOutputPath(mode: String, instanceName: String) -> String {
+        let fileName: String
+        switch mode {
+        case "archive":
+            fileName = "\(instanceName).zstd"
+        case "rootfs":
+            fileName = "\(instanceName).rootfs.tar.xz"
+        default:
+            fileName = "\(instanceName).img"
+        }
+        return URL(fileURLWithPath: fileManager.currentDirectoryPath, isDirectory: true)
+            .appendingPathComponent(fileName, isDirectory: false)
+            .path
+    }
+
+    private func readGuestInitVersionViaDaemon(instanceName: String) throws -> String? {
+        let response = try daemonClient.send(RuntimeControlRequest(
+            op: "exec",
+            instance: instanceName,
+            argv: [
+                "/bin/sh",
+                "-lc",
+                """
+                if [ -x /usr/local/bin/msl-init ]; then
+                  /usr/local/bin/msl-init version 2>/dev/null || /usr/local/bin/msl-init --version 2>/dev/null || sha256sum /usr/local/bin/msl-init 2>/dev/null | awk '{print $1}'
+                fi
+                """
+            ],
+            timeoutMs: 2_000
+        ))
+        guard response.ok, (response.exitCode ?? 1) == 0 else {
+            return nil
+        }
+        let value = response.stdout?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return value.isEmpty ? nil : value
+    }
+
+    private func readHostInitVersion(at path: String) -> String? {
+        let sidecar = path + ".version"
+        guard fileManager.isReadableFile(atPath: sidecar),
+              let data = fileManager.contents(atPath: sidecar),
+              let value = String(data: data, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+              !value.isEmpty else {
+            return nil
+        }
+        return value
+    }
+
+    private func logicalBytes(of fileURL: URL) -> Int64? {
+        do {
+            let attrs = try fileManager.attributesOfItem(atPath: fileURL.path)
+            if let value = attrs[.size] as? NSNumber {
+                return value.int64Value
+            }
+            return nil
+        } catch {
+            return nil
+        }
+    }
+
+    private func allocatedBytes(of fileURL: URL) -> Int64? {
+        let values = try? fileURL.resourceValues(forKeys: [.totalFileAllocatedSizeKey, .fileAllocatedSizeKey])
+        if let total = values?.totalFileAllocatedSize {
+            return Int64(total)
+        }
+        if let allocated = values?.fileAllocatedSize {
+            return Int64(allocated)
+        }
+        return nil
+    }
+
+    private func shellQuote(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\"'\"'") + "'"
+    }
+
+    private func runHostShell(_ command: String) throws -> ProcessResult {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = ["-lc", command]
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
+        try process.run()
+        process.waitUntilExit()
+        let stdout = String(data: stdoutPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        let stderr = String(data: stderrPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        return ProcessResult(exitCode: process.terminationStatus, stdout: stdout, stderr: stderr)
+    }
     private func formatBytes(_ bytes: UInt64) -> String {
         let gib = Double(bytes) / Double(1024 * 1024 * 1024)
         return String(format: "%.2f GiB", gib)
     }
 
+    private struct GuestStorageInspectStats {
+        var beforeCompressionBytes: Int64?
+        var afterCompressionBytes: Int64?
+        var compressionRatioPercent: Double?
+        var tmpTotalBytes: Int64?
+        var tmpUsedBytes: Int64?
+        var tmpAvailBytes: Int64?
+        var tmpUsePercent: Int64?
+        var varTmpTotalBytes: Int64?
+        var varTmpUsedBytes: Int64?
+        var varTmpAvailBytes: Int64?
+        var varTmpUsePercent: Int64?
+    }
+
+    private struct ExternalizedCacheUsage {
+        var label: String
+        var hostPath: String
+        var bytes: Int64
+    }
+
+    private func collectGuestStorageInspectStatsIfRunning(instanceName: String) throws -> GuestStorageInspectStats? {
+        if try !isInstanceRunningByName(instanceName) {
+            return nil
+        }
+        let hostShareRoot = resolveWorkspaceHostShareRoot()
+        try daemonClient.ensureConnected(
+            expectedInstanceName: instanceName,
+            hostShareRoot: hostShareRoot,
+            callerCwd: currentCallerCwd()
+        )
+        defer {
+            daemonClient.disconnect()
+        }
+        let response = try daemonClient.send(RuntimeControlRequest(
+            op: "exec",
+            instance: instanceName,
+            argv: [
+                "/bin/sh",
+                "-lc",
+                """
+                set -eu
+                emit_df() {
+                  path="$1"
+                  prefix="$2"
+                  line="$(df -kP "$path" 2>/dev/null | awk 'NR==2 {print $2\" \"$3\" \"$4\" \"$5}' || true)"
+                  [ -n "$line" ] || return 0
+                  set -- $line
+                  total_kib="$1"
+                  used_kib="$2"
+                  avail_kib="$3"
+                  use_pct="${4%%%}"
+                  case "$total_kib" in ''|*[!0-9]*) total_kib='' ;; esac
+                  case "$used_kib" in ''|*[!0-9]*) used_kib='' ;; esac
+                  case "$avail_kib" in ''|*[!0-9]*) avail_kib='' ;; esac
+                  case "$use_pct" in ''|*[!0-9]*) use_pct='' ;; esac
+                  if [ -n "$total_kib" ]; then echo "${prefix}_total_bytes=$((total_kib * 1024))"; fi
+                  if [ -n "$used_kib" ]; then echo "${prefix}_used_bytes=$((used_kib * 1024))"; fi
+                  if [ -n "$avail_kib" ]; then echo "${prefix}_avail_bytes=$((avail_kib * 1024))"; fi
+                  if [ -n "$use_pct" ]; then echo "${prefix}_use_percent=$use_pct"; fi
+                }
+                if command -v du >/dev/null 2>&1; then
+                  apparent_kib="$(du -sx --apparent-size / 2>/dev/null | awk '{print $1}' || true)"
+                  actual_kib="$(du -sx / 2>/dev/null | awk '{print $1}' || true)"
+                  case "$apparent_kib" in ''|*[!0-9]*) apparent_kib='' ;; esac
+                  case "$actual_kib" in ''|*[!0-9]*) actual_kib='' ;; esac
+                  if [ -n "$apparent_kib" ]; then
+                    echo "du_apparent_bytes=$((apparent_kib * 1024))"
+                  fi
+                  if [ -n "$actual_kib" ]; then
+                    echo "du_actual_bytes=$((actual_kib * 1024))"
+                  fi
+                fi
+                emit_df /tmp tmp
+                emit_df /var/tmp var_tmp
+                """
+            ],
+            timeoutMs: 120_000
+        ))
+        guard response.ok, (response.exitCode ?? 1) == 0 else {
+            return nil
+        }
+        let parsed = parseKeyValueLines(response.stdout ?? "")
+        let beforeCompressionBytes = parsed["du_apparent_bytes"]
+        let afterCompressionBytes = parsed["du_actual_bytes"]
+        let ratio: Double?
+        if let beforeCompressionBytes, let afterCompressionBytes, beforeCompressionBytes > 0 {
+            ratio = (1.0 - (Double(afterCompressionBytes) / Double(beforeCompressionBytes))) * 100.0
+        } else {
+            ratio = nil
+        }
+        logger.log("image_inspect_tmp_usage_collected", fields: [
+            "instance": instanceName,
+            "tmp_used_bytes": parsed["tmp_used_bytes"].map(String.init) ?? "",
+            "var_tmp_used_bytes": parsed["var_tmp_used_bytes"].map(String.init) ?? ""
+        ])
+        return GuestStorageInspectStats(
+            beforeCompressionBytes: beforeCompressionBytes,
+            afterCompressionBytes: afterCompressionBytes,
+            compressionRatioPercent: ratio,
+            tmpTotalBytes: parsed["tmp_total_bytes"],
+            tmpUsedBytes: parsed["tmp_used_bytes"],
+            tmpAvailBytes: parsed["tmp_avail_bytes"],
+            tmpUsePercent: parsed["tmp_use_percent"],
+            varTmpTotalBytes: parsed["var_tmp_total_bytes"],
+            varTmpUsedBytes: parsed["var_tmp_used_bytes"],
+            varTmpAvailBytes: parsed["var_tmp_avail_bytes"],
+            varTmpUsePercent: parsed["var_tmp_use_percent"]
+        )
+    }
+
+    private func parseKeyValueLines(_ text: String) -> [String: Int64] {
+        var result: [String: Int64] = [:]
+        for line in text.split(separator: "\n") {
+            let parts = line.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+            guard parts.count == 2 else { continue }
+            let key = String(parts[0]).trimmingCharacters(in: .whitespacesAndNewlines)
+            let valueText = String(parts[1]).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !key.isEmpty, let value = Int64(valueText) else { continue }
+            result[key] = value
+        }
+        return result
+    }
+
+    private func collectExternalizedCacheUsages(metadata: DistributionInstanceMetadata) -> [ExternalizedCacheUsage] {
+        let policyConfig = metadata.cacheSharing ?? CacheSharingPolicyResolver.defaultConfigForDistroFamily(
+            metadata.distroFamily
+                ?? metadata.source.distro
+                ?? DistributionManager.inferDistroFamilyStatic(from: metadata.source.manifestId)
+        )
+        let policy = CacheSharingPolicyResolver.resolve(config: policyConfig)
+        guard policy.enabled else {
+            return []
+        }
+
+        let hostHome = ProcessInfo.processInfo.environment["HOME"] ?? fileManager.homeDirectoryForCurrentUser.path
+        let hostCacheRoot = CacheSharingPolicyResolver.hostCacheRootPath(hostHome: hostHome)
+        var candidates: [(String, String)] = []
+        if policy.apt { candidates.append(("apt", hostCacheRoot + "/apt")) }
+        if policy.apk { candidates.append(("apk", hostCacheRoot + "/apk")) }
+        if policy.zypper { candidates.append(("zypper", hostCacheRoot + "/zypper")) }
+        if policy.dnf { candidates.append(("dnf", hostCacheRoot + "/dnf")) }
+        if policy.go { candidates.append(("go", hostCacheRoot + "/go")) }
+        if policy.python { candidates.append(("python", hostCacheRoot + "/python")) }
+        if policy.npm { candidates.append(("npm", hostCacheRoot + "/node/npm")) }
+        if policy.pnpm { candidates.append(("pnpm", hostCacheRoot + "/node/pnpm-store")) }
+        if policy.yarn { candidates.append(("yarn", hostCacheRoot + "/node/yarn")) }
+        if policy.maven { candidates.append(("maven", hostCacheRoot + "/java/maven-repo")) }
+        if policy.gradle { candidates.append(("gradle", hostCacheRoot + "/java/gradle")) }
+        if policy.composer { candidates.append(("composer", hostCacheRoot + "/php/composer")) }
+        if policy.scala { candidates.append(("scala", hostCacheRoot + "/scala")) }
+        if policy.ruby { candidates.append(("ruby", hostCacheRoot + "/ruby")) }
+        if policy.rust { candidates.append(("rust", hostCacheRoot + "/rust")) }
+        if policy.deno { candidates.append(("deno", hostCacheRoot + "/deno")) }
+        if policy.bun { candidates.append(("bun", hostCacheRoot + "/bun")) }
+        if policy.nuget { candidates.append(("nuget", hostCacheRoot + "/dotnet")) }
+
+        return candidates.map { label, path in
+            let bytes = hostDirectoryUsageBytes(path: path) ?? 0
+            return ExternalizedCacheUsage(label: label, hostPath: path, bytes: bytes)
+        }
+    }
+
+    private func hostDirectoryUsageBytes(path: String) -> Int64? {
+        let quoted = shellQuote(path)
+        let result = try? runHostShell("du -sk \(quoted) 2>/dev/null | awk '{print $1}'")
+        guard let result, result.exitCode == 0 else {
+            return nil
+        }
+        let raw = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let kib = Int64(raw), kib >= 0 else {
+            return nil
+        }
+        return kib * 1024
+    }
+
+    private func formatMegaBytesTenths(_ bytes: Int64) -> String {
+        let mb = Double(max(0, bytes)) / Double(1024 * 1024)
+        let formatter = NumberFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.numberStyle = .decimal
+        formatter.usesGroupingSeparator = true
+        formatter.minimumFractionDigits = 1
+        formatter.maximumFractionDigits = 1
+        return formatter.string(from: NSNumber(value: mb)) ?? String(format: "%.1f", mb)
+    }
+
+    private func printIndentedMegaBytesLine(label: String, bytes: Int64?) {
+        let labelWidth = 24
+        let valueWidth = 10
+        let paddedLabel = label.padding(toLength: labelWidth, withPad: " ", startingAt: 0)
+        guard let bytes else {
+            let paddedValue = "N/A".leftPadding(toLength: valueWidth)
+            print("  \(paddedLabel)\(paddedValue) MB")
+            return
+        }
+        let value = formatMegaBytesTenths(bytes)
+        let paddedValue = value.leftPadding(toLength: valueWidth)
+        print("  \(paddedLabel)\(paddedValue) MB")
+    }
+
+    private func printIndentedCompressedLine(label: String, bytes: Int64?, savingPercent: Double?) {
+        let labelWidth = 24
+        let valueWidth = 10
+        let paddedLabel = label.padding(toLength: labelWidth, withPad: " ", startingAt: 0)
+        guard let bytes else {
+            let paddedValue = "N/A".leftPadding(toLength: valueWidth)
+            print("  \(paddedLabel)\(paddedValue) MB")
+            return
+        }
+        let size = formatMegaBytesTenths(bytes).leftPadding(toLength: valueWidth)
+        if let savingPercent {
+            let percent = String(format: "-%.1f%%", savingPercent)
+            print("  \(paddedLabel)\(size) MB (\(percent))")
+        } else {
+            print("  \(paddedLabel)\(size) MB")
+        }
+    }
+
+    private func printPathUsageLine(
+        label: String,
+        totalBytes: Int64?,
+        usedBytes: Int64?,
+        availBytes: Int64?,
+        usePercent: Int64?
+    ) {
+        guard
+            let totalBytes,
+            let usedBytes,
+            let availBytes,
+            let usePercent
+        else {
+            print("  \(label) unavailable")
+            return
+        }
+        let total = formatMegaBytesTenths(totalBytes).leftPadding(toLength: 10)
+        let used = formatMegaBytesTenths(usedBytes).leftPadding(toLength: 10)
+        let avail = formatMegaBytesTenths(availBytes).leftPadding(toLength: 10)
+        print("  \(label) total=\(total)MB used=\(used)MB avail=\(avail)MB use%=\(usePercent)")
+    }
+
+    private func formatDefragTimestamp(_ maintenance: DistributionInstanceMetadata.ImageMaintenanceStatus?) -> String {
+        guard let maintenance else { return "never" }
+        if maintenance.lastOperation == "manual_defrag" || maintenance.lastOperation == "startup_auto_trim" {
+            return formatEpochMs(maintenance.lastRunAtEpochMs)
+        }
+        if let compactAt = maintenance.lastCompactAtEpochMs {
+            return formatEpochMs(compactAt)
+        }
+        return "never"
+    }
+
+    private func tildePath(_ path: String) -> String {
+        let homePath = fileManager.homeDirectoryForCurrentUser.path
+        if path == homePath {
+            return "~"
+        }
+        if path.hasPrefix(homePath + "/") {
+            return "~" + String(path.dropFirst(homePath.count))
+        }
+        return path
+    }
     private func formatEpochMs(_ value: Int64?) -> String {
         guard let value else {
             return "never"
@@ -1728,4 +2288,11 @@ public final class RuntimeManager {
 
 private func runtimeMonotonicMs() -> Int64 {
     Int64(DispatchTime.now().uptimeNanoseconds / 1_000_000)
+}
+
+private extension String {
+    func leftPadding(toLength length: Int, withPad pad: Character = " ") -> String {
+        guard count < length else { return self }
+        return String(repeating: String(pad), count: length - count) + self
+    }
 }

@@ -256,6 +256,70 @@ public struct DistributionNetworkPolicy: Codable, Equatable {
 }
 
 public struct DistributionInstanceMetadata: Codable, Equatable {
+    public struct TmpStoragePolicy: Codable, Equatable {
+        public var mode: String
+        public var sizeMiB: Int
+        public var resetOnStop: Bool
+
+        public init(
+            mode: String = "embedded",
+            sizeMiB: Int = 1024,
+            resetOnStop: Bool = true
+        ) {
+            self.mode = mode
+            self.sizeMiB = sizeMiB
+            self.resetOnStop = resetOnStop
+        }
+    }
+
+    public struct ImageMaintenanceStatus: Codable, Equatable {
+        public var lastRunAtEpochMs: Int64?
+        public var lastOperation: String?
+        public var lastResult: String?
+        public var lastErrorCode: String?
+        public var lastErrorMessage: String?
+        public var lastCompactAtEpochMs: Int64?
+        public var lastCompactBytesBefore: Int64?
+        public var lastCompactBytesAfter: Int64?
+        public var lastRefreshVersionBefore: String?
+        public var lastRefreshVersionAfter: String?
+        public var cachedTotalContentBytes: Int64?
+        public var cachedCompressedBytes: Int64?
+        public var cachedCompressionSavingPercent: Double?
+        public var cachedAtEpochMs: Int64?
+
+        public init(
+            lastRunAtEpochMs: Int64? = nil,
+            lastOperation: String? = nil,
+            lastResult: String? = nil,
+            lastErrorCode: String? = nil,
+            lastErrorMessage: String? = nil,
+            lastCompactAtEpochMs: Int64? = nil,
+            lastCompactBytesBefore: Int64? = nil,
+            lastCompactBytesAfter: Int64? = nil,
+            lastRefreshVersionBefore: String? = nil,
+            lastRefreshVersionAfter: String? = nil,
+            cachedTotalContentBytes: Int64? = nil,
+            cachedCompressedBytes: Int64? = nil,
+            cachedCompressionSavingPercent: Double? = nil,
+            cachedAtEpochMs: Int64? = nil
+        ) {
+            self.lastRunAtEpochMs = lastRunAtEpochMs
+            self.lastOperation = lastOperation
+            self.lastResult = lastResult
+            self.lastErrorCode = lastErrorCode
+            self.lastErrorMessage = lastErrorMessage
+            self.lastCompactAtEpochMs = lastCompactAtEpochMs
+            self.lastCompactBytesBefore = lastCompactBytesBefore
+            self.lastCompactBytesAfter = lastCompactBytesAfter
+            self.lastRefreshVersionBefore = lastRefreshVersionBefore
+            self.lastRefreshVersionAfter = lastRefreshVersionAfter
+            self.cachedTotalContentBytes = cachedTotalContentBytes
+            self.cachedCompressedBytes = cachedCompressedBytes
+            self.cachedCompressionSavingPercent = cachedCompressionSavingPercent
+            self.cachedAtEpochMs = cachedAtEpochMs
+        }
+    }
     public struct RuntimeInitProfile: Codable, Equatable {
         public var initMode: String
         public var serviceManager: String
@@ -313,6 +377,8 @@ public struct DistributionInstanceMetadata: Codable, Equatable {
     public var compressionPolicy: DistributionCompressionPolicy?
     public var networkPolicy: DistributionNetworkPolicy?
     public var cacheSharing: CacheSharingConfig?
+    public var imageMaintenance: ImageMaintenanceStatus?
+    public var tmpStorage: TmpStoragePolicy?
 
     public init(
         name: String,
@@ -328,7 +394,9 @@ public struct DistributionInstanceMetadata: Codable, Equatable {
         workspacePolicy: WorkspacePolicy? = nil,
         compressionPolicy: DistributionCompressionPolicy? = nil,
         networkPolicy: DistributionNetworkPolicy? = nil,
-        cacheSharing: CacheSharingConfig? = nil
+        cacheSharing: CacheSharingConfig? = nil,
+        imageMaintenance: ImageMaintenanceStatus? = nil,
+        tmpStorage: TmpStoragePolicy? = nil
     ) {
         self.name = name
         self.distroFamily = distroFamily
@@ -344,6 +412,51 @@ public struct DistributionInstanceMetadata: Codable, Equatable {
         self.compressionPolicy = compressionPolicy
         self.networkPolicy = networkPolicy
         self.cacheSharing = cacheSharing
+        self.imageMaintenance = imageMaintenance
+        self.tmpStorage = tmpStorage
+    }
+
+    public static func defaultTmpStoragePolicyForNewInstance() -> TmpStoragePolicy {
+        TmpStoragePolicy(mode: "ephemeral", sizeMiB: 1024, resetOnStop: true)
+    }
+
+    public static func defaultTmpStoragePolicy(forNewInstanceNamed name: String) -> TmpStoragePolicy {
+        let _ = name
+        return defaultTmpStoragePolicyForNewInstance()
+    }
+
+    public static func defaultTmpStoragePolicyForExistingInstance() -> TmpStoragePolicy {
+        TmpStoragePolicy(mode: "embedded", sizeMiB: 1024, resetOnStop: true)
+    }
+
+    public func resolveValidatedTmpStoragePolicy(applyEnvironmentOverride: Bool = true) throws -> TmpStoragePolicy {
+        if applyEnvironmentOverride && Self.isForceEmbeddedEnabled() {
+            return Self.defaultTmpStoragePolicyForExistingInstance()
+        }
+        let raw = tmpStorage ?? Self.defaultTmpStoragePolicyForExistingInstance()
+        let normalizedMode = raw.mode.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard normalizedMode == "embedded" || normalizedMode == "ephemeral" else {
+            throw MSLRuntimeError(
+                "invalid tmpStorage.mode '\(raw.mode)' for instance '\(name)': allowed=[embedded,ephemeral]"
+            )
+        }
+        guard raw.sizeMiB > 0 else {
+            throw MSLRuntimeError(
+                "invalid tmpStorage.sizeMiB '\(raw.sizeMiB)' for instance '\(name)': must be > 0"
+            )
+        }
+        return TmpStoragePolicy(
+            mode: normalizedMode,
+            sizeMiB: raw.sizeMiB,
+            resetOnStop: raw.resetOnStop
+        )
+    }
+
+    private static func isForceEmbeddedEnabled() -> Bool {
+        let raw = ProcessInfo.processInfo.environment["MSL_TMP_STORAGE_FORCE_EMBEDDED"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() ?? ""
+        return raw == "1" || raw == "true" || raw == "yes"
     }
 }
 

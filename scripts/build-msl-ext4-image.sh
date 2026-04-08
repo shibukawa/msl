@@ -10,7 +10,7 @@ if ! command -v cargo >/dev/null 2>&1; then
 fi
 
 cd "$ROOT_DIR/Support/msl-ext4-mkfs"
-cargo build --release
+CARGO_PROFILE_RELEASE_STRIP=none cargo build --release
 
 OUT_MKFS="$ROOT_DIR/Support/msl-ext4-mkfs/target/release/msl-ext4-mkfs"
 if [ ! -x "$OUT_MKFS" ]; then
@@ -19,7 +19,7 @@ if [ ! -x "$OUT_MKFS" ]; then
 fi
 
 cd "$ROOT_DIR/Support/msl-ext4-image"
-cargo build --release
+CARGO_PROFILE_RELEASE_STRIP=none cargo build --release
 
 OUT_POPULATE="$ROOT_DIR/Support/msl-ext4-image/target/release/msl-ext4-image"
 if [ ! -x "$OUT_POPULATE" ]; then

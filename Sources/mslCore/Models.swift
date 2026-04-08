@@ -5,6 +5,21 @@ public enum VMState: String, Codable {
     case running = "Running"
 }
 
+public enum RuntimeLifecycleState: String, Codable {
+    case stopped
+    case starting
+    case running
+    case stopping
+    case error
+}
+
+public enum StartupStepStatus: String, Codable {
+    case pending
+    case inProgress = "in_progress"
+    case completed
+    case failed
+}
+
 public struct IdleTimerState: Codable {
     public var armed: Bool
     public var deadlineEpochMs: Int64?
@@ -29,14 +44,21 @@ public struct RuntimeState: Codable {
     public var schemaVersion: Int
     public var distro: String
     public var vmState: VMState
+    public var lifecycleState: RuntimeLifecycleState
     public var activeSessionCount: Int
     public var idleTimer: IdleTimerState
     public var lastTransitionEpochMs: Int64
+    public var startupEpochMs: Int64?
+    public var startupStep: Int?
+    public var startupStepName: String?
+    public var startupStepStatus: StartupStepStatus?
     public var bootstrap: BootstrapState
     public var runtimeHostPid: Int32?
     public var runtimeControlSocket: String?
     public var initChannel: InitChannelState?
     public var runtimeUser: RuntimeUserState?
+    public var lastErrorCode: String?
+    public var lastErrorMessage: String?
     // Step24 schema v2 fields (legacy fields stay for compatibility during migration).
     public var daemonHostPid: Int32?
     public var daemonControlSocket: String?
@@ -45,17 +67,24 @@ public struct RuntimeState: Codable {
 
     public static func initial(nowMs: Int64) -> RuntimeState {
         RuntimeState(
-            schemaVersion: 2,
+            schemaVersion: 3,
             distro: "default",
             vmState: .stopped,
+            lifecycleState: .stopped,
             activeSessionCount: 0,
             idleTimer: IdleTimerState(),
             lastTransitionEpochMs: nowMs,
+            startupEpochMs: nil,
+            startupStep: nil,
+            startupStepName: nil,
+            startupStepStatus: nil,
             bootstrap: BootstrapState(),
             runtimeHostPid: nil,
             runtimeControlSocket: nil,
             initChannel: nil,
             runtimeUser: nil,
+            lastErrorCode: nil,
+            lastErrorMessage: nil,
             daemonHostPid: nil,
             daemonControlSocket: nil,
             daemonEventSocket: nil,
@@ -63,6 +92,7 @@ public struct RuntimeState: Codable {
                 RuntimeInstanceState(
                     instance: "default",
                     vmState: .stopped,
+                    lifecycleState: .stopped,
                     activeSessionCount: 0,
                     idleTimer: IdleTimerState(),
                     runtimeUser: nil,
@@ -70,17 +100,78 @@ public struct RuntimeState: Codable {
                     runtimeHostPid: nil,
                     runtimeControlSocket: nil,
                     lastError: nil,
+                    lastErrorCode: nil,
+                    lastErrorMessage: nil,
+                    startupEpochMs: nil,
+                    startupStep: nil,
+                    startupStepName: nil,
+                    startupStepStatus: nil,
                     lastTransitionEpochMs: nowMs
                 )
             ]
         )
     }
 
+    public init(
+        schemaVersion: Int,
+        distro: String,
+        vmState: VMState,
+        lifecycleState: RuntimeLifecycleState? = nil,
+        activeSessionCount: Int,
+        idleTimer: IdleTimerState,
+        lastTransitionEpochMs: Int64,
+        startupEpochMs: Int? = nil,
+        startupStep: Int? = nil,
+        startupStepName: String? = nil,
+        startupStepStatus: StartupStepStatus? = nil,
+        bootstrap: BootstrapState = BootstrapState(),
+        runtimeHostPid: Int32? = nil,
+        runtimeControlSocket: String? = nil,
+        initChannel: InitChannelState? = nil,
+        runtimeUser: RuntimeUserState? = nil,
+        lastErrorCode: String? = nil,
+        lastErrorMessage: String? = nil,
+        daemonHostPid: Int32? = nil,
+        daemonControlSocket: String? = nil,
+        daemonEventSocket: String? = nil,
+        instances: [RuntimeInstanceState]? = nil
+    ) {
+        self.schemaVersion = schemaVersion
+        self.distro = distro
+        self.vmState = vmState
+        self.lifecycleState = lifecycleState ?? (vmState == .running ? .running : .stopped)
+        self.activeSessionCount = activeSessionCount
+        self.idleTimer = idleTimer
+        self.lastTransitionEpochMs = lastTransitionEpochMs
+        self.startupEpochMs = startupEpochMs.map(Int64.init)
+        self.startupStep = startupStep
+        self.startupStepName = startupStepName
+        self.startupStepStatus = startupStepStatus
+        self.bootstrap = bootstrap
+        self.runtimeHostPid = runtimeHostPid
+        self.runtimeControlSocket = runtimeControlSocket
+        self.initChannel = initChannel
+        self.runtimeUser = runtimeUser
+        self.lastErrorCode = lastErrorCode
+        self.lastErrorMessage = lastErrorMessage
+        self.daemonHostPid = daemonHostPid
+        self.daemonControlSocket = daemonControlSocket
+        self.daemonEventSocket = daemonEventSocket
+        self.instances = instances
+    }
+
     @discardableResult
     public mutating func normalizeSchemaV2(nowMs: Int64) -> Bool {
         var changed = false
-        if schemaVersion < 2 {
-            schemaVersion = 2
+        if schemaVersion < 3 {
+            schemaVersion = 3
+            changed = true
+        }
+        if lifecycleState == .running && vmState != .running {
+            vmState = .running
+            changed = true
+        } else if lifecycleState != .running && vmState != .stopped {
+            vmState = .stopped
             changed = true
         }
         if instances == nil || instances?.isEmpty == true {
@@ -88,13 +179,20 @@ public struct RuntimeState: Codable {
                 RuntimeInstanceState(
                     instance: distro,
                     vmState: vmState,
+                    lifecycleState: lifecycleState,
                     activeSessionCount: activeSessionCount,
                     idleTimer: idleTimer,
                     runtimeUser: runtimeUser,
                     initChannel: initChannel,
                     runtimeHostPid: runtimeHostPid,
                     runtimeControlSocket: runtimeControlSocket,
-                    lastError: nil,
+                    lastError: lastErrorMessage,
+                    lastErrorCode: lastErrorCode,
+                    lastErrorMessage: lastErrorMessage,
+                    startupEpochMs: startupEpochMs,
+                    startupStep: startupStep,
+                    startupStepName: startupStepName,
+                    startupStepStatus: startupStepStatus,
                     lastTransitionEpochMs: lastTransitionEpochMs
                 )
             ]
@@ -119,13 +217,20 @@ public struct RuntimeState: Codable {
             merged[distro] = RuntimeInstanceState(
                 instance: distro,
                 vmState: vmState,
+                lifecycleState: lifecycleState,
                 activeSessionCount: activeSessionCount,
                 idleTimer: idleTimer,
                 runtimeUser: runtimeUser,
                 initChannel: initChannel,
                 runtimeHostPid: runtimeHostPid,
                 runtimeControlSocket: runtimeControlSocket,
-                lastError: merged[distro]?.lastError,
+                lastError: lastErrorMessage,
+                lastErrorCode: lastErrorCode,
+                lastErrorMessage: lastErrorMessage,
+                startupEpochMs: startupEpochMs,
+                startupStep: startupStep,
+                startupStepName: startupStepName,
+                startupStepStatus: startupStepStatus,
                 lastTransitionEpochMs: lastTransitionEpochMs
             )
 
@@ -146,7 +251,11 @@ public struct RuntimeState: Codable {
                         || lhs.idleTimer.armed != rhs.idleTimer.armed
                         || lhs.idleTimer.deadlineEpochMs != rhs.idleTimer.deadlineEpochMs
                         || lhs.runtimeHostPid != rhs.runtimeHostPid
-                        || lhs.runtimeControlSocket != rhs.runtimeControlSocket {
+                        || lhs.runtimeControlSocket != rhs.runtimeControlSocket
+                        || lhs.lifecycleState != rhs.lifecycleState
+                        || lhs.lastErrorMessage != rhs.lastErrorMessage
+                        || lhs.startupStep != rhs.startupStep
+                        || lhs.startupStepStatus != rhs.startupStepStatus {
                         changed = true
                         break
                     }
@@ -166,13 +275,89 @@ public struct RuntimeState: Codable {
             lastTransitionEpochMs = nowMs
             changed = true
         }
+        if lastError != lastErrorMessage {
+            lastError = lastErrorMessage
+            changed = true
+        }
         return changed
+    }
+
+    public var lastError: String? {
+        get { lastErrorMessage }
+        set { lastErrorMessage = newValue }
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case schemaVersion, distro, vmState, lifecycleState, activeSessionCount, idleTimer, lastTransitionEpochMs
+        case startupEpochMs, startupStep, startupStepName, startupStepStatus
+        case bootstrap, runtimeHostPid, runtimeControlSocket, initChannel, runtimeUser
+        case lastErrorCode, lastErrorMessage, daemonHostPid, daemonControlSocket, daemonEventSocket, instances
+        case lastError
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        schemaVersion = try c.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? 2
+        distro = try c.decodeIfPresent(String.self, forKey: .distro) ?? "default"
+        vmState = try c.decodeIfPresent(VMState.self, forKey: .vmState) ?? .stopped
+        lifecycleState = try c.decodeIfPresent(RuntimeLifecycleState.self, forKey: .lifecycleState)
+            ?? (vmState == .running ? .running : .stopped)
+        activeSessionCount = try c.decodeIfPresent(Int.self, forKey: .activeSessionCount) ?? 0
+        idleTimer = try c.decodeIfPresent(IdleTimerState.self, forKey: .idleTimer) ?? IdleTimerState()
+        lastTransitionEpochMs = try c.decodeIfPresent(Int64.self, forKey: .lastTransitionEpochMs) ?? nowEpochMs()
+        startupEpochMs = try c.decodeIfPresent(Int64.self, forKey: .startupEpochMs)
+        startupStep = try c.decodeIfPresent(Int.self, forKey: .startupStep)
+        startupStepName = try c.decodeIfPresent(String.self, forKey: .startupStepName)
+        startupStepStatus = try c.decodeIfPresent(StartupStepStatus.self, forKey: .startupStepStatus)
+        bootstrap = try c.decodeIfPresent(BootstrapState.self, forKey: .bootstrap) ?? BootstrapState()
+        runtimeHostPid = try c.decodeIfPresent(Int32.self, forKey: .runtimeHostPid)
+        runtimeControlSocket = try c.decodeIfPresent(String.self, forKey: .runtimeControlSocket)
+        initChannel = try c.decodeIfPresent(InitChannelState.self, forKey: .initChannel)
+        runtimeUser = try c.decodeIfPresent(RuntimeUserState.self, forKey: .runtimeUser)
+        lastErrorCode = try c.decodeIfPresent(String.self, forKey: .lastErrorCode)
+        if let message = try c.decodeIfPresent(String.self, forKey: .lastErrorMessage) {
+            lastErrorMessage = message
+        } else {
+            lastErrorMessage = try c.decodeIfPresent(String.self, forKey: .lastError)
+        }
+        daemonHostPid = try c.decodeIfPresent(Int32.self, forKey: .daemonHostPid)
+        daemonControlSocket = try c.decodeIfPresent(String.self, forKey: .daemonControlSocket)
+        daemonEventSocket = try c.decodeIfPresent(String.self, forKey: .daemonEventSocket)
+        instances = try c.decodeIfPresent([RuntimeInstanceState].self, forKey: .instances)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(schemaVersion, forKey: .schemaVersion)
+        try c.encode(distro, forKey: .distro)
+        try c.encode(vmState, forKey: .vmState)
+        try c.encode(lifecycleState, forKey: .lifecycleState)
+        try c.encode(activeSessionCount, forKey: .activeSessionCount)
+        try c.encode(idleTimer, forKey: .idleTimer)
+        try c.encode(lastTransitionEpochMs, forKey: .lastTransitionEpochMs)
+        try c.encodeIfPresent(startupEpochMs, forKey: .startupEpochMs)
+        try c.encodeIfPresent(startupStep, forKey: .startupStep)
+        try c.encodeIfPresent(startupStepName, forKey: .startupStepName)
+        try c.encodeIfPresent(startupStepStatus, forKey: .startupStepStatus)
+        try c.encode(bootstrap, forKey: .bootstrap)
+        try c.encodeIfPresent(runtimeHostPid, forKey: .runtimeHostPid)
+        try c.encodeIfPresent(runtimeControlSocket, forKey: .runtimeControlSocket)
+        try c.encodeIfPresent(initChannel, forKey: .initChannel)
+        try c.encodeIfPresent(runtimeUser, forKey: .runtimeUser)
+        try c.encodeIfPresent(lastErrorCode, forKey: .lastErrorCode)
+        try c.encodeIfPresent(lastErrorMessage, forKey: .lastErrorMessage)
+        try c.encodeIfPresent(lastErrorMessage, forKey: .lastError)
+        try c.encodeIfPresent(daemonHostPid, forKey: .daemonHostPid)
+        try c.encodeIfPresent(daemonControlSocket, forKey: .daemonControlSocket)
+        try c.encodeIfPresent(daemonEventSocket, forKey: .daemonEventSocket)
+        try c.encodeIfPresent(instances, forKey: .instances)
     }
 }
 
 public struct RuntimeInstanceState: Codable {
     public var instance: String
     public var vmState: VMState
+    public var lifecycleState: RuntimeLifecycleState
     public var activeSessionCount: Int
     public var idleTimer: IdleTimerState
     public var runtimeUser: RuntimeUserState?
@@ -180,7 +365,79 @@ public struct RuntimeInstanceState: Codable {
     public var runtimeHostPid: Int32?
     public var runtimeControlSocket: String?
     public var lastError: String?
+    public var lastErrorCode: String?
+    public var lastErrorMessage: String?
+    public var startupEpochMs: Int64?
+    public var startupStep: Int?
+    public var startupStepName: String?
+    public var startupStepStatus: StartupStepStatus?
     public var lastTransitionEpochMs: Int64
+
+    enum CodingKeys: String, CodingKey {
+        case instance, vmState, lifecycleState, activeSessionCount, idleTimer, runtimeUser, initChannel
+        case runtimeHostPid, runtimeControlSocket, lastError, lastErrorCode, lastErrorMessage
+        case startupEpochMs, startupStep, startupStepName, startupStepStatus, lastTransitionEpochMs
+    }
+
+    public init(
+        instance: String,
+        vmState: VMState,
+        lifecycleState: RuntimeLifecycleState? = nil,
+        activeSessionCount: Int,
+        idleTimer: IdleTimerState,
+        runtimeUser: RuntimeUserState?,
+        initChannel: InitChannelState?,
+        runtimeHostPid: Int32?,
+        runtimeControlSocket: String?,
+        lastError: String? = nil,
+        lastErrorCode: String? = nil,
+        lastErrorMessage: String? = nil,
+        startupEpochMs: Int64? = nil,
+        startupStep: Int? = nil,
+        startupStepName: String? = nil,
+        startupStepStatus: StartupStepStatus? = nil,
+        lastTransitionEpochMs: Int64
+    ) {
+        self.instance = instance
+        self.vmState = vmState
+        self.lifecycleState = lifecycleState ?? (vmState == .running ? .running : .stopped)
+        self.activeSessionCount = activeSessionCount
+        self.idleTimer = idleTimer
+        self.runtimeUser = runtimeUser
+        self.initChannel = initChannel
+        self.runtimeHostPid = runtimeHostPid
+        self.runtimeControlSocket = runtimeControlSocket
+        self.lastError = lastError
+        self.lastErrorCode = lastErrorCode
+        self.lastErrorMessage = lastErrorMessage
+        self.startupEpochMs = startupEpochMs
+        self.startupStep = startupStep
+        self.startupStepName = startupStepName
+        self.startupStepStatus = startupStepStatus
+        self.lastTransitionEpochMs = lastTransitionEpochMs
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        instance = try c.decode(String.self, forKey: .instance)
+        vmState = try c.decodeIfPresent(VMState.self, forKey: .vmState) ?? .stopped
+        lifecycleState = try c.decodeIfPresent(RuntimeLifecycleState.self, forKey: .lifecycleState)
+            ?? (vmState == .running ? .running : .stopped)
+        activeSessionCount = try c.decodeIfPresent(Int.self, forKey: .activeSessionCount) ?? 0
+        idleTimer = try c.decodeIfPresent(IdleTimerState.self, forKey: .idleTimer) ?? IdleTimerState()
+        runtimeUser = try c.decodeIfPresent(RuntimeUserState.self, forKey: .runtimeUser)
+        initChannel = try c.decodeIfPresent(InitChannelState.self, forKey: .initChannel)
+        runtimeHostPid = try c.decodeIfPresent(Int32.self, forKey: .runtimeHostPid)
+        runtimeControlSocket = try c.decodeIfPresent(String.self, forKey: .runtimeControlSocket)
+        lastError = try c.decodeIfPresent(String.self, forKey: .lastError)
+        lastErrorCode = try c.decodeIfPresent(String.self, forKey: .lastErrorCode)
+        lastErrorMessage = try c.decodeIfPresent(String.self, forKey: .lastErrorMessage) ?? lastError
+        startupEpochMs = try c.decodeIfPresent(Int64.self, forKey: .startupEpochMs)
+        startupStep = try c.decodeIfPresent(Int.self, forKey: .startupStep)
+        startupStepName = try c.decodeIfPresent(String.self, forKey: .startupStepName)
+        startupStepStatus = try c.decodeIfPresent(StartupStepStatus.self, forKey: .startupStepStatus)
+        lastTransitionEpochMs = try c.decodeIfPresent(Int64.self, forKey: .lastTransitionEpochMs) ?? nowEpochMs()
+    }
 }
 
 public struct RuntimeUserState: Codable {

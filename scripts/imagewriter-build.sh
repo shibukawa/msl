@@ -12,6 +12,7 @@ INIT_BINARY_PATH="${IMAGEWRITER_INIT_BINARY:-}"
 RUN_TIMEOUT="${IMAGEWRITER_RUN_TIMEOUT:-900}"
 IMAGEWRITER_PACKAGES="${IMAGEWRITER_PACKAGES:-btrfs-progs e2fsprogs util-linux tar zstd xz coreutils}"
 IMAGEWRITER_APK_CACHE_DIR="${IMAGEWRITER_APK_CACHE_DIR:-}"
+IMAGEWRITER_APK_RETRY_LIMIT="${IMAGEWRITER_APK_RETRY_LIMIT:-5}"
 
 TOTAL_STEPS=7
 STEP_INDEX=0
@@ -59,11 +60,15 @@ stop_imagewriter_runtime() {
   STOP_ATTEMPTED=1
 
   echo "imagewriter_runtime_stop_attempted instance=$INSTANCE"
-  if "$MSL_BIN" --instance "$INSTANCE" --stop >/dev/null 2>&1; then
+  if "$MSL_BIN" --instance "$INSTANCE" stop >/dev/null 2>&1; then
     echo "imagewriter_runtime_stop_succeeded instance=$INSTANCE"
   else
     stop_code=$?
-    echo "imagewriter_runtime_stop_failed instance=$INSTANCE exit_code=$stop_code" >&2
+    if [ "$stop_code" -eq 64 ]; then
+      echo "imagewriter_runtime_stop_skipped instance=$INSTANCE reason=not_running"
+    else
+      echo "imagewriter_runtime_stop_failed instance=$INSTANCE exit_code=$stop_code" >&2
+    fi
   fi
 }
 
@@ -291,7 +296,11 @@ copy_if_needed() {
       return 0
     fi
   fi
-  cp -f "$src" "$dst"
+  if cp --help 2>/dev/null | grep -q -- '--sparse'; then
+    cp --sparse=always -f "$src" "$dst"
+  else
+    cp -f "$src" "$dst"
+  fi
 }
 
 copy_if_needed "$ROOTFS_TARBALL" "$STAGE_ROOTFS"
@@ -330,7 +339,8 @@ size_mb="$5"
 guest_init="$6"
 packages="$7"
 apk_cache="$8"
-guest_tmp_image="$9"
+apk_retry_limit="$9"
+guest_tmp_image="${10}"
 
 MSL_RUNTIME_USER_ROOT=1 "$MSL_BIN" --instance "$INSTANCE" run --timeout "$RUN_TIMEOUT" -- sh -lc '
 set -eu
@@ -344,6 +354,7 @@ init_bin="$7"
 packages="$8"
 apk_cache="$9"
 tmp_image="${10}"
+apk_retry_limit="${11}"
 tmp_mount="/mnt/msl-imagewriter-tmp"
 tmp_work_dir="$tmp_mount/work"
 worker="$tmp_mount/msl-imagewriter-build-guest.sh"
@@ -361,12 +372,47 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
+report_file_allocation() {
+  label="$1"
+  path="$2"
+  if [ ! -f "$path" ]; then
+    echo "imagewriter_file_alloc mode=$mode label=$label path=$path status=missing"
+    return 0
+  fi
+  stat_line="$(stat -c "blocks=%b size=%s blksize=%o" "$path" 2>/dev/null || true)"
+  du_kib="$(du -sk "$path" 2>/dev/null | cut -f1 || true)"
+  if [ -z "$du_kib" ]; then
+    du_kib=0
+  fi
+  echo "imagewriter_file_alloc mode=$mode label=$label path=$path $stat_line du_kib=$du_kib"
+}
+
+compact_sparse_file() {
+  path="$1"
+  if [ ! -f "$path" ]; then
+    return 0
+  fi
+  if ! command -v fallocate >/dev/null 2>&1; then
+    echo "imagewriter_file_compact_skipped mode=$mode path=$path reason=fallocate_missing"
+    return 0
+  fi
+  if fallocate -d "$path" >/dev/null 2>&1; then
+    echo "imagewriter_file_compacted mode=$mode path=$path method=fallocate_d"
+  else
+    echo "imagewriter_file_compact_skipped mode=$mode path=$path reason=fallocate_failed"
+  fi
+}
+
 cleanup_guest_artifacts() {
   sync >/dev/null 2>&1 || true
   if grep -qs " $tmp_mount " /proc/mounts; then
     umount "$tmp_mount" >/dev/null 2>&1 || true
   fi
-  rm -f "$tmp_image" >/dev/null 2>&1 || true
+  if rm -f "$tmp_image" >/dev/null 2>&1; then
+    echo "tmp_reset_succeeded context=imagewriter_tmp path=$tmp_image"
+  else
+    echo "tmp_reset_failed context=imagewriter_tmp path=$tmp_image" >&2
+  fi
   rmdir "$tmp_mount" >/dev/null 2>&1 || true
   sync >/dev/null 2>&1 || true
   fstrim -v / >/dev/null 2>&1 || true
@@ -397,6 +443,7 @@ mkdir -p "$(dirname "$tmp_image")"
 rm -f "$tmp_image"
 truncate -s "${tmp_image_mb}M" "$tmp_image"
 mkfs.ext4 -q -F -E lazy_itable_init=1,lazy_journal_init=1 "$tmp_image"
+echo "tmp_image_created context=imagewriter_tmp path=$tmp_image size_mib=$tmp_image_mb"
 mkdir -p "$tmp_mount"
 mount -o loop "$tmp_image" "$tmp_mount"
 mkdir -p "$tmp_work_dir"
@@ -407,16 +454,16 @@ rm -f "$local_output"
 case "$mode" in
   stage1)
     if [ -n "$init_bin" ]; then
-      MSL_IMAGEWRITER_WORK_DIR="$tmp_work_dir" sh "$worker" --mode stage1 --rootfs "$input_path" --output "$local_output" --size-mb "$size_mb" --init-binary "$init_bin" --packages "$packages" --apk-cache-dir "$apk_cache"
+      MSL_IMAGEWRITER_WORK_DIR="$tmp_work_dir" sh "$worker" --mode stage1 --rootfs "$input_path" --output "$local_output" --size-mb "$size_mb" --init-binary "$init_bin" --packages "$packages" --apk-cache-dir "$apk_cache" --retry-limit "$apk_retry_limit"
     else
-      MSL_IMAGEWRITER_WORK_DIR="$tmp_work_dir" sh "$worker" --mode stage1 --rootfs "$input_path" --output "$local_output" --size-mb "$size_mb" --packages "$packages" --apk-cache-dir "$apk_cache"
+      MSL_IMAGEWRITER_WORK_DIR="$tmp_work_dir" sh "$worker" --mode stage1 --rootfs "$input_path" --output "$local_output" --size-mb "$size_mb" --packages "$packages" --apk-cache-dir "$apk_cache" --retry-limit "$apk_retry_limit"
     fi
     ;;
   stage2)
     if [ -n "$init_bin" ]; then
-      MSL_IMAGEWRITER_WORK_DIR="$tmp_work_dir" sh "$worker" --mode stage2 --rootfs "$input_path" --output "$local_output" --size-mb "$size_mb" --init-binary "$init_bin" --packages "$packages" --apk-cache-dir "$apk_cache"
+      MSL_IMAGEWRITER_WORK_DIR="$tmp_work_dir" sh "$worker" --mode stage2 --rootfs "$input_path" --output "$local_output" --size-mb "$size_mb" --init-binary "$init_bin" --packages "$packages" --apk-cache-dir "$apk_cache" --retry-limit "$apk_retry_limit"
     else
-      MSL_IMAGEWRITER_WORK_DIR="$tmp_work_dir" sh "$worker" --mode stage2 --rootfs "$input_path" --output "$local_output" --size-mb "$size_mb" --packages "$packages" --apk-cache-dir "$apk_cache"
+      MSL_IMAGEWRITER_WORK_DIR="$tmp_work_dir" sh "$worker" --mode stage2 --rootfs "$input_path" --output "$local_output" --size-mb "$size_mb" --packages "$packages" --apk-cache-dir "$apk_cache" --retry-limit "$apk_retry_limit"
     fi
     ;;
   legacy)
@@ -427,11 +474,19 @@ case "$mode" in
     exit 1
     ;;
 esac
-cp -f "$local_output" "$output"
+report_file_allocation "guest_local_output_before_compact" "$local_output"
+compact_sparse_file "$local_output"
+report_file_allocation "guest_local_output" "$local_output"
+if cp --help 2>/dev/null | grep -q -- '--sparse'; then
+  cp --sparse=always -f "$local_output" "$output"
+else
+  cp -f "$local_output" "$output"
+fi
+report_file_allocation "guest_shared_output" "$output"
 sync
 cleanup_guest_artifacts
 trap - EXIT INT TERM
-' sh "$WORKER_B64" "$mode" "$guest_input" "$guest_output" "$fs_type" "$size_mb" "$guest_init" "$packages" "$apk_cache" "$guest_tmp_image"
+' sh "$WORKER_B64" "$mode" "$guest_input" "$guest_output" "$fs_type" "$size_mb" "$guest_init" "$packages" "$apk_cache" "$guest_tmp_image" "$apk_retry_limit"
 }
 
 run_guest_worker_with_retry() {
@@ -444,13 +499,13 @@ run_guest_worker_with_retry() {
   packages="$7"
   apk_cache="$8"
 
-  if run_guest_worker "$mode" "$guest_input" "$guest_output" "$fs_type" "$size_mb" "$guest_init" "$packages" "$apk_cache" "$GUEST_TMP_IMAGE"; then
+  if run_guest_worker "$mode" "$guest_input" "$guest_output" "$fs_type" "$size_mb" "$guest_init" "$packages" "$apk_cache" "$IMAGEWRITER_APK_RETRY_LIMIT" "$GUEST_TMP_IMAGE"; then
     return 0
   fi
 
   echo "imagewriter: first guest run failed for mode=$mode; stopping instance and retrying once..." >&2
-  "$MSL_BIN" --instance "$INSTANCE" --stop >/dev/null 2>&1 || true
-  run_guest_worker "$mode" "$guest_input" "$guest_output" "$fs_type" "$size_mb" "$guest_init" "$packages" "$apk_cache" "$GUEST_TMP_IMAGE"
+  "$MSL_BIN" --instance "$INSTANCE" stop >/dev/null 2>&1 || true
+  run_guest_worker "$mode" "$guest_input" "$guest_output" "$fs_type" "$size_mb" "$guest_init" "$packages" "$apk_cache" "$IMAGEWRITER_APK_RETRY_LIMIT" "$GUEST_TMP_IMAGE"
 }
 
 if [ "$IMAGE_FS" = "btrfs" ] && [ "$TWO_STAGE_BTRFS" -eq 1 ]; then

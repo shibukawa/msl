@@ -2,7 +2,7 @@ use ext4_lwext4::{Ext4Fs, FileBlockDevice, OpenFlags};
 use std::collections::HashMap;
 use std::fs as hostfs;
 use std::io::{ErrorKind, Read};
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 struct Options {
@@ -297,8 +297,7 @@ fn copy_regular_file(
         }
     }
 
-    let mut src_file = hostfs::File::open(source)
-        .map_err(|e| format!("open source failed for {}: {e}", source.display()))?;
+    let mut src_file = open_source_file_for_copy(source, meta)?;
     let mut dst_file = fs
         .open(
             guest_path,
@@ -330,6 +329,49 @@ fn copy_regular_file(
     }
 
     Ok(())
+}
+
+fn open_source_file_for_copy(source: &Path, meta: &hostfs::Metadata) -> Result<hostfs::File, String> {
+    match hostfs::File::open(source) {
+        Ok(file) => Ok(file),
+        Err(err) if err.kind() == ErrorKind::PermissionDenied => {
+            let original_mode = meta.mode() & 0o7777;
+            let relaxed_mode = original_mode | 0o400;
+            if relaxed_mode == original_mode {
+                return Err(format!("open source failed for {}: {err}", source.display()));
+            }
+
+            debug_log(&format!(
+                "temporarily adding owner-read to {} (mode {:o} -> {:o})",
+                source.display(),
+                original_mode,
+                relaxed_mode
+            ));
+            hostfs::set_permissions(source, hostfs::Permissions::from_mode(relaxed_mode))
+                .map_err(|chmod_err| {
+                    format!(
+                        "open source failed for {}: {err}; chmod fallback failed: {chmod_err}",
+                        source.display()
+                    )
+                })?;
+
+            let reopen_result = hostfs::File::open(source).map_err(|reopen_err| {
+                format!(
+                    "open source failed for {} after chmod fallback: {reopen_err}",
+                    source.display()
+                )
+            });
+            let restore_result = hostfs::set_permissions(source, hostfs::Permissions::from_mode(original_mode));
+            if let Err(restore_err) = restore_result {
+                return Err(format!(
+                    "restoring original mode failed for {}: {restore_err}",
+                    source.display()
+                ));
+            }
+            reopen_result
+        }
+        Err(err) => Err(format!("open source failed for {}: {err}", source.display())),
+    }
 }
 
 fn copy_symlink(fs: &Ext4Fs, ctx: &CopyContext, source: &Path, guest_path: &str) -> Result<(), String> {
@@ -420,5 +462,42 @@ fn main() {
     if let Err(err) = run(options) {
         eprintln!("error: {err}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::io::Write;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_path(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        std::env::temp_dir().join(format!("msl-ext4-image-{name}-{nanos}"))
+    }
+
+    #[test]
+    fn open_source_file_for_copy_temporarily_relaxes_owner_read() {
+        let path = temp_path("owner-read");
+        let mut file = fs::File::create(&path).expect("create");
+        writeln!(file, "hello").expect("write");
+        drop(file);
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o111)).expect("chmod 111");
+        let meta = fs::symlink_metadata(&path).expect("metadata");
+
+        let mut reopened = open_source_file_for_copy(&path, &meta).expect("reopen");
+        let mut content = String::new();
+        reopened.read_to_string(&mut content).expect("read");
+        assert!(content.contains("hello"));
+
+        let restored = fs::symlink_metadata(&path).expect("metadata restored");
+        assert_eq!(restored.mode() & 0o7777, 0o111);
+
+        fs::remove_file(&path).expect("cleanup");
     }
 }
