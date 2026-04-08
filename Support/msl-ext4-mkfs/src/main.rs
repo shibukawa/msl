@@ -5,10 +5,11 @@ use std::path::PathBuf;
 struct Options {
     output: PathBuf,
     size_bytes: u64,
+    label: String,
 }
 
 fn usage() -> &'static str {
-    "usage: msl-ext4-mkfs --output <disk.raw> [--size-gb <n> | --size-mb <n>]"
+    "usage: msl-ext4-mkfs --output <disk.raw> [--size-gb <n> | --size-mb <n>] [--label <name>]"
 }
 
 fn parse_args() -> Result<Options, String> {
@@ -16,6 +17,7 @@ fn parse_args() -> Result<Options, String> {
     let mut output: Option<PathBuf> = None;
     let mut size_gb: u64 = 8;
     let mut size_mb: Option<u64> = None;
+    let mut label = "msl-rootfs".to_string();
 
     while let Some(token) = args.next() {
         match token.as_str() {
@@ -46,6 +48,13 @@ fn parse_args() -> Result<Options, String> {
                     return Err("--size-mb must be >= 1".to_string());
                 }
             }
+            "--label" => {
+                let value = args.next().ok_or_else(|| "missing value for --label".to_string())?;
+                if value.is_empty() {
+                    return Err("--label must not be empty".to_string());
+                }
+                label = value;
+            }
             "--help" | "-h" => {
                 return Err(usage().to_string());
             }
@@ -68,7 +77,11 @@ fn parse_args() -> Result<Options, String> {
             .ok_or_else(|| "disk size overflow".to_string())?
     };
 
-    Ok(Options { output, size_bytes })
+    Ok(Options {
+        output,
+        size_bytes,
+        label,
+    })
 }
 
 fn run(options: Options) -> Result<(), String> {
@@ -95,7 +108,7 @@ fn run(options: Options) -> Result<(), String> {
         .block_size(4096)
         .inode_size(256)
         .journal(true)
-        .label("msl-rootfs");
+        .label(options.label);
     mkfs(device, config).map_err(|e| format!("mkfs failed: {e}"))?;
     Ok(())
 }

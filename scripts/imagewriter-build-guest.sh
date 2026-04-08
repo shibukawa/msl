@@ -14,6 +14,7 @@ SIZE_MB="0"
 INIT_BINARY=""
 PACKAGES=""
 APK_CACHE_DIR=""
+APK_RETRY_LIMIT="5"
 
 usage() {
   cat >&2 <<'EOF_USAGE'
@@ -70,6 +71,10 @@ if [ "$#" -gt 0 ] && [ "${1#--}" != "$1" ]; then
         APK_CACHE_DIR="${2:-}"
         shift 2
         ;;
+      --retry-limit)
+        APK_RETRY_LIMIT="${2:-}"
+        shift 2
+        ;;
       --help|-h)
         usage
         exit 0
@@ -97,6 +102,10 @@ fi
 
 if ! is_non_negative_int "$SIZE_MB"; then
   echo "error: size-mb must be a non-negative integer: $SIZE_MB" >&2
+  exit 1
+fi
+if ! is_non_negative_int "$APK_RETRY_LIMIT" || [ "$APK_RETRY_LIMIT" -le 0 ]; then
+  echo "error: retry-limit must be a positive integer: $APK_RETRY_LIMIT" >&2
   exit 1
 fi
 
@@ -178,6 +187,18 @@ set_btrfs_compression() {
   fi
 }
 
+defrag_with_zstd() {
+  target="$1"
+  if [ ! -e "$target" ]; then
+    return 0
+  fi
+  if ! btrfs filesystem defrag -r -czstd -L 15 "$target" >/dev/null 2>&1; then
+    if ! btrfs filesystem defrag -r -czstd "$target" >/dev/null 2>&1; then
+      echo "warning: failed to defrag/recompress $target with zstd" >&2
+    fi
+  fi
+}
+
 detect_service_manager() {
   if [ -f "$ROOTFS_DIR/etc/alpine-release" ] || [ -x "$ROOTFS_DIR/sbin/openrc-run" ] || [ -d "$ROOTFS_DIR/etc/runlevels" ]; then
     echo "openrc"
@@ -202,7 +223,7 @@ normalize_root_fstab() {
     {
       if ($2 == "/") {
         if (root_done == 0) {
-          print "/dev/vda / auto defaults 0 1"
+          print "/dev/vda / auto defaults,nodiscard 0 1"
           root_done = 1
         }
         next
@@ -290,29 +311,49 @@ NTPD_OPTS="-p 127.0.0.1"
 EOF_NTPD_CONF
 }
 
-apply_btrfs_policy() {
+prepare_btrfs_policy() {
   mount_dir="$1"
   mkdir -p \
+    "$mount_dir/bin" \
+    "$mount_dir/etc" \
+    "$mount_dir/lib" \
+    "$mount_dir/lib64" \
+    "$mount_dir/root" \
+    "$mount_dir/sbin" \
     "$mount_dir/usr" \
     "$mount_dir/usr/local" \
     "$mount_dir/opt" \
     "$mount_dir/var/lib" \
+    "$mount_dir/var/cache/apk" \
     "$mount_dir/var/cache/apt" \
     "$mount_dir/var/log"
 
+  set_btrfs_compression "$mount_dir" zstd
+  set_btrfs_compression "$mount_dir/bin" zstd
+  set_btrfs_compression "$mount_dir/etc" zstd
+  set_btrfs_compression "$mount_dir/lib" zstd
+  set_btrfs_compression "$mount_dir/lib64" zstd
+  set_btrfs_compression "$mount_dir/root" zstd
+  set_btrfs_compression "$mount_dir/sbin" zstd
   set_btrfs_compression "$mount_dir/usr" zstd
   set_btrfs_compression "$mount_dir/usr/local" zstd
   set_btrfs_compression "$mount_dir/opt" zstd
   set_btrfs_compression "$mount_dir/var/lib" zstd
+  set_btrfs_compression "$mount_dir/var/cache/apk" none
   set_btrfs_compression "$mount_dir/var/cache/apt" none
   set_btrfs_compression "$mount_dir/var/log" zstd
+}
 
-  # Re-compress /usr with a high zstd level to make the base image denser.
-  if ! btrfs filesystem defrag -r -czstd -L 15 "$mount_dir/usr" >/dev/null 2>&1; then
-    if ! btrfs filesystem defrag -r -czstd "$mount_dir/usr" >/dev/null 2>&1; then
-      echo "warning: failed to defrag/recompress /usr with zstd" >&2
-    fi
-  fi
+apply_btrfs_policy() {
+  mount_dir="$1"
+  prepare_btrfs_policy "$mount_dir"
+
+  # Re-compress the whole rootfs after copy to densify the base image.
+  # Cache directories are switched back to `none` for future writes, but the
+  # initial bootstrap contents can stay compressed in the base image.
+  defrag_with_zstd "$mount_dir"
+  set_btrfs_compression "$mount_dir/var/cache/apk" none
+  set_btrfs_compression "$mount_dir/var/cache/apt" none
 }
 
 resolve_size_from_rootfs() {
@@ -343,14 +384,30 @@ install_packages() {
     echo "error: apk command not found in guest worker environment" >&2
     exit 1
   fi
-  if [ -n "$APK_CACHE_DIR" ]; then
-    mkdir -p "$APK_CACHE_DIR"
-    # shellcheck disable=SC2086
-    apk --root "$ROOTFS_DIR" --initdb --update-cache --cache-dir "$APK_CACHE_DIR" add $PACKAGES
-  else
-    # shellcheck disable=SC2086
-    apk --root "$ROOTFS_DIR" --initdb --update-cache add $PACKAGES
-  fi
+  attempts=0
+  while true; do
+    if [ -n "$APK_CACHE_DIR" ]; then
+      mkdir -p "$APK_CACHE_DIR"
+      # shellcheck disable=SC2086
+      if apk --root "$ROOTFS_DIR" --initdb --update-cache --cache-dir "$APK_CACHE_DIR" add $PACKAGES; then
+        break
+      fi
+    else
+      # shellcheck disable=SC2086
+      if apk --root "$ROOTFS_DIR" --initdb --update-cache add $PACKAGES; then
+        break
+      fi
+    fi
+    attempts=$((attempts + 1))
+    if [ "$attempts" -ge "$APK_RETRY_LIMIT" ]; then
+      echo "error: apk add failed after $attempts attempts" >&2
+      exit 1
+    fi
+    echo "warning: apk add failed (attempt $attempts/$APK_RETRY_LIMIT), retrying..." >&2
+    sleep "$attempts"
+  done
+  rootfs_kib="$(du -sk "$ROOTFS_DIR" | awk '{print $1}')"
+  echo "imagewriter_rootfs_size_kib mode=$MODE size_kib=$rootfs_kib"
 }
 
 extract_rootfs() {
@@ -382,6 +439,7 @@ install_init_binary() {
   cp -f "$INIT_BINARY" "$ROOTFS_DIR/usr/local/bin/msl-init"
   chmod 0755 "$ROOTFS_DIR/sbin/msl-init" "$ROOTFS_DIR/usr/local/bin/msl-init"
   ln -snf msl-init "$ROOTFS_DIR/usr/local/bin/msl"
+  ln -snf msl-init "$ROOTFS_DIR/usr/local/bin/code"
 
   SERVICE_MANAGER="$(detect_service_manager)"
   case "$SERVICE_MANAGER" in
@@ -406,6 +464,7 @@ build_from_source_dir() {
     btrfs)
       mkfs.btrfs -f "$OUTPUT_IMAGE" >/dev/null
       mount -o loop "$OUTPUT_IMAGE" "$OUTPUT_MOUNT_DIR"
+      prepare_btrfs_policy "$OUTPUT_MOUNT_DIR"
       ;;
     ext4)
       mkfs.ext4 -q -F -E lazy_itable_init=1,lazy_journal_init=1 "$OUTPUT_IMAGE"

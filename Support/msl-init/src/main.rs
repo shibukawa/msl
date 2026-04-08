@@ -1,32 +1,66 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::fs::symlink;
 use std::os::unix::io::FromRawFd;
 use std::os::unix::net::UnixListener;
 use std::os::unix::net::UnixStream;
-use std::os::unix::process::CommandExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicI8, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::sync::{Mutex, OnceLock};
+use std::sync::mpsc::{self as std_mpsc, Receiver};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::io::{unix::AsyncFd, AsyncReadExt, AsyncWriteExt};
+use tokio::process::Command as TokioCommand;
+use tokio::runtime::{Builder as TokioRuntimeBuilder, Runtime as TokioRuntime};
+use tokio::sync::{mpsc as tokio_mpsc, Mutex as TokioMutex};
+use tokio::time::{timeout as tokio_timeout, Duration as TokioDuration};
 
 const MAX_READ_BYTES: usize = 16 * 1024;
+const INIT_CHANNEL_FRAME_MAGIC: u32 = 0x4D534C49; // "MSLI"
+const INIT_CHANNEL_FRAME_OPCODE_JSON_RPC_REQUEST: u32 = 1;
+const INIT_CHANNEL_FRAME_OPCODE_JSON_RPC_RESPONSE: u32 = 2;
+const INIT_CHANNEL_FRAME_OPCODE_PTY_READ_REQUEST: u32 = 3;
+const INIT_CHANNEL_FRAME_OPCODE_PTY_READ_RESPONSE: u32 = 4;
+const INIT_CHANNEL_FRAME_OPCODE_PTY_WRITE_REQUEST: u32 = 5;
+const INIT_CHANNEL_FRAME_OPCODE_PTY_WRITE_RESPONSE: u32 = 6;
+const INIT_CHANNEL_FRAME_OPCODE_PROC_READ_REQUEST: u32 = 7;
+const INIT_CHANNEL_FRAME_OPCODE_PROC_READ_RESPONSE: u32 = 8;
+const INIT_CHANNEL_FRAME_OPCODE_PROC_WRITE_REQUEST: u32 = 9;
+const INIT_CHANNEL_FRAME_OPCODE_PROC_WRITE_RESPONSE: u32 = 10;
+const INIT_CHANNEL_FRAME_OPCODE_PROC_SUBSCRIBE_REQUEST: u32 = 11;
+const INIT_CHANNEL_FRAME_OPCODE_PROC_EVENT: u32 = 12;
+const INIT_CHANNEL_FRAME_OPCODE_PTY_SUBSCRIBE_REQUEST: u32 = 13;
+const INIT_CHANNEL_FRAME_OPCODE_PTY_EVENT: u32 = 14;
 const MSL_VSOCK_PORT: u32 = 1024;
+const MSL_CODE_OPEN_VSOCK_PORT: u32 = 5001;
 const MSL_DNS_TUNNEL_PORT: u32 = 1053;
 const MSL_TIME_TUNNEL_PORT: u32 = 1067;
 const MEMORY_STATS_FILE: &str = "/run/msl-memory-stats.env";
 const LOCAL_CONTROL_SOCKET: &str = "/run/msl-init.sock";
 const LOCAL_NTP_BIND_ADDR: &str = "127.0.0.1:123";
 const NTP_UNIX_OFFSET_SECONDS: u64 = 2_208_988_800;
+const BUILD_GIT_COMMIT: &str = match option_env!("MSL_INIT_BUILD_GIT_COMMIT") {
+    Some(value) => value,
+    None => "unknown",
+};
+const BUILD_TIMESTAMP: &str = match option_env!("MSL_INIT_BUILD_TIMESTAMP") {
+    Some(value) => value,
+    None => "unknown",
+};
+const BUILD_TARGET: &str = match option_env!("MSL_INIT_BUILD_TARGET") {
+    Some(value) => value,
+    None => "unknown",
+};
 
 // Linux constants for vsock
 const AF_VSOCK: i32 = 40;
@@ -67,14 +101,17 @@ struct PollFd {
     revents: i16,
 }
 
-const POLLOUT: i16 = 0x004;
 const POLLIN: i16 = 0x001;
 const POLLHUP: i16 = 0x010;
 const POLLERR: i16 = 0x008;
+const F_GETFL: i32 = 3;
+const F_SETFL: i32 = 4;
+const O_NONBLOCK: i32 = 0x800;
 const MS_BIND: usize = 4096;
 
 extern "C" {
     fn poll(fds: *mut PollFd, nfds: u64, timeout: i32) -> i32;
+    fn fcntl(fd: i32, cmd: i32, ...) -> i32;
     fn _exit(status: i32) -> !;
     fn chdir(path: *const u8) -> i32;
     fn setgroups(size: usize, list: *const u32) -> i32;
@@ -111,6 +148,7 @@ extern "C" {
     fn fork() -> i32;
     fn setsid() -> i32;
     fn dup2(oldfd: i32, newfd: i32) -> i32;
+    fn dup(oldfd: i32) -> i32;
     fn execve(pathname: *const u8, argv: *const *const u8, envp: *const *const u8) -> i32;
     fn ioctl(fd: i32, request: u64, ...) -> i32;
     fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
@@ -124,11 +162,72 @@ const SIGKILL: i32 = 9;
 struct PtySession {
     master_fd: i32,
     child_pid: i32,
-    rx: Receiver<Vec<u8>>,
+    stdin_tx: Option<tokio_mpsc::Sender<PtyInputMessage>>,
+    rx: Arc<TokioMutex<tokio_mpsc::Receiver<PtyEvent>>>,
+    child_exit_code: Option<i32>,
+    child_exit_reason: Option<String>,
+    streams_closed: bool,
+}
+
+enum PtyEvent {
+    Output(Vec<u8>),
+    Exited { code: i32, reason: String },
+    StreamsClosed,
+}
+
+enum PtyInputMessage {
+    Data { bytes: Vec<u8>, enqueued_at_ms: i64 },
+    Close,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProcStreamKind {
+    Stdout,
+    Stderr,
+}
+
+#[derive(Clone)]
+struct ProcStreamChunk {
+    seq: u64,
+    stream: ProcStreamKind,
+    data: Vec<u8>,
+}
+
+const SHELL_SERVER_SENTINEL: &[u8] = b"\xE2\x90\x84";
+const PROC_STDERR_HOLDBACK_WINDOW_MS: u64 = 8;
+
+enum ProcEvent {
+    Stream(ProcStreamChunk),
+    Exited { code: i32, reason: String },
+    StreamsClosed,
+}
+
+struct ProcSession {
+    child_pid: i32,
+    stdin_tx: Option<tokio_mpsc::Sender<ProcStdinMessage>>,
+    rx: Arc<TokioMutex<tokio_mpsc::Receiver<ProcEvent>>>,
+    child_exit_code: Option<i32>,
+    child_exit_reason: Option<String>,
+    streams_closed: bool,
+    stdin_tail: String,
+    stdin_text_tail: String,
+    helper_trace: String,
+    stdin_line_buffer: Vec<u8>,
+    helper_watch_started: bool,
+    helper_candidate_logged: bool,
+    helper_reference_logged: bool,
+    helper_tail_last_logged: String,
+}
+
+enum ProcStdinMessage {
+    Data { bytes: Vec<u8>, enqueued_at_ms: i64 },
+    Close,
 }
 
 static PTY_SESSIONS: OnceLock<Mutex<HashMap<String, PtySession>>> = OnceLock::new();
 static PTY_SEQ: AtomicU64 = AtomicU64::new(1);
+static PROC_SESSIONS: OnceLock<Mutex<HashMap<String, ProcSession>>> = OnceLock::new();
+static PROC_SEQ: AtomicU64 = AtomicU64::new(1);
 static LOG_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static DIAG_LOCK: OnceLock<Mutex<Option<std::fs::File>>> = OnceLock::new();
 static RUNTIME_USER: OnceLock<Mutex<RuntimeUserContext>> = OnceLock::new();
@@ -147,12 +246,43 @@ struct RuntimeUserContext {
 struct DNSProxyRuntime {
     listen: SocketAddr,
     upstreams: Vec<SocketAddr>,
-    stop_tx: mpsc::Sender<()>,
+    stop_tx: std_mpsc::Sender<()>,
     handle: JoinHandle<()>,
+}
+
+struct RawAsyncFD(i32);
+
+impl AsRawFd for RawAsyncFD {
+    fn as_raw_fd(&self) -> i32 {
+        self.0
+    }
+}
+
+static IO_RUNTIME: OnceLock<TokioRuntime> = OnceLock::new();
+
+fn io_runtime() -> &'static TokioRuntime {
+    IO_RUNTIME.get_or_init(|| {
+        TokioRuntimeBuilder::new_multi_thread()
+            .enable_all()
+            .worker_threads(2)
+            .thread_name("msl-init-io")
+            .build()
+            .expect("failed to build tokio runtime")
+    })
+}
+
+enum BlockingRecvResult<T> {
+    Event(T),
+    Timeout,
+    Closed,
 }
 
 fn sessions() -> &'static Mutex<HashMap<String, PtySession>> {
     PTY_SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn proc_sessions() -> &'static Mutex<HashMap<String, ProcSession>> {
+    PROC_SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn runtime_user() -> &'static Mutex<RuntimeUserContext> {
@@ -165,6 +295,29 @@ fn runtime_user() -> &'static Mutex<RuntimeUserContext> {
             shell: "/bin/sh".to_string(),
         })
     })
+}
+
+fn runtime_context_for_request(run_as_root: bool) -> RuntimeUserContext {
+    if run_as_root {
+        RuntimeUserContext {
+            username: "root".to_string(),
+            uid: 0,
+            gid: 0,
+            home: "/root".to_string(),
+            shell: "/bin/sh".to_string(),
+        }
+    } else {
+        runtime_user()
+            .lock()
+            .map(|v| v.clone())
+            .unwrap_or(RuntimeUserContext {
+                username: "root".to_string(),
+                uid: 0,
+                gid: 0,
+                home: "/root".to_string(),
+                shell: "/bin/sh".to_string(),
+            })
+    }
 }
 
 fn dns_proxy_state() -> &'static Mutex<Option<DNSProxyRuntime>> {
@@ -403,7 +556,7 @@ fn ensure_dns_proxy(listen: SocketAddr, upstreams: Vec<SocketAddr>) -> Result<(b
         .map_err(|err| format!("dns proxy bind failed listen={} err={}", listen, err))?;
     let _ = socket.set_read_timeout(Some(Duration::from_millis(200)));
 
-    let (stop_tx, stop_rx) = mpsc::channel::<()>();
+    let (stop_tx, stop_rx) = std_mpsc::channel::<()>();
     let listen_for_thread = listen;
     let upstreams_for_thread = upstreams.clone();
     let handle = thread::spawn(move || {
@@ -434,8 +587,8 @@ fn run_dns_proxy_loop(
     loop {
         match stop_rx.try_recv() {
             Ok(_) => break,
-            Err(TryRecvError::Disconnected) => break,
-            Err(TryRecvError::Empty) => {}
+            Err(std_mpsc::TryRecvError::Disconnected) => break,
+            Err(std_mpsc::TryRecvError::Empty) => {}
         }
 
         match socket.recv_from(&mut buf) {
@@ -825,6 +978,10 @@ fn main() -> Result<(), String> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(MSL_VSOCK_PORT);
 
+    log_line(&format!(
+        "session_started build_git={} build_ts={} build_target={}",
+        BUILD_GIT_COMMIT, BUILD_TIMESTAMP, BUILD_TARGET
+    ));
     log_line(&format!("started vsock_port={}", vsock_port));
     ensure_process_environment();
     ensure_mount_prerequisites();
@@ -857,11 +1014,21 @@ fn main() -> Result<(), String> {
 
 fn run_guest_cli_if_requested(args: &[String]) -> Option<Result<(), String>> {
     let argv0 = args.first().map(String::as_str).unwrap_or("msl-init");
-    let invoked_as_msl = Path::new(argv0)
+    let invoked_name = Path::new(argv0)
         .file_name()
         .and_then(|v| v.to_str())
-        .map(|v| v == "msl")
-        .unwrap_or(false);
+        .unwrap_or("msl-init");
+    let invoked_as_msl = invoked_name == "msl";
+    let invoked_as_code = invoked_name == "code";
+
+    if invoked_as_code {
+        let command_args = if args.len() >= 2 { &args[1..] } else { &[] };
+        return Some(run_guest_code_cli(command_args));
+    }
+
+    if args.len() >= 2 && (args[1] == "version" || args[1] == "--version" || args[1] == "-V") {
+        return Some(run_guest_version_cli(&args[1..]));
+    }
 
     if !invoked_as_msl && (args.len() < 2 || args[1] != "memory") {
         return None;
@@ -888,6 +1055,76 @@ fn run_guest_memory_cli(args: &[String]) -> Result<(), String> {
 
 fn guest_memory_usage() -> String {
     "usage: msl memory [status|compact|drop-cache|compat]".to_string()
+}
+
+fn run_guest_code_cli(args: &[String]) -> Result<(), String> {
+    if args.len() > 1 {
+        return Err(guest_code_usage());
+    }
+    let raw_target = args.first().map(|v| v.as_str()).unwrap_or(".");
+    let target = resolve_code_target(raw_target)?;
+    send_code_open_request(&target)?;
+    Ok(())
+}
+
+fn guest_code_usage() -> String {
+    "usage: code [path]".to_string()
+}
+
+fn run_guest_version_cli(args: &[String]) -> Result<(), String> {
+    if args.is_empty() || args.len() > 1 {
+        return Err(guest_version_usage());
+    }
+    println!("{}", guest_version_string());
+    Ok(())
+}
+
+fn guest_version_usage() -> String {
+    "usage: msl-init version".to_string()
+}
+
+fn guest_version_string() -> String {
+    format!(
+        "msl-init git={} built_at={} target={}",
+        BUILD_GIT_COMMIT,
+        BUILD_TIMESTAMP,
+        BUILD_TARGET
+    )
+}
+
+fn resolve_code_target(raw: &str) -> Result<String, String> {
+    let trimmed = if raw.trim().is_empty() { "." } else { raw.trim() };
+    let candidate = Path::new(trimmed);
+    let absolute = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        let cwd = env::current_dir().map_err(|e| format!("failed to get cwd: {}", e))?;
+        cwd.join(candidate)
+    };
+    let normalized_path = match fs::canonicalize(&absolute) {
+        Ok(v) => v,
+        Err(_) => absolute,
+    };
+    let as_str = normalized_path
+        .to_str()
+        .ok_or_else(|| "path is not valid UTF-8".to_string())?;
+    Ok(normalize_absolute_path(as_str).unwrap_or_else(|| as_str.to_string()))
+}
+
+fn send_code_open_request(target: &str) -> Result<(), String> {
+    let port = env::var("MSL_CODE_OPEN_VSOCK_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(MSL_CODE_OPEN_VSOCK_PORT);
+    let mut stream = connect_vsock(port)?;
+    let payload = format!("OPEN:{}\n", target);
+    stream
+        .write_all(payload.as_bytes())
+        .map_err(|e| format!("failed to send OPEN request: {}", e))?;
+    stream
+        .flush()
+        .map_err(|e| format!("failed to flush OPEN request: {}", e))?;
+    Ok(())
 }
 
 fn print_guest_memory_status() {
@@ -1511,6 +1748,37 @@ fn run_vsock_client(port: u32) -> Result<(), String> {
     }
 }
 
+fn connect_single_vsock_session(port: u32, role: &str) -> Result<(), String> {
+    let fd = unsafe { socket(AF_VSOCK, SOCK_STREAM, 0) };
+    if fd < 0 {
+        return Err(format!(
+            "socket(AF_VSOCK) failed for role={}: {}",
+            role,
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    let addr = SockaddrVm {
+        svm_family: AF_VSOCK as u16,
+        svm_reserved1: 0,
+        svm_port: port,
+        svm_cid: VMADDR_CID_HOST,
+        svm_zero: [0; 4],
+    };
+
+    let ret = unsafe { connect(fd, &addr, std::mem::size_of::<SockaddrVm>() as u32) };
+    if ret < 0 {
+        let err = std::io::Error::last_os_error();
+        unsafe { close(fd); }
+        return Err(format!("vsock connect to host port {} failed for role={}: {}", port, role, err));
+    }
+
+    log_line(&format!("vsock connected to host port {} role={}", port, role));
+    handle_persistent_connection(fd);
+    log_line(&format!("vsock connection closed role={}", role));
+    Ok(())
+}
+
 fn handle_persistent_connection(fd: i32) {
     // SAFETY: fd is a valid file descriptor from connect()
     let stream: std::fs::File = unsafe { FromRawFd::from_raw_fd(fd) };
@@ -1523,7 +1791,7 @@ fn handle_persistent_connection(fd: i32) {
     let mut writer = stream;
 
     loop {
-        // Poll for data before blocking on read_line.
+        // Poll for data before blocking on frame read.
         // This prevents the connection handler from blocking indefinitely when the
         // host side becomes slow or unresponsive (e.g. during macOS sleep).
         // Use -1 (infinite wait): the daemon owns the VM lifecycle and will
@@ -1553,9 +1821,9 @@ fn handle_persistent_connection(fd: i32) {
             return;
         }
 
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
-            Ok(0) => {
+        let request_frame = match read_frame(&mut reader) {
+            Ok(Some(frame)) => frame,
+            Ok(None) => {
                 log_line("vsock EOF from host");
                 return;
             }
@@ -1563,13 +1831,47 @@ fn handle_persistent_connection(fd: i32) {
                 log_line(&format!("vsock read error: {}", e));
                 return;
             }
-            Ok(_) => {}
+        };
+
+        match decode_frame(request_frame.as_slice()) {
+            Ok(decoded) if decoded.magic == INIT_CHANNEL_FRAME_MAGIC => {
+                let decoded_op = decoded.opcode;
+                let decoded_header = decoded._header.clone();
+                let streamed = match decoded.opcode {
+                    INIT_CHANNEL_FRAME_OPCODE_PROC_SUBSCRIBE_REQUEST => {
+                        if let Some(proc_id) = extract_direct_string(&decoded_header, "procId") {
+                            log_line(&format!("proc_subscribe_stream_started proc_id={}", proc_id));
+                        } else {
+                            log_line("proc_subscribe_stream_started proc_id=unknown");
+                        }
+                        if let Err(err) = handle_direct_proc_subscribe(decoded._header, &mut writer) {
+                            log_line(&format!("proc subscribe error: {}", err));
+                        }
+                        true
+                    }
+                    INIT_CHANNEL_FRAME_OPCODE_PTY_SUBSCRIBE_REQUEST => {
+                        if let Some(pty_id) = extract_direct_string(&decoded_header, "ptyId") {
+                            log_line(&format!("pty_subscribe_stream_started pty_id={}", pty_id));
+                        } else {
+                            log_line("pty_subscribe_stream_started pty_id=unknown");
+                        }
+                        if let Err(err) = handle_direct_pty_subscribe(decoded._header, &mut writer) {
+                            log_line(&format!("pty subscribe error: {}", err));
+                        }
+                        true
+                    }
+                    _ => false,
+                };
+                if streamed {
+                    log_line(&format!("vsock direct stream handler returning opcode={}", decoded_op));
+                    return;
+                }
+            }
+            _ => {}
         }
 
-        let response = handle_request_line(&line);
-        let mut out = response.into_bytes();
-        out.push(b'\n');
-        if writer.write_all(&out).is_err() {
+        let response_frame = handle_frame(request_frame);
+        if writer.write_all(&response_frame).is_err() {
             log_line("vsock write error");
             return;
         }
@@ -1597,18 +1899,65 @@ fn run_file_handoff_loop(handoff_file: &str, ack_file: &str) -> Result<(), Strin
 
     let mut last_request_id = String::new();
     loop {
-        if let Ok(line) = fs::read_to_string(handoff) {
-            let request_id = extract_string(&line, "requestId").unwrap_or_default();
+        if let Ok(data) = fs::read(handoff) {
+            let request_payload = match decode_json_rpc_request_payload(&data) {
+                Ok(payload) => payload,
+                Err(e) => {
+                    log_line(&format!("file handoff decode error: {}", e));
+                    thread::sleep(Duration::from_millis(50));
+                    continue;
+                }
+            };
+            let request_id = extract_string(&request_payload, "requestId").unwrap_or_default();
             if !request_id.is_empty() && request_id != last_request_id {
-                let response = handle_request_line(&line);
+                let response = handle_request_line(&request_payload);
+                let response_frame = encode_json_rpc_response(&response);
                 let tmp_ack = format!("{}.tmp", ack_file);
-                if fs::write(&tmp_ack, response).is_ok() {
+                if fs::write(&tmp_ack, response_frame).is_ok() {
                     let _ = fs::rename(&tmp_ack, ack);
                     last_request_id = request_id;
                 }
             }
         }
         thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn handle_frame(frame: Vec<u8>) -> Vec<u8> {
+    match decode_frame(frame.as_slice()) {
+        Ok(decoded) => {
+            if decoded.magic != INIT_CHANNEL_FRAME_MAGIC {
+                let response = error_response("unknown", "unknown", "invalid_request", "invalid init channel frame magic");
+                return encode_json_rpc_response(&response);
+            }
+            match decoded.opcode {
+                INIT_CHANNEL_FRAME_OPCODE_JSON_RPC_REQUEST => {
+                    let request = match String::from_utf8(decoded.payload) {
+                        Ok(v) => v,
+                        Err(_) => {
+                            let response = error_response("unknown", "unknown", "invalid_request", "invalid JSON-RPC payload");
+                            return encode_json_rpc_response(&response);
+                        }
+                    };
+                    let request_op = extract_string(&request, "op").unwrap_or_else(|| "unknown".to_string());
+                    log_line(&format!("control_request_received op={}", request_op));
+                    let response = handle_request_line(&request);
+                    encode_json_rpc_response(&response)
+                }
+                INIT_CHANNEL_FRAME_OPCODE_PTY_READ_REQUEST => handle_direct_pty_read(decoded._header),
+                INIT_CHANNEL_FRAME_OPCODE_PTY_WRITE_REQUEST => handle_direct_pty_write(decoded._header, decoded.payload),
+                INIT_CHANNEL_FRAME_OPCODE_PROC_READ_REQUEST => handle_direct_proc_read(decoded._header),
+                INIT_CHANNEL_FRAME_OPCODE_PROC_WRITE_REQUEST => handle_direct_proc_write(decoded._header, decoded.payload),
+                _ => {
+                    let response = error_response("unknown", "unknown", "unsupported_op", "unsupported init channel frame opcode");
+                    encode_json_rpc_response(&response)
+                }
+            }
+        }
+        Err(e) => {
+            let response = error_response("unknown", "unknown", "invalid_request", &format!("invalid init channel frame: {}", e));
+            encode_json_rpc_response(&response)
+        }
     }
 }
 
@@ -1659,6 +2008,12 @@ fn handle_request_line(line: &str) -> String {
         "pty_write" => pty_write_response(&request_id, &op, line),
         "pty_resize" => pty_resize_response(&request_id, &op, line),
         "pty_close" => pty_close_response(&request_id, &op, line),
+        "proc_open" => proc_open_response(&request_id, &op, line),
+        "proc_read" => proc_read_response(&request_id, &op, line),
+        "proc_write" => proc_write_response(&request_id, &op, line),
+        "proc_stdin_close" => proc_stdin_close_response(&request_id, &op, line),
+        "proc_close" => proc_close_response(&request_id, &op, line),
+        "sideband_open" => sideband_open_response(&request_id, &op, line),
         "dns_reconcile" => dns_reconcile_response(&request_id, &op, line),
         "dns_healthcheck" => dns_healthcheck_response(&request_id, &op, line),
         _ => error_response(
@@ -1668,6 +2023,643 @@ fn handle_request_line(line: &str) -> String {
             &format!("unsupported op {}", op),
         ),
     }
+}
+
+fn sideband_open_response(request_id: &str, op: &str, line: &str) -> String {
+    let role = extract_string(line, "sidebandRole").unwrap_or_else(|| "sideband".to_string());
+    let port = env::var("MSL_VSOCK_PORT")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(MSL_VSOCK_PORT);
+    let role_clone = role.clone();
+    thread::spawn(move || {
+        if let Err(err) = connect_single_vsock_session(port, &role_clone) {
+            log_line(&err);
+        }
+    });
+    ok_response(
+        request_id,
+        op,
+        Some(format!("\"meta\":{{\"role\":\"{}\"}}", escape_json(&role))),
+    )
+}
+
+struct InitChannelFrame {
+    magic: u32,
+    opcode: u32,
+    _header: Vec<u8>,
+    payload: Vec<u8>,
+}
+
+struct DirectFrameChunkDescriptor {
+    stream: &'static str,
+    length: usize,
+}
+
+#[derive(Copy, Clone)]
+enum DirectBinaryStreamKind {
+    Stdout = 1,
+    Stderr = 2,
+}
+
+fn read_frame<R: Read>(reader: &mut R) -> Result<Option<Vec<u8>>, String> {
+    let mut fixed = [0u8; 16];
+    let mut offset = 0usize;
+    while offset < fixed.len() {
+        match reader.read(&mut fixed[offset..]) {
+            Ok(0) => {
+                if offset == 0 {
+                    return Ok(None);
+                }
+                return Err("unexpected EOF while reading frame header".to_string());
+            }
+            Ok(n) => offset += n,
+            Err(e) => return Err(format!("frame header read failed: {}", e)),
+        }
+    }
+
+    let header_len = u32::from_be_bytes([fixed[8], fixed[9], fixed[10], fixed[11]]) as usize;
+    let payload_len = u32::from_be_bytes([fixed[12], fixed[13], fixed[14], fixed[15]]) as usize;
+    let mut body = vec![0u8; header_len + payload_len];
+    let mut body_offset = 0usize;
+    while body_offset < body.len() {
+        match reader.read(&mut body[body_offset..]) {
+            Ok(0) => return Err("unexpected EOF while reading frame body".to_string()),
+            Ok(n) => body_offset += n,
+            Err(e) => return Err(format!("frame body read failed: {}", e)),
+        }
+    }
+
+    let mut frame = fixed.to_vec();
+    frame.extend_from_slice(&body);
+    Ok(Some(frame))
+}
+
+fn decode_frame(data: &[u8]) -> Result<InitChannelFrame, String> {
+    if data.len() < 16 {
+        return Err("short frame".to_string());
+    }
+    let magic = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+    let opcode = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
+    let header_len = u32::from_be_bytes([data[8], data[9], data[10], data[11]]) as usize;
+    let payload_len = u32::from_be_bytes([data[12], data[13], data[14], data[15]]) as usize;
+    let expected = 16usize
+        .checked_add(header_len)
+        .and_then(|v| v.checked_add(payload_len))
+        .ok_or_else(|| "frame length overflow".to_string())?;
+    if data.len() != expected {
+        return Err("frame length mismatch".to_string());
+    }
+    let header_start = 16usize;
+    let payload_start = header_start + header_len;
+    Ok(InitChannelFrame {
+        magic,
+        opcode,
+        _header: data[header_start..payload_start].to_vec(),
+        payload: data[payload_start..expected].to_vec(),
+    })
+}
+
+fn encode_frame(opcode: u32, header: &[u8], payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(16 + header.len() + payload.len());
+    out.extend_from_slice(&INIT_CHANNEL_FRAME_MAGIC.to_be_bytes());
+    out.extend_from_slice(&opcode.to_be_bytes());
+    out.extend_from_slice(&(header.len() as u32).to_be_bytes());
+    out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    out.extend_from_slice(header);
+    out.extend_from_slice(payload);
+    out
+}
+
+fn encode_json_rpc_response(response: &str) -> Vec<u8> {
+    encode_frame(
+        INIT_CHANNEL_FRAME_OPCODE_JSON_RPC_RESPONSE,
+        &[],
+        response.as_bytes(),
+    )
+}
+
+fn decode_json_rpc_request_payload(data: &[u8]) -> Result<String, String> {
+    let frame = decode_frame(data)?;
+    if frame.magic != INIT_CHANNEL_FRAME_MAGIC {
+        return Err("invalid frame magic".to_string());
+    }
+    if frame.opcode != INIT_CHANNEL_FRAME_OPCODE_JSON_RPC_REQUEST {
+        return Err("unexpected frame opcode".to_string());
+    }
+    String::from_utf8(frame.payload).map_err(|_| "invalid JSON-RPC UTF-8 payload".to_string())
+}
+
+fn direct_header(request_id: &str, op: &str, extras: Option<String>) -> Vec<u8> {
+    let mut fields = vec![
+        format!("\"version\":1"),
+        format!("\"requestId\":\"{}\"", escape_json(request_id)),
+        format!("\"op\":\"{}\"", escape_json(op)),
+        format!("\"status\":\"ok\""),
+    ];
+    if let Some(extra) = extras {
+        fields.push(extra);
+    }
+    format!("{{{}}}", fields.join(",")).into_bytes()
+}
+
+fn direct_error_header(request_id: &str, op: &str, code: &str, message: &str) -> Vec<u8> {
+    format!(
+        "{{\"version\":1,\"requestId\":\"{}\",\"op\":\"{}\",\"status\":\"error\",\"error\":{{\"code\":\"{}\",\"message\":\"{}\"}}}}",
+        escape_json(request_id),
+        escape_json(op),
+        escape_json(code),
+        escape_json(message)
+    )
+    .into_bytes()
+}
+
+fn encode_binary_pty_read_header(ok: bool, exit_code: Option<i32>, id: &str, text: Option<&str>) -> Vec<u8> {
+    let id_bytes = id.as_bytes();
+    let text_bytes = text.unwrap_or("").as_bytes();
+    let mut flags = 0u8;
+    if exit_code.is_some() {
+        flags |= 1 << 0;
+    }
+    if !text_bytes.is_empty() {
+        flags |= 1 << 1;
+    }
+    let mut header = Vec::with_capacity(16 + id_bytes.len() + text_bytes.len());
+    header.push(if ok { 1 } else { 0 });
+    header.push(flags);
+    header.extend_from_slice(&[0, 0]);
+    header.extend_from_slice(&exit_code.unwrap_or(0).to_be_bytes());
+    header.extend_from_slice(&(id_bytes.len() as u32).to_be_bytes());
+    header.extend_from_slice(&(text_bytes.len() as u32).to_be_bytes());
+    header.extend_from_slice(id_bytes);
+    header.extend_from_slice(text_bytes);
+    header
+}
+
+fn encode_binary_proc_read_header(
+    ok: bool,
+    exit_code: Option<i32>,
+    proc_id: &str,
+    text: Option<&str>,
+    descriptors: &[DirectFrameChunkDescriptor],
+) -> Vec<u8> {
+    let id_bytes = proc_id.as_bytes();
+    let text_bytes = text.unwrap_or("").as_bytes();
+    let mut flags = 0u8;
+    if exit_code.is_some() {
+        flags |= 1 << 0;
+    }
+    if !text_bytes.is_empty() {
+        flags |= 1 << 1;
+    }
+    let mut header = Vec::with_capacity(20 + id_bytes.len() + text_bytes.len() + descriptors.len() * 8);
+    header.push(if ok { 1 } else { 0 });
+    header.push(flags);
+    header.extend_from_slice(&[0, 0]);
+    header.extend_from_slice(&exit_code.unwrap_or(0).to_be_bytes());
+    header.extend_from_slice(&(id_bytes.len() as u32).to_be_bytes());
+    header.extend_from_slice(&(text_bytes.len() as u32).to_be_bytes());
+    header.extend_from_slice(&(descriptors.len() as u32).to_be_bytes());
+    header.extend_from_slice(id_bytes);
+    header.extend_from_slice(text_bytes);
+    for descriptor in descriptors {
+        let stream_id = match descriptor.stream {
+            "stdout" => DirectBinaryStreamKind::Stdout as u8,
+            "stderr" => DirectBinaryStreamKind::Stderr as u8,
+            _ => 0,
+        };
+        header.push(stream_id);
+        header.extend_from_slice(&[0, 0, 0]);
+        header.extend_from_slice(&(descriptor.length as u32).to_be_bytes());
+    }
+    header
+}
+
+fn extract_direct_string(header: &[u8], key: &str) -> Option<String> {
+    let line = std::str::from_utf8(header).ok()?;
+    extract_string(line, key)
+}
+
+fn extract_direct_int(header: &[u8], key: &str) -> Option<i32> {
+    let line = std::str::from_utf8(header).ok()?;
+    extract_int(line, key)
+}
+
+fn collect_proc_read_events(
+    session: &mut ProcSession,
+    timeout_ms: Option<i32>,
+) -> (Vec<ProcStreamChunk>, Option<i32>, Option<String>, bool) {
+    let mut chunks: Vec<ProcStreamChunk> = Vec::new();
+    let mut total_bytes = 0usize;
+    let timeout = timeout_ms
+        .map(|value| value.max(0) as u64)
+        .unwrap_or(0);
+
+    let mut rx = session.rx.blocking_lock();
+
+    if total_bytes < MAX_READ_BYTES {
+        match recv_proc_event_blocking(&mut rx, timeout) {
+            BlockingRecvResult::Event(ProcEvent::Stream(chunk)) => {
+                total_bytes += chunk.data.len();
+                chunks.push(chunk);
+            }
+            BlockingRecvResult::Event(ProcEvent::Exited { code, reason }) => {
+                session.child_exit_code = Some(code);
+                session.child_exit_reason = Some(reason);
+            }
+            BlockingRecvResult::Event(ProcEvent::StreamsClosed) => {
+                session.streams_closed = true;
+            }
+            BlockingRecvResult::Timeout => {}
+            BlockingRecvResult::Closed => {
+                session.streams_closed = true;
+            }
+        }
+    }
+
+    while total_bytes < MAX_READ_BYTES {
+        match rx.try_recv() {
+            Ok(ProcEvent::Stream(chunk)) => {
+                total_bytes += chunk.data.len();
+                chunks.push(chunk);
+            }
+            Ok(ProcEvent::Exited { code, reason }) => {
+                session.child_exit_code = Some(code);
+                session.child_exit_reason = Some(reason);
+            }
+            Ok(ProcEvent::StreamsClosed) => {
+                session.streams_closed = true;
+            }
+            Err(tokio_mpsc::error::TryRecvError::Empty) => break,
+            Err(tokio_mpsc::error::TryRecvError::Disconnected) => {
+                session.streams_closed = true;
+                break;
+            }
+        }
+    }
+
+    let finalize = session.child_exit_code.is_some() && session.streams_closed;
+    (
+        chunks,
+        session.child_exit_code,
+        session.child_exit_reason.clone(),
+        finalize,
+    )
+}
+
+fn recv_proc_event_blocking(
+    rx: &mut tokio_mpsc::Receiver<ProcEvent>,
+    timeout_ms: u64,
+) -> BlockingRecvResult<ProcEvent> {
+    if timeout_ms == 0 {
+        match rx.try_recv() {
+            Ok(event) => BlockingRecvResult::Event(event),
+            Err(tokio_mpsc::error::TryRecvError::Empty) => BlockingRecvResult::Timeout,
+            Err(tokio_mpsc::error::TryRecvError::Disconnected) => BlockingRecvResult::Closed,
+        }
+    } else {
+        match io_runtime().block_on(tokio_timeout(TokioDuration::from_millis(timeout_ms), rx.recv())) {
+            Ok(Some(event)) => BlockingRecvResult::Event(event),
+            Ok(None) => BlockingRecvResult::Closed,
+            Err(_) => BlockingRecvResult::Timeout,
+        }
+    }
+}
+
+fn recv_pty_event_blocking(
+    rx: &mut tokio_mpsc::Receiver<PtyEvent>,
+    timeout_ms: u64,
+) -> BlockingRecvResult<PtyEvent> {
+    if timeout_ms == 0 {
+        match rx.try_recv() {
+            Ok(event) => BlockingRecvResult::Event(event),
+            Err(tokio_mpsc::error::TryRecvError::Empty) => BlockingRecvResult::Timeout,
+            Err(tokio_mpsc::error::TryRecvError::Disconnected) => BlockingRecvResult::Closed,
+        }
+    } else {
+        match io_runtime().block_on(tokio_timeout(TokioDuration::from_millis(timeout_ms), rx.recv())) {
+            Ok(Some(event)) => BlockingRecvResult::Event(event),
+            Ok(None) => BlockingRecvResult::Closed,
+            Err(_) => BlockingRecvResult::Timeout,
+        }
+    }
+}
+
+fn handle_direct_pty_read(header: Vec<u8>) -> Vec<u8> {
+    let pty_id = match extract_direct_string(&header, "ptyId") {
+        Some(v) if !v.is_empty() => v,
+        _ => {
+            return encode_frame(
+                INIT_CHANNEL_FRAME_OPCODE_PTY_READ_RESPONSE,
+                &encode_binary_pty_read_header(false, None, "", Some("missing ptyId")),
+                &[],
+            )
+        }
+    };
+
+    let mut map = match sessions().lock() {
+        Ok(v) => v,
+        Err(_) => {
+            return encode_frame(
+                INIT_CHANNEL_FRAME_OPCODE_PTY_READ_RESPONSE,
+                &encode_binary_pty_read_header(false, None, &pty_id, Some("pty session lock poisoned")),
+                &[],
+            )
+        }
+    };
+
+    let mut output: Vec<u8> = Vec::new();
+    {
+        let session = match map.get_mut(&pty_id) {
+            Some(v) => v,
+            None => {
+                return encode_frame(
+                    INIT_CHANNEL_FRAME_OPCODE_PTY_READ_RESPONSE,
+                    &encode_binary_pty_read_header(false, None, &pty_id, Some("unknown ptyId")),
+                    &[],
+                )
+            }
+        };
+        let mut rx = session.rx.blocking_lock();
+        while output.len() < MAX_READ_BYTES {
+            match recv_pty_event_blocking(&mut rx, 0) {
+                BlockingRecvResult::Event(PtyEvent::Output(chunk)) => output.extend_from_slice(&chunk),
+                BlockingRecvResult::Event(PtyEvent::Exited { code, reason }) => {
+                    session.child_exit_code = Some(code);
+                    session.child_exit_reason = Some(reason);
+                }
+                BlockingRecvResult::Event(PtyEvent::StreamsClosed) => {
+                    session.streams_closed = true;
+                }
+                BlockingRecvResult::Timeout => break,
+                BlockingRecvResult::Closed => {
+                    session.streams_closed = true;
+                    break;
+                }
+            }
+        }
+    }
+    let exit_code = map.get(&pty_id).and_then(|session| session.child_exit_code);
+    if exit_code.is_some() && map.get(&pty_id).map(|v| v.streams_closed).unwrap_or(false) {
+        if let Some(session) = map.remove(&pty_id) {
+            unsafe { close(session.master_fd); }
+        }
+    }
+
+    encode_frame(
+        INIT_CHANNEL_FRAME_OPCODE_PTY_READ_RESPONSE,
+        &encode_binary_pty_read_header(true, exit_code, &pty_id, None),
+        &output,
+    )
+}
+
+fn handle_direct_pty_write(header: Vec<u8>, payload: Vec<u8>) -> Vec<u8> {
+    let request_id = extract_direct_string(&header, "requestId").unwrap_or_else(|| "unknown".to_string());
+    let op = extract_direct_string(&header, "op").unwrap_or_else(|| "pty_write".to_string());
+    let pty_id = match extract_direct_string(&header, "ptyId") {
+        Some(v) if !v.is_empty() => v,
+        _ => {
+            return encode_frame(
+                INIT_CHANNEL_FRAME_OPCODE_PTY_WRITE_RESPONSE,
+                &direct_error_header(&request_id, &op, "invalid_request", "missing ptyId"),
+                &[],
+            )
+        }
+    };
+    let line = format!("{{\"requestId\":\"{}\",\"op\":\"{}\",\"ptyId\":\"{}\",\"dataBase64\":\"{}\"}}",
+        escape_json(&request_id), escape_json(&op), escape_json(&pty_id), escape_json(&b64_encode(&payload)));
+    let response = pty_write_response(&request_id, &op, &line);
+    encode_frame(INIT_CHANNEL_FRAME_OPCODE_PTY_WRITE_RESPONSE, response.as_bytes(), &[])
+}
+
+fn handle_direct_proc_read(header: Vec<u8>) -> Vec<u8> {
+    let proc_id = match extract_direct_string(&header, "procId") {
+        Some(v) if !v.is_empty() => v,
+        _ => {
+            return encode_frame(
+                INIT_CHANNEL_FRAME_OPCODE_PROC_READ_RESPONSE,
+                &encode_binary_proc_read_header(false, None, "", Some("missing procId"), &[]),
+                &[],
+            )
+        }
+    };
+    let timeout_ms = extract_direct_int(&header, "timeoutMs");
+
+    let mut map = match proc_sessions().lock() {
+        Ok(v) => v,
+        Err(_) => {
+            return encode_frame(
+                INIT_CHANNEL_FRAME_OPCODE_PROC_READ_RESPONSE,
+                &encode_binary_proc_read_header(false, None, &proc_id, Some("proc session lock poisoned"), &[]),
+                &[],
+            )
+        }
+    };
+
+    let (mut chunks, exit_code, exit_reason, finalize) = {
+        let session = match map.get_mut(&proc_id) {
+            Some(v) => v,
+            None => {
+                return encode_frame(
+                    INIT_CHANNEL_FRAME_OPCODE_PROC_READ_RESPONSE,
+                    &encode_binary_proc_read_header(false, None, &proc_id, Some("unknown procId"), &[]),
+                    &[],
+                )
+            }
+        };
+        collect_proc_read_events(session, timeout_ms)
+    };
+    if finalize {
+        map.remove(&proc_id);
+    }
+
+    chunks.sort_by_key(|chunk| chunk.seq);
+    let mut payload: Vec<u8> = Vec::new();
+    let mut chunk_descriptors: Vec<DirectFrameChunkDescriptor> = Vec::new();
+    for chunk in chunks {
+        let stream = match chunk.stream {
+            ProcStreamKind::Stdout => "stdout",
+            ProcStreamKind::Stderr => "stderr",
+        };
+        chunk_descriptors.push(DirectFrameChunkDescriptor {
+            stream,
+            length: chunk.data.len(),
+        });
+        payload.extend_from_slice(&chunk.data);
+    }
+
+    encode_frame(
+        INIT_CHANNEL_FRAME_OPCODE_PROC_READ_RESPONSE,
+        &encode_binary_proc_read_header(true, exit_code, &proc_id, exit_reason.as_deref(), &chunk_descriptors),
+        &payload,
+    )
+}
+
+fn handle_direct_proc_write(header: Vec<u8>, payload: Vec<u8>) -> Vec<u8> {
+    let request_id = extract_direct_string(&header, "requestId").unwrap_or_else(|| "unknown".to_string());
+    let op = extract_direct_string(&header, "op").unwrap_or_else(|| "proc_write".to_string());
+    let proc_id = match extract_direct_string(&header, "procId") {
+        Some(v) if !v.is_empty() => v,
+        _ => {
+            return encode_frame(
+                INIT_CHANNEL_FRAME_OPCODE_PROC_WRITE_RESPONSE,
+                &direct_error_header(&request_id, &op, "invalid_request", "missing procId"),
+                &[],
+            )
+        }
+    };
+
+    let stdin_tx = {
+        let mut map = match proc_sessions().lock() {
+            Ok(v) => v,
+            Err(_) => {
+                return encode_frame(
+                    INIT_CHANNEL_FRAME_OPCODE_PROC_WRITE_RESPONSE,
+                    &direct_error_header(&request_id, &op, "internal_error", "proc session lock poisoned"),
+                    &[],
+                )
+            }
+        };
+        let session = match map.get_mut(&proc_id) {
+            Some(v) => v,
+            None => {
+                return encode_frame(
+                    INIT_CHANNEL_FRAME_OPCODE_PROC_WRITE_RESPONSE,
+                    &direct_error_header(&request_id, &op, "invalid_request", "unknown procId"),
+                    &[],
+                )
+            }
+        };
+        observe_helper_handoff(&proc_id, session, &payload);
+        match session.stdin_tx.as_ref() {
+            Some(v) => v.clone(),
+            None => {
+                return encode_frame(
+                    INIT_CHANNEL_FRAME_OPCODE_PROC_WRITE_RESPONSE,
+                    &direct_error_header(&request_id, &op, "internal_error", "proc stdin already closed"),
+                    &[],
+                )
+            }
+        }
+    };
+    if let Err(err) = stdin_tx.blocking_send(ProcStdinMessage::Data {
+        bytes: payload,
+        enqueued_at_ms: now_epoch_ms() as i64,
+    }) {
+        return encode_frame(
+            INIT_CHANNEL_FRAME_OPCODE_PROC_WRITE_RESPONSE,
+            &direct_error_header(&request_id, &op, "internal_error", &format!("proc stdin queue failed: {}", err)),
+            &[],
+        );
+    }
+    encode_frame(
+        INIT_CHANNEL_FRAME_OPCODE_PROC_WRITE_RESPONSE,
+        &direct_header(&request_id, &op, Some(format!("\"procId\":\"{}\"", escape_json(&proc_id)))),
+        &[],
+    )
+}
+
+fn encode_proc_event_frame(proc_id: &str, kind: &str, payload: &[u8], exit_code: Option<i32>, text: Option<&str>) -> Vec<u8> {
+    let header = format!(
+        "{{\"kind\":\"{}\",\"procId\":\"{}\"{}{}{}}}",
+        escape_json(kind),
+        escape_json(proc_id),
+        exit_code.map(|v| format!(",\"exitCode\":{}", v)).unwrap_or_default(),
+        text.map(|v| format!(",\"text\":\"{}\"", escape_json(v))).unwrap_or_default(),
+        ""
+    );
+    encode_frame(INIT_CHANNEL_FRAME_OPCODE_PROC_EVENT, header.as_bytes(), payload)
+}
+
+fn encode_pty_event_frame(pty_id: &str, kind: &str, payload: &[u8], exit_code: Option<i32>, text: Option<&str>) -> Vec<u8> {
+    let header = format!(
+        "{{\"kind\":\"{}\",\"ptyId\":\"{}\"{}{}{}}}",
+        escape_json(kind),
+        escape_json(pty_id),
+        exit_code.map(|v| format!(",\"exitCode\":{}", v)).unwrap_or_default(),
+        text.map(|v| format!(",\"text\":\"{}\"", escape_json(v))).unwrap_or_default(),
+        ""
+    );
+    encode_frame(INIT_CHANNEL_FRAME_OPCODE_PTY_EVENT, header.as_bytes(), payload)
+}
+
+fn handle_direct_proc_subscribe(header: Vec<u8>, writer: &mut std::fs::File) -> Result<(), String> {
+    let proc_id = extract_direct_string(&header, "procId")
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| "missing procId".to_string())?;
+
+    let rx = {
+        let map = proc_sessions().lock().map_err(|_| "proc session lock poisoned".to_string())?;
+        let session = map.get(&proc_id).ok_or_else(|| "unknown procId".to_string())?;
+        session.rx.clone()
+    };
+
+    let mut saw_exit = false;
+    let mut saw_streams_closed = false;
+    loop {
+        let event = {
+            let mut guard = rx.blocking_lock();
+            guard.blocking_recv().ok_or_else(|| "proc event stream closed".to_string())?
+        };
+        let frame = match event {
+            ProcEvent::Stream(chunk) => match chunk.stream {
+                ProcStreamKind::Stdout => encode_proc_event_frame(&proc_id, "stdout", &chunk.data, None, None),
+                ProcStreamKind::Stderr => encode_proc_event_frame(&proc_id, "stderr", &chunk.data, None, None),
+            },
+            ProcEvent::Exited { code, reason } => {
+                saw_exit = true;
+                encode_proc_event_frame(&proc_id, "exited", &[], Some(code), Some(&reason))
+            }
+            ProcEvent::StreamsClosed => {
+                saw_streams_closed = true;
+                encode_proc_event_frame(&proc_id, "streams_closed", &[], None, None)
+            }
+        };
+        writer.write_all(&frame).map_err(|e| format!("proc subscribe write failed: {e}"))?;
+        writer.flush().map_err(|e| format!("proc subscribe flush failed: {e}"))?;
+        if saw_exit && saw_streams_closed {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn handle_direct_pty_subscribe(header: Vec<u8>, writer: &mut std::fs::File) -> Result<(), String> {
+    let pty_id = extract_direct_string(&header, "ptyId")
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| "missing ptyId".to_string())?;
+
+    let rx = {
+        let map = sessions().lock().map_err(|_| "pty session lock poisoned".to_string())?;
+        let session = map.get(&pty_id).ok_or_else(|| "unknown ptyId".to_string())?;
+        session.rx.clone()
+    };
+
+    let mut saw_exit = false;
+    let mut saw_streams_closed = false;
+    loop {
+        let event = {
+            let mut guard = rx.blocking_lock();
+            guard.blocking_recv().ok_or_else(|| "pty event stream closed".to_string())?
+        };
+        let frame = match event {
+            PtyEvent::Output(data) => encode_pty_event_frame(&pty_id, "output", &data, None, None),
+            PtyEvent::Exited { code, reason } => {
+                saw_exit = true;
+                encode_pty_event_frame(&pty_id, "exited", &[], Some(code), Some(&reason))
+            }
+            PtyEvent::StreamsClosed => {
+                saw_streams_closed = true;
+                encode_pty_event_frame(&pty_id, "streams_closed", &[], None, None)
+            }
+        };
+        writer.write_all(&frame).map_err(|e| format!("pty subscribe write failed: {e}"))?;
+        writer.flush().map_err(|e| format!("pty subscribe flush failed: {e}"))?;
+        if saw_exit && saw_streams_closed {
+            break;
+        }
+    }
+    Ok(())
 }
 
 fn dns_reconcile_response(request_id: &str, op: &str, line: &str) -> String {
@@ -2072,20 +3064,24 @@ fn pty_open_response(request_id: &str, op: &str, line: &str) -> String {
 
     // Parent: close slave, set up reader thread for master
     unsafe { close(slave_fd); }
-
-    let (tx, rx) = mpsc::channel::<Vec<u8>>();
-    let reader_fd = master_fd;
-    thread::spawn(move || {
-        let mut buf = [0u8; 4096];
-        loop {
-            let n = unsafe { libc_read(reader_fd, buf.as_mut_ptr(), buf.len()) };
-            if n <= 0 { break; }
-            if tx.send(buf[..n as usize].to_vec()).is_err() { break; }
-        }
-    });
-
     let pty_id = format!("pty-{}-{}", std::process::id(), PTY_SEQ.fetch_add(1, Ordering::Relaxed));
-    let session = PtySession { master_fd, child_pid: pid, rx };
+    let _ = set_fd_nonblocking(master_fd);
+
+    let (event_tx, event_rx) = tokio_mpsc::channel::<PtyEvent>(256);
+    let (stdin_tx, stdin_rx) = tokio_mpsc::channel::<PtyInputMessage>(128);
+    start_pty_output_pump(master_fd, event_tx.clone());
+    start_pty_input_pump(pty_id.clone(), master_fd, stdin_rx);
+    start_pty_wait_task(pid, event_tx);
+
+    let session = PtySession {
+        master_fd,
+        child_pid: pid,
+        stdin_tx: Some(stdin_tx),
+        rx: Arc::new(TokioMutex::new(event_rx)),
+        child_exit_code: None,
+        child_exit_reason: None,
+        streams_closed: false,
+    };
 
     match sessions().lock() {
         Ok(mut map) => {
@@ -2129,6 +3125,150 @@ extern "C" {
     fn libc_write(fd: i32, buf: *const u8, count: usize) -> isize;
 }
 
+fn start_pty_output_pump(master_fd: i32, tx: tokio_mpsc::Sender<PtyEvent>) {
+    io_runtime().spawn(async move {
+        let async_fd = match AsyncFd::new(RawAsyncFD(master_fd)) {
+            Ok(fd) => fd,
+            Err(_) => {
+                let _ = tx.send(PtyEvent::StreamsClosed).await;
+                return;
+            }
+        };
+        let mut buf = [0u8; 4096];
+        loop {
+            let mut guard = match async_fd.readable().await {
+                Ok(guard) => guard,
+                Err(_) => break,
+            };
+            let read_result = guard.try_io(|inner| {
+                let n = unsafe { libc_read(inner.get_ref().as_raw_fd(), buf.as_mut_ptr(), buf.len()) };
+                if n < 0 {
+                    let err = std::io::Error::last_os_error();
+                    if matches!(err.kind(), std::io::ErrorKind::WouldBlock) {
+                        Err(err)
+                    } else {
+                        log_line(&format!("pty_output_event proc_id={} reason=read_failed message={}", master_fd, err));
+                        Ok(0)
+                    }
+                } else {
+                    Ok(n)
+                }
+            });
+            match read_result {
+                Ok(Ok(0)) => break,
+                Ok(Ok(n)) => {
+                    if tx.send(PtyEvent::Output(buf[..n as usize].to_vec())).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(Err(_)) => continue,
+                Err(_would_block) => continue,
+            }
+        }
+        let _ = tx.send(PtyEvent::StreamsClosed).await;
+    });
+}
+
+fn start_pty_input_pump(proc_id: String, master_fd: i32, mut rx: tokio_mpsc::Receiver<PtyInputMessage>) {
+    io_runtime().spawn(async move {
+        let write_fd = unsafe { dup(master_fd) };
+        if write_fd < 0 {
+            let err = std::io::Error::last_os_error();
+            log_line(&format!("pty_stdin_writer_error proc_id={} reason=dup message={}", proc_id, err));
+            return;
+        }
+        let async_fd = match AsyncFd::new(RawAsyncFD(write_fd)) {
+            Ok(fd) => fd,
+            Err(err) => {
+                log_line(&format!("pty_stdin_writer_error proc_id={} reason=async_fd message={}", proc_id, err));
+                return;
+            }
+        };
+        while let Some(message) = rx.recv().await {
+            match message {
+                PtyInputMessage::Data { bytes, enqueued_at_ms } => {
+                    let dequeued_at_ms = now_epoch_ms() as i64;
+                    let queue_wait_ms = dequeued_at_ms.saturating_sub(enqueued_at_ms);
+                    let mut offset = 0usize;
+                    while offset < bytes.len() {
+                        let mut guard = match async_fd.writable().await {
+                            Ok(guard) => guard,
+                            Err(err) => {
+                                log_line(&format!("pty_stdin_writer_error proc_id={} reason=writable message={}", proc_id, err));
+                                return;
+                            }
+                        };
+                        let write_result = guard.try_io(|inner| {
+                            let n = unsafe {
+                                libc_write(
+                                    inner.get_ref().as_raw_fd(),
+                                    bytes[offset..].as_ptr(),
+                                    bytes.len() - offset,
+                                )
+                            };
+                            if n < 0 {
+                                let err = std::io::Error::last_os_error();
+                                if matches!(err.kind(), std::io::ErrorKind::WouldBlock) {
+                                    Err(err)
+                                } else {
+                                    log_line(&format!("pty_stdin_writer_error proc_id={} reason=write_failed message={}", proc_id, err));
+                                    Ok(bytes.len())
+                                }
+                            } else {
+                                Ok(n as usize)
+                            }
+                        });
+                        match write_result {
+                            Ok(Ok(n)) => offset += n,
+                            Ok(Err(_)) => continue,
+                            Err(_would_block) => continue,
+                        }
+                    }
+                    let write_done_ms = now_epoch_ms() as i64;
+                    log_line(&format!(
+                        "pty_stdin_writer_write proc_id={} bytes={} queue_wait_ms={} write_ms={}",
+                        proc_id,
+                        bytes.len(),
+                        queue_wait_ms,
+                        write_done_ms.saturating_sub(dequeued_at_ms)
+                    ));
+                }
+                PtyInputMessage::Close => {
+                    log_line(&format!("pty_stdin_writer_closed proc_id={} reason=stdin_close", proc_id));
+                    break;
+                }
+            }
+        }
+    });
+}
+
+fn start_pty_wait_task(child_pid: i32, tx: tokio_mpsc::Sender<PtyEvent>) {
+    io_runtime().spawn(async move {
+        let waited = tokio::task::spawn_blocking(move || {
+            let mut status: i32 = 0;
+            let ret = unsafe { waitpid(child_pid, &mut status, 0) };
+            if ret > 0 {
+                let code = if status & 0x7f == 0 {
+                    (status >> 8) & 0xff
+                } else {
+                    128 + (status & 0x7f)
+                };
+                let reason = if status & 0x7f == 0 {
+                    "exit".to_string()
+                } else {
+                    "signal".to_string()
+                };
+                Some(PtyEvent::Exited { code, reason })
+            } else {
+                None
+            }
+        }).await.ok().flatten();
+        if let Some(event) = waited {
+            let _ = tx.send(event).await;
+        }
+    });
+}
+
 fn pty_read_response(request_id: &str, op: &str, line: &str) -> String {
     let pty_id = match extract_string(line, "ptyId") {
         Some(v) if !v.is_empty() => v,
@@ -2141,7 +3281,6 @@ fn pty_read_response(request_id: &str, op: &str, line: &str) -> String {
     };
 
     let mut output: Vec<u8> = Vec::new();
-    let mut exit_code: Option<i32> = None;
 
     {
         let session = match map.get_mut(&pty_id) {
@@ -2149,29 +3288,30 @@ fn pty_read_response(request_id: &str, op: &str, line: &str) -> String {
             None => return error_response(request_id, op, "invalid_request", "unknown ptyId"),
         };
 
+        let mut rx = session.rx.blocking_lock();
+
         while output.len() < MAX_READ_BYTES {
-            match session.rx.try_recv() {
-                Ok(chunk) => output.extend_from_slice(&chunk),
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => break,
+            match recv_pty_event_blocking(&mut rx, 0) {
+                BlockingRecvResult::Event(PtyEvent::Output(chunk)) => output.extend_from_slice(&chunk),
+                BlockingRecvResult::Event(PtyEvent::Exited { code, reason }) => {
+                    session.child_exit_code = Some(code);
+                    session.child_exit_reason = Some(reason);
+                }
+                BlockingRecvResult::Event(PtyEvent::StreamsClosed) => {
+                    session.streams_closed = true;
+                }
+                BlockingRecvResult::Timeout => break,
+                BlockingRecvResult::Closed => {
+                    session.streams_closed = true;
+                    break;
+                }
             }
         }
 
-        // Check child status via waitpid(WNOHANG)
-        let mut status: i32 = 0;
-        let ret = unsafe { waitpid(session.child_pid, &mut status, WNOHANG) };
-        if ret > 0 {
-            if status & 0x7f == 0 {
-                // Exited normally
-                exit_code = Some((status >> 8) & 0xff);
-            } else {
-                // Killed by signal
-                exit_code = Some(128 + (status & 0x7f));
-            }
-        }
     }
+    let exit_code = map.get(&pty_id).and_then(|session| session.child_exit_code);
 
-    if exit_code.is_some() {
+    if exit_code.is_some() && map.get(&pty_id).map(|v| v.streams_closed).unwrap_or(false) {
         if let Some(session) = map.remove(&pty_id) {
             unsafe { close(session.master_fd); }
         }
@@ -2220,26 +3360,15 @@ fn pty_write_response(request_id: &str, op: &str, line: &str) -> String {
         None => return error_response(request_id, op, "invalid_request", "unknown ptyId"),
     };
 
-    let mut offset = 0;
-    while offset < bytes.len() {
-        // Use poll(POLLOUT) to avoid blocking indefinitely on full PTY buffer
-        let mut pfd = PollFd { fd: session.master_fd, events: POLLOUT, revents: 0 };
-        let pret = unsafe { poll(&mut pfd, 1, 5000) }; // 5s timeout
-        if pret == 0 {
-            return error_response(request_id, op, "timeout", "pty write timed out (PTY buffer full?)");
-        }
-        if pret < 0 {
-            let e = std::io::Error::last_os_error();
-            if e.raw_os_error() == Some(4) { // EINTR
-                continue;
-            }
-            return error_response(request_id, op, "internal_error", &format!("pty write poll failed: {}", e));
-        }
-        let n = unsafe { libc_write(session.master_fd, bytes[offset..].as_ptr(), bytes.len() - offset) };
-        if n < 0 {
-            return error_response(request_id, op, "internal_error", &format!("pty write failed: {}", std::io::Error::last_os_error()));
-        }
-        offset += n as usize;
+    let stdin_tx = match session.stdin_tx.as_ref() {
+        Some(v) => v,
+        None => return error_response(request_id, op, "internal_error", "pty stdin already closed"),
+    };
+    if let Err(err) = stdin_tx.blocking_send(PtyInputMessage::Data {
+        bytes,
+        enqueued_at_ms: now_epoch_ms() as i64,
+    }) {
+        return error_response(request_id, op, "internal_error", &format!("pty stdin queue failed: {}", err));
     }
 
     ok_response(request_id, op, None)
@@ -2269,7 +3398,11 @@ fn pty_resize_response(request_id: &str, op: &str, line: &str) -> String {
         return error_response(request_id, op, "internal_error", &format!("TIOCSWINSZ failed: {}", std::io::Error::last_os_error()));
     }
 
-    ok_response(request_id, op, Some(format!("\"meta\":{{\"rows\":{},\"cols\":{}}}", rows, cols)))
+    ok_response(
+        request_id,
+        op,
+        Some(format!("\"meta\":{{\"rows\":\"{}\",\"cols\":\"{}\"}}", rows, cols)),
+    )
 }
 
 fn pty_close_response(request_id: &str, op: &str, line: &str) -> String {
@@ -2283,10 +3416,14 @@ fn pty_close_response(request_id: &str, op: &str, line: &str) -> String {
         Err(_) => return error_response(request_id, op, "internal_error", "pty session lock poisoned"),
     };
 
-    let session = match map.remove(&pty_id) {
+    let mut session = match map.remove(&pty_id) {
         Some(v) => v,
         None => return ok_response(request_id, op, Some("\"meta\":{\"closed\":\"already\"}".to_string())),
     };
+
+    if let Some(tx) = session.stdin_tx.take() {
+        let _ = tx.blocking_send(PtyInputMessage::Close);
+    }
 
     // Close master fd first (sends EOF to child)
     unsafe { close(session.master_fd); }
@@ -2318,6 +3455,1052 @@ fn pty_close_response(request_id: &str, op: &str, line: &str) -> String {
         request_id,
         op,
         Some(format!("\"meta\":{{\"exitCode\":\"{}\"}},\"exitCode\":{}", code, code)),
+    )
+}
+
+fn exit_status_code(status: &std::process::ExitStatus) -> i32 {
+    status.code().unwrap_or_else(|| 128 + status.signal().unwrap_or(1))
+}
+
+fn exit_status_reason(status: &std::process::ExitStatus) -> String {
+    match status.code() {
+        Some(code) => format!("exit({})", code),
+        None => format!("signal({})", status.signal().unwrap_or(1)),
+    }
+}
+
+fn parse_children_pids(raw: &str) -> Vec<u32> {
+    raw.split_whitespace()
+        .filter_map(|part| part.parse::<u32>().ok())
+        .collect()
+}
+
+fn read_process_children(pid: u32) -> Vec<u32> {
+    let path = format!("/proc/{}/task/{}/children", pid, pid);
+    match fs::read_to_string(path) {
+        Ok(contents) => parse_children_pids(&contents),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn read_process_cmdline(pid: u32) -> Option<String> {
+    let cmdline_path = format!("/proc/{}/cmdline", pid);
+    if let Ok(raw) = fs::read(cmdline_path) {
+        let cmdline = raw
+            .split(|b| *b == 0)
+            .filter(|part| !part.is_empty())
+            .map(|part| String::from_utf8_lossy(part).into_owned())
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !cmdline.is_empty() {
+            return Some(cmdline);
+        }
+    }
+
+    let comm_path = format!("/proc/{}/comm", pid);
+    fs::read_to_string(comm_path)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn collect_process_descendants(root_pid: u32) -> HashMap<u32, String> {
+    let mut discovered: HashMap<u32, String> = HashMap::new();
+    let mut visited: HashSet<u32> = HashSet::new();
+    let mut pending = read_process_children(root_pid);
+
+    while let Some(pid) = pending.pop() {
+        if !visited.insert(pid) {
+            continue;
+        }
+        let cmd = read_process_cmdline(pid).unwrap_or_else(|| "<unknown>".to_string());
+        discovered.insert(pid, cmd);
+        pending.extend(read_process_children(pid));
+    }
+
+    discovered
+}
+
+fn log_proc_child_lifecycle(proc_id: String, root_pid: u32) {
+    let mut known_children: HashMap<u32, String> = HashMap::new();
+
+    loop {
+        let root_alive = Path::new(&format!("/proc/{}", root_pid)).exists();
+        let current_children = collect_process_descendants(root_pid);
+
+        for (pid, cmd) in current_children.iter() {
+            if !known_children.contains_key(pid) {
+                log_line(&format!(
+                    "proc_child_spawn proc_id={} root_pid={} pid={} cmd={}",
+                    proc_id,
+                    root_pid,
+                    pid,
+                    cmd
+                ));
+            }
+        }
+
+        for pid in known_children.keys() {
+            if !current_children.contains_key(pid) {
+                log_line(&format!(
+                    "proc_child_exit proc_id={} root_pid={} pid={}",
+                    proc_id,
+                    root_pid,
+                    pid
+                ));
+            }
+        }
+
+        known_children = current_children;
+
+        if !root_alive && known_children.is_empty() {
+            break;
+        }
+
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn append_tail(buffer: &mut String, fragment: &str, max_chars: usize) {
+    buffer.push_str(fragment);
+    let char_count = buffer.chars().count();
+    if char_count > max_chars {
+        let keep_from = char_count - max_chars;
+        let byte_index = buffer
+            .char_indices()
+            .nth(keep_from)
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        buffer.drain(..byte_index);
+    }
+}
+
+fn sanitize_preview_for_log(text: &str) -> String {
+    text.replace('\n', "\\n").replace('\r', "\\r")
+}
+
+fn log_helper_tail_snapshot(proc_id: &str, session: &mut ProcSession, reason: &str) {
+    if !session.helper_reference_logged || session.helper_watch_started {
+        return;
+    }
+    let tail = session.helper_trace.as_str();
+    if tail.is_empty() || tail == session.helper_tail_last_logged {
+        return;
+    }
+    log_line(&format!(
+        "proc_helper_tail proc_id={} reason={} preview={}",
+        proc_id,
+        reason,
+        sanitize_preview_for_log(tail)
+    ));
+    session.helper_tail_last_logged = tail.to_string();
+}
+
+fn is_shell_text_byte(byte: u8) -> bool {
+    matches!(byte, b'\n' | b'\r' | b'\t' | b' ') || byte.is_ascii_graphic()
+}
+
+fn sanitize_shell_candidate(bytes: &[u8]) -> String {
+    bytes.iter()
+        .filter(|byte| is_shell_text_byte(**byte))
+        .map(|byte| *byte as char)
+        .collect()
+}
+
+fn is_likely_shell_line(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.len() < 16 || trimmed.len() > 4096 {
+        return false;
+    }
+    let bytes = trimmed.as_bytes();
+    let ascii_shell_bytes = bytes
+        .iter()
+        .filter(|byte| is_shell_text_byte(**byte))
+        .count();
+    if ascii_shell_bytes * 100 / bytes.len().max(1) < 95 {
+        return false;
+    }
+
+    [
+        "REMOTE_CONTAINERS_",
+        "vscode-remote-containers",
+        "/.vscode-server/bin/",
+        "git config --system --replace-all credential.helper",
+        "gpgconf --list-dirs",
+        "extensionsCache",
+        "check-requirements.sh",
+        "code-server",
+        "product.json",
+        "connection-token",
+        "/tmp/devcontainers-",
+        "# Test for /root/.ssh/known_hosts",
+        "# Copy ",
+    ]
+    .iter()
+    .any(|needle| trimmed.contains(needle))
+}
+
+fn is_helper_relevant_line(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    [
+        "REMOTE_CONTAINERS_",
+        "vscode-remote-containers",
+        "credential.helper",
+        "/.vscode-server/bin/",
+        "gpgconf --list-dirs",
+        "extensionsCache",
+        "check-requirements.sh",
+        "code-server",
+        "product.json",
+        "connection-token",
+        "/tmp/devcontainers-",
+        "# Test for /root/.ssh/known_hosts",
+        "# Copy ",
+    ]
+    .iter()
+    .any(|needle| trimmed.contains(needle))
+}
+
+fn append_helper_trace(session: &mut ProcSession, text_fragment: &str) {
+    for line in text_fragment.lines() {
+        if !is_helper_relevant_line(line) {
+            continue;
+        }
+        if !session.helper_trace.is_empty() && !session.helper_trace.ends_with('\n') {
+            session.helper_trace.push('\n');
+        }
+        append_tail(&mut session.helper_trace, line, 128 * 1024);
+    }
+}
+
+fn filter_shell_text_fragment(line_buffer: &mut Vec<u8>, bytes: &[u8]) -> String {
+    let mut filtered = String::new();
+    for byte in bytes {
+        if *byte == b'\n' || *byte == b'\r' {
+            if !line_buffer.is_empty() {
+                let candidate = sanitize_shell_candidate(line_buffer);
+                if is_likely_shell_line(candidate.as_str()) {
+                    if !filtered.is_empty() && !filtered.ends_with('\n') {
+                        filtered.push('\n');
+                    }
+                    filtered.push_str(candidate.as_str());
+                }
+                line_buffer.clear();
+            }
+            continue;
+        }
+        line_buffer.push(*byte);
+        if line_buffer.len() > 4096 {
+            let candidate = sanitize_shell_candidate(line_buffer);
+            if is_likely_shell_line(candidate.as_str()) {
+                if !filtered.is_empty() && !filtered.ends_with('\n') {
+                    filtered.push('\n');
+                }
+                filtered.push_str(candidate.as_str());
+            }
+            line_buffer.clear();
+        }
+    }
+
+    if !line_buffer.is_empty() {
+        let candidate = sanitize_shell_candidate(line_buffer);
+        if is_likely_shell_line(candidate.as_str()) {
+            if !filtered.is_empty() && !filtered.ends_with('\n') {
+                filtered.push('\n');
+            }
+            filtered.push_str(candidate.as_str());
+        }
+    }
+
+    filtered
+}
+
+fn extract_shell_assignment_value(text: &str, key: &str) -> Option<String> {
+    let needle = format!("{}=", key);
+    let start = text.find(&needle)? + needle.len();
+    let bytes = text.as_bytes();
+    if start >= bytes.len() {
+        return None;
+    }
+
+    let quote = bytes[start];
+    if quote == b'\'' || quote == b'"' {
+        let mut end = start + 1;
+        while end < bytes.len() {
+            if bytes[end] == quote {
+                return Some(text[start + 1..end].to_string());
+            }
+            end += 1;
+        }
+        return None;
+    }
+
+    let mut end = start;
+    while end < bytes.len() {
+        let ch = bytes[end];
+        if ch.is_ascii_whitespace() || ch == b';' {
+            break;
+        }
+        end += 1;
+    }
+    if end > start {
+        Some(text[start..end].to_string())
+    } else {
+        None
+    }
+}
+
+fn is_helper_path_char(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_' | b'.')
+}
+
+fn extract_remote_containers_paths(text: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut seen = HashSet::new();
+    let bytes = text.as_bytes();
+    let mut cursor = 0usize;
+
+    while cursor < bytes.len() {
+        let Some(offset) = text[cursor..].find("/tmp/vscode-remote-containers") else {
+            break;
+        };
+        let start = cursor + offset;
+        let mut end = start;
+        while end < bytes.len() && is_helper_path_char(bytes[end]) {
+            end += 1;
+        }
+        let path = text[start..end].to_string();
+        if seen.insert(path.clone()) {
+            found.push(path);
+        }
+        cursor = end;
+    }
+
+    found
+}
+
+fn watch_helper_artifacts(proc_id: String, ipc_path: Option<String>, asset_paths: Vec<String>) {
+    if ipc_path.is_none() && asset_paths.is_empty() {
+        return;
+    }
+
+    thread::spawn(move || {
+        let mut watched: Vec<(String, String)> = Vec::new();
+        if let Some(ipc) = ipc_path {
+            watched.push(("ipc".to_string(), ipc));
+        }
+        for asset in asset_paths {
+            watched.push(("asset".to_string(), asset));
+        }
+
+        let mut previous: HashMap<String, bool> = HashMap::new();
+        for (_, path) in &watched {
+            previous.insert(path.clone(), false);
+        }
+
+        for _ in 0..400 {
+            let mut any_change = false;
+            for (kind, path) in &watched {
+                let exists = Path::new(path).exists();
+                let was = previous.get(path).copied().unwrap_or(false);
+                if exists != was {
+                    log_line(&format!(
+                        "proc_helper_artifact_state proc_id={} kind={} path={} exists={}",
+                        proc_id, kind, path, exists
+                    ));
+                    previous.insert(path.clone(), exists);
+                    any_change = true;
+                }
+            }
+            if !any_change && previous.values().all(|exists| *exists) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    });
+}
+
+fn start_proc_stdin_writer(
+    proc_id: String,
+    mut stdin: tokio::process::ChildStdin,
+    mut rx: tokio_mpsc::Receiver<ProcStdinMessage>,
+) {
+    io_runtime().spawn(async move {
+        while let Some(message) = rx.recv().await {
+            match message {
+                ProcStdinMessage::Data { bytes, enqueued_at_ms } => {
+                    let dequeued_at_ms = now_epoch_ms() as i64;
+                    let queue_wait_ms = dequeued_at_ms.saturating_sub(enqueued_at_ms);
+                    if let Err(err) = stdin.write_all(&bytes).await {
+                        log_line(&format!(
+                            "proc_stdin_writer_error proc_id={} reason=write_failed message={}",
+                            proc_id, err
+                        ));
+                        break;
+                    }
+                    let write_done_ms = now_epoch_ms() as i64;
+                    log_line(&format!(
+                        "proc_stdin_writer_write proc_id={} bytes={} queue_wait_ms={} write_ms={}",
+                        proc_id,
+                        bytes.len(),
+                        queue_wait_ms,
+                        write_done_ms.saturating_sub(dequeued_at_ms)
+                    ));
+                }
+                ProcStdinMessage::Close => {
+                    let _ = stdin.shutdown().await;
+                    log_line(&format!("proc_stdin_writer_closed proc_id={} reason=stdin_close", proc_id));
+                    break;
+                }
+            }
+        }
+    });
+}
+
+fn start_proc_output_merge_pump(
+    mut stdout: tokio::process::ChildStdout,
+    mut stderr: tokio::process::ChildStderr,
+    tx: tokio_mpsc::Sender<ProcEvent>,
+    seq: Arc<AtomicU64>,
+    proc_id: String,
+) {
+    io_runtime().spawn(async move {
+        let mut stdout_open = true;
+        let mut stderr_open = true;
+        let mut pending_stderr: Option<Vec<u8>> = None;
+        let mut stdout_buf = vec![0u8; 4096];
+        let mut stderr_buf = vec![0u8; 4096];
+
+        while stdout_open || stderr_open {
+            if let Some(data) = pending_stderr.take() {
+                if stdout_open {
+                    match tokio_timeout(
+                        TokioDuration::from_millis(PROC_STDERR_HOLDBACK_WINDOW_MS),
+                        stdout.read(&mut stdout_buf),
+                    )
+                    .await
+                    {
+                        Ok(Ok(0)) => {
+                            stdout_open = false;
+                        }
+                        Ok(Ok(n)) => {
+                            log_line(&format!(
+                                "proc_merge_flush proc_id={} stream=stdout bytes={}",
+                                proc_id, n
+                            ));
+                            if emit_proc_stream_chunk(
+                                &tx,
+                                &seq,
+                                &proc_id,
+                                ProcStreamKind::Stdout,
+                                stdout_buf[..n].to_vec(),
+                            )
+                            .await
+                            .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        Ok(Err(err)) => {
+                            log_line(&format!(
+                                "proc_stream_error proc_id={} stream={:?} message={}",
+                                proc_id,
+                                ProcStreamKind::Stdout,
+                                err
+                            ));
+                            stdout_open = false;
+                        }
+                        Err(_) => {
+                            log_line(&format!(
+                                "proc_merge_flush proc_id={} stream=stderr bytes={} reason=holdback_timeout",
+                                proc_id,
+                                data.len()
+                            ));
+                        }
+                    }
+                }
+                if emit_proc_stream_chunk(&tx, &seq, &proc_id, ProcStreamKind::Stderr, data)
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                continue;
+            }
+            tokio::select! {
+                stdout_result = stdout.read(&mut stdout_buf), if stdout_open => {
+                    match stdout_result {
+                        Ok(0) => {
+                            stdout_open = false;
+                        }
+                        Ok(n) => {
+                            log_line(&format!("proc_stdout_event proc_id={} bytes={}", proc_id, n));
+                            if emit_proc_stream_chunk(
+                                &tx,
+                                &seq,
+                                &proc_id,
+                                ProcStreamKind::Stdout,
+                                stdout_buf[..n].to_vec(),
+                            ).await.is_err() {
+                                return;
+                            }
+                        }
+                        Err(err) => {
+                            log_line(&format!(
+                                "proc_stream_error proc_id={} stream={:?} message={}",
+                                proc_id,
+                                ProcStreamKind::Stdout,
+                                err
+                            ));
+                            stdout_open = false;
+                        }
+                    }
+                }
+                stderr_result = stderr.read(&mut stderr_buf), if stderr_open => {
+                    match stderr_result {
+                        Ok(0) => {
+                            stderr_open = false;
+                        }
+                        Ok(n) => {
+                            log_line(&format!("proc_stderr_event proc_id={} bytes={}", proc_id, n));
+                            let data = stderr_buf[..n].to_vec();
+                            if should_holdback_proc_stderr_chunk(&data) && stdout_open {
+                                log_line(&format!(
+                                    "proc_merge_holdback proc_id={} stream=stderr bytes={} reason=shell_server_sentinel",
+                                    proc_id, n
+                                ));
+                                pending_stderr = Some(data);
+                            } else if emit_proc_stream_chunk(
+                                &tx,
+                                &seq,
+                                &proc_id,
+                                ProcStreamKind::Stderr,
+                                data,
+                            ).await.is_err() {
+                                    return;
+                            }
+                        }
+                        Err(err) => {
+                            log_line(&format!(
+                                "proc_stream_error proc_id={} stream={:?} message={}",
+                                proc_id,
+                                ProcStreamKind::Stderr,
+                                err
+                            ));
+                            stderr_open = false;
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(data) = pending_stderr.take() {
+            log_line(&format!(
+                "proc_merge_flush proc_id={} stream=stderr bytes={} reason=finalize",
+                proc_id,
+                data.len()
+            ));
+            if emit_proc_stream_chunk(&tx, &seq, &proc_id, ProcStreamKind::Stderr, data)
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+        let _ = tx.send(ProcEvent::StreamsClosed).await;
+    });
+}
+
+async fn emit_proc_stream_chunk(
+    tx: &tokio_mpsc::Sender<ProcEvent>,
+    seq: &Arc<AtomicU64>,
+    proc_id: &str,
+    stream: ProcStreamKind,
+    data: Vec<u8>,
+) -> Result<(), ()> {
+    let chunk = ProcStreamChunk {
+        seq: seq.fetch_add(1, Ordering::Relaxed),
+        stream,
+        data,
+    };
+    log_line(&format!(
+        "proc_merge_emit proc_id={} stream={:?} seq={} bytes={}",
+        proc_id,
+        stream,
+        chunk.seq,
+        chunk.data.len()
+    ));
+    tx.send(ProcEvent::Stream(chunk)).await.map_err(|_| ())
+}
+
+fn should_holdback_proc_stderr_chunk(data: &[u8]) -> bool {
+    data == SHELL_SERVER_SENTINEL
+}
+
+fn start_proc_wait_task(proc_id: String, mut child: tokio::process::Child, tx: tokio_mpsc::Sender<ProcEvent>) {
+    io_runtime().spawn(async move {
+        match child.wait().await {
+            Ok(status) => {
+                let code = exit_status_code(&status);
+                let reason = exit_status_reason(&status);
+                log_line(&format!("proc_exited proc_id={} exit_code={} reason={}", proc_id, code, reason));
+                let _ = tx.send(ProcEvent::Exited { code, reason }).await;
+            }
+            Err(err) => {
+                log_line(&format!("proc_wait_error proc_id={} message={}", proc_id, err));
+                let _ = tx
+                    .send(ProcEvent::Exited {
+                        code: 126,
+                        reason: format!("wait_error({})", err),
+                    })
+                    .await;
+            }
+        }
+    });
+}
+
+fn observe_helper_handoff(proc_id: &str, session: &mut ProcSession, bytes: &[u8]) {
+    let fragment = String::from_utf8_lossy(bytes);
+    if fragment.is_empty() {
+        return;
+    }
+
+    append_tail(&mut session.stdin_tail, &fragment, 32 * 1024);
+    let text_fragment = filter_shell_text_fragment(&mut session.stdin_line_buffer, bytes);
+    if !text_fragment.is_empty() {
+        append_tail(&mut session.stdin_text_tail, &text_fragment, 32 * 1024);
+        append_helper_trace(session, &text_fragment);
+    }
+
+    let tail = session.helper_trace.clone();
+    if tail.is_empty() {
+        return;
+    }
+
+    let has_helper_path = tail.contains("/tmp/vscode-remote-containers-");
+    let has_server_script = tail.contains("/tmp/vscode-remote-containers-server-");
+    let has_ipc = tail.contains("REMOTE_CONTAINERS_IPC=");
+    let has_node_exec = tail.contains("/.vscode-server/bin/") && tail.contains("/node");
+
+    if !has_helper_path && !has_ipc {
+        return;
+    }
+
+    if !session.helper_reference_logged && has_helper_path && !(has_ipc && has_server_script) {
+        let helper_paths = extract_remote_containers_paths(&tail);
+        log_line(&format!(
+            "proc_helper_reference proc_id={} helper_paths={} preview={}",
+            proc_id,
+            helper_paths.join(","),
+            sanitize_preview_for_log(&tail)
+        ));
+        session.helper_reference_logged = true;
+    }
+
+    log_helper_tail_snapshot(proc_id, session, "stdin_progress");
+
+    if !session.helper_candidate_logged && (has_ipc || has_server_script || has_node_exec) {
+        log_line(&format!(
+            "proc_helper_candidate proc_id={} has_ipc={} has_server_script={} has_node_exec={} preview={}",
+            proc_id,
+            has_ipc,
+            has_server_script,
+            has_node_exec,
+            sanitize_preview_for_log(&tail)
+        ));
+        session.helper_candidate_logged = true;
+    }
+
+    if session.helper_watch_started || !has_ipc || !has_server_script || !has_node_exec {
+        return;
+    }
+
+    let ipc_path = extract_shell_assignment_value(&tail, "REMOTE_CONTAINERS_IPC");
+    let sockets = extract_shell_assignment_value(&tail, "REMOTE_CONTAINERS_SOCKETS");
+    let helper_paths = extract_remote_containers_paths(&tail);
+    let preview = sanitize_preview_for_log(&tail);
+    log_line(&format!(
+        "proc_helper_detected proc_id={} ipc_path={} sockets={} helper_paths={} preview={}",
+        proc_id,
+        ipc_path.as_deref().unwrap_or(""),
+        sockets.as_deref().unwrap_or(""),
+        if helper_paths.is_empty() {
+            "".to_string()
+        } else {
+            helper_paths.join(",")
+        },
+        preview
+    ));
+    session.helper_watch_started = true;
+    watch_helper_artifacts(proc_id.to_string(), ipc_path, helper_paths);
+}
+
+fn proc_open_response(request_id: &str, op: &str, line: &str) -> String {
+    let argv = extract_string_array(line, "argv").unwrap_or_else(|| vec!["/bin/sh".to_string()]);
+    if argv.is_empty() {
+        return error_response(request_id, op, "invalid_request", "missing argv");
+    }
+    let requested_cwd = extract_string(line, "cwd");
+    let env_additions = extract_string_map(line, "envAdditions").unwrap_or_default();
+    let run_as_root = extract_bool(line, "runAsRoot").unwrap_or(false);
+    let runtime = runtime_context_for_request(run_as_root);
+    log_line(&format!(
+        "proc_open_received request_id={} argv0={} run_as_root={} requested_cwd={}",
+        request_id,
+        argv[0],
+        run_as_root,
+        requested_cwd.clone().unwrap_or_default()
+    ));
+
+    let mut cmd = TokioCommand::new(&argv[0]);
+    if argv.len() > 1 {
+        cmd.args(&argv[1..]);
+    }
+    cmd.uid(runtime.uid);
+    cmd.gid(runtime.gid);
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    cmd.env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+    cmd.env("HOME", &runtime.home);
+    cmd.env("TERM", "xterm-256color");
+    cmd.env("USER", &runtime.username);
+    cmd.env("LOGNAME", &runtime.username);
+    cmd.env("SHELL", &runtime.shell);
+    cmd.env("LANG", "C.UTF-8");
+    cmd.env("LC_ALL", "C.UTF-8");
+    for (key, value) in env_additions {
+        if is_valid_env_key(&key) {
+            cmd.env(key, value);
+        }
+    }
+    let desired_cwd = requested_cwd
+        .as_ref()
+        .filter(|v| v.starts_with('/') && Path::new(v).is_dir())
+        .cloned()
+        .unwrap_or_else(|| runtime.home.clone());
+    if Path::new(&desired_cwd).is_dir() {
+        cmd.current_dir(&desired_cwd);
+    }
+
+    let tokio_runtime = io_runtime();
+    let _runtime_guard = tokio_runtime.enter();
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(err) => {
+            return error_response(
+                request_id,
+                op,
+                "internal_error",
+                &format!("spawn failed: {}", err)
+            )
+        }
+    };
+
+    let stdin = match child.stdin.take() {
+        Some(stdin) => stdin,
+        None => return error_response(request_id, op, "internal_error", "missing child stdin"),
+    };
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => return error_response(request_id, op, "internal_error", "missing child stdout"),
+    };
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => return error_response(request_id, op, "internal_error", "missing child stderr"),
+    };
+
+    let proc_id = format!("proc-{}-{}", std::process::id(), PROC_SEQ.fetch_add(1, Ordering::Relaxed));
+    let (merged_tx, merged_rx) = tokio_mpsc::channel::<ProcEvent>(512);
+    let stream_seq = Arc::new(AtomicU64::new(1));
+    start_proc_output_merge_pump(
+        stdout,
+        stderr,
+        merged_tx.clone(),
+        Arc::clone(&stream_seq),
+        proc_id.clone(),
+    );
+
+    let pid = child.id().unwrap_or(0);
+    let (stdin_tx, stdin_rx) = tokio_mpsc::channel::<ProcStdinMessage>(256);
+    start_proc_stdin_writer(proc_id.clone(), stdin, stdin_rx);
+    let child_monitor_proc_id = proc_id.clone();
+    thread::spawn(move || {
+        log_proc_child_lifecycle(child_monitor_proc_id, pid);
+    });
+    start_proc_wait_task(proc_id.clone(), child, merged_tx.clone());
+
+    match proc_sessions().lock() {
+        Ok(mut map) => {
+            map.insert(proc_id.clone(), ProcSession {
+                child_pid: pid as i32,
+                stdin_tx: Some(stdin_tx),
+                rx: Arc::new(TokioMutex::new(merged_rx)),
+                child_exit_code: None,
+                child_exit_reason: None,
+                streams_closed: false,
+                stdin_tail: String::new(),
+                stdin_text_tail: String::new(),
+                helper_trace: String::new(),
+                stdin_line_buffer: Vec::new(),
+                helper_watch_started: false,
+                helper_candidate_logged: false,
+                helper_reference_logged: false,
+                helper_tail_last_logged: String::new(),
+            });
+        }
+        Err(_) => return error_response(request_id, op, "internal_error", "proc session lock poisoned"),
+    }
+
+    log_line(&format!(
+        "proc_session_started request_id={} proc_id={} argv0={} pid={} user={} uid={} gid={}",
+        request_id,
+        proc_id,
+        argv[0],
+        pid,
+        runtime.username,
+        runtime.uid,
+        runtime.gid
+    ));
+    ok_response(
+        request_id,
+        op,
+        Some(format!("\"procId\":\"{}\"", escape_json(&proc_id))),
+    )
+}
+
+fn proc_read_response(request_id: &str, op: &str, line: &str) -> String {
+    let proc_id = match extract_string(line, "procId") {
+        Some(v) if !v.is_empty() => v,
+        _ => return error_response(request_id, op, "invalid_request", "missing procId"),
+    };
+    let timeout_ms = extract_int(line, "timeoutMs");
+
+    let mut map = match proc_sessions().lock() {
+        Ok(v) => v,
+        Err(_) => return error_response(request_id, op, "internal_error", "proc session lock poisoned"),
+    };
+
+    let mut stdout: Vec<u8> = Vec::new();
+    let mut stderr: Vec<u8> = Vec::new();
+    let (mut chunks, exit_code, exit_reason, finalize) = {
+        let session = match map.get_mut(&proc_id) {
+            Some(v) => v,
+            None => return error_response(request_id, op, "invalid_request", "unknown procId"),
+        };
+        collect_proc_read_events(session, timeout_ms)
+    };
+
+    if finalize {
+        map.remove(&proc_id);
+    }
+
+    chunks.sort_by_key(|chunk| chunk.seq);
+
+    let mut chunks_json: Vec<String> = Vec::new();
+    for chunk in chunks {
+        match chunk.stream {
+            ProcStreamKind::Stdout => {
+                stdout.extend_from_slice(&chunk.data);
+                chunks_json.push(format!(
+                    "{{\"stream\":\"stdout\",\"dataBase64\":\"{}\"}}",
+                    escape_json(&b64_encode(&chunk.data))
+                ));
+            }
+            ProcStreamKind::Stderr => {
+                stderr.extend_from_slice(&chunk.data);
+                chunks_json.push(format!(
+                    "{{\"stream\":\"stderr\",\"dataBase64\":\"{}\"}}",
+                    escape_json(&b64_encode(&chunk.data))
+                ));
+            }
+        }
+    }
+
+    let mut extras: Vec<String> = Vec::new();
+    if !stdout.is_empty() {
+        extras.push(format!("\"stdoutBase64\":\"{}\"", escape_json(&b64_encode(&stdout))));
+    }
+    if !stderr.is_empty() {
+        extras.push(format!("\"stderrBase64\":\"{}\"", escape_json(&b64_encode(&stderr))));
+    }
+    if !chunks_json.is_empty() {
+        extras.push(format!("\"chunks\":[{}]", chunks_json.join(",")));
+    }
+    if let Some(code) = exit_code {
+        let mut meta_fields = vec![format!("\"exitCode\":\"{}\"", code)];
+        if let Some(reason) = exit_reason.as_ref() {
+            meta_fields.push(format!("\"exitReason\":\"{}\"", escape_json(reason)));
+        }
+        extras.push(format!("\"meta\":{{{}}}", meta_fields.join(",")));
+        extras.push(format!("\"exitCode\":{}", code));
+    }
+    ok_response(request_id, op, if extras.is_empty() { None } else { Some(extras.join(",")) })
+}
+
+fn set_fd_nonblocking(fd: i32) -> bool {
+    let flags = unsafe { fcntl(fd, F_GETFL) };
+    if flags < 0 {
+        return false;
+    }
+    (unsafe { fcntl(fd, F_SETFL, flags | O_NONBLOCK) }) == 0
+}
+
+fn proc_write_response(request_id: &str, op: &str, line: &str) -> String {
+    let proc_id = match extract_string(line, "procId") {
+        Some(v) if !v.is_empty() => v,
+        _ => return error_response(request_id, op, "invalid_request", "missing procId"),
+    };
+    let payload = match extract_string(line, "dataBase64") {
+        Some(v) => v,
+        None => return error_response(request_id, op, "invalid_request", "missing dataBase64"),
+    };
+
+    let bytes = match b64_decode(&payload) {
+        Ok(v) => v,
+        Err(e) => return error_response(request_id, op, "invalid_request", &format!("invalid base64: {e}")),
+    };
+
+    let stdin_tx = {
+        let mut map = match proc_sessions().lock() {
+            Ok(v) => v,
+            Err(_) => return error_response(request_id, op, "internal_error", "proc session lock poisoned"),
+        };
+        let session = match map.get_mut(&proc_id) {
+            Some(v) => v,
+            None => return error_response(request_id, op, "invalid_request", "unknown procId"),
+        };
+        observe_helper_handoff(&proc_id, session, &bytes);
+
+        match session.stdin_tx.as_ref() {
+            Some(v) => v.clone(),
+            None => return error_response(request_id, op, "internal_error", "proc stdin already closed"),
+        }
+    };
+
+    let enqueue_started_ms = now_epoch_ms() as i64;
+    let byte_len = bytes.len();
+    if let Err(err) = stdin_tx.blocking_send(ProcStdinMessage::Data {
+        bytes,
+        enqueued_at_ms: enqueue_started_ms,
+    }) {
+        return error_response(request_id, op, "internal_error", &format!("proc stdin queue failed: {}", err));
+    }
+    let meta = format!(
+        "\"meta\":{{\"bytes\":\"{}\",\"queueSendMs\":\"{}\"}}",
+        byte_len,
+        (now_epoch_ms() as i64).saturating_sub(enqueue_started_ms)
+    );
+    ok_response(request_id, op, Some(meta))
+}
+
+fn proc_stdin_close_response(request_id: &str, op: &str, line: &str) -> String {
+    let proc_id = match extract_string(line, "procId") {
+        Some(v) if !v.is_empty() => v,
+        _ => return error_response(request_id, op, "invalid_request", "missing procId"),
+    };
+
+    let (sender, already_closed, child_alive) = {
+        let mut map = match proc_sessions().lock() {
+            Ok(v) => v,
+            Err(_) => return error_response(request_id, op, "internal_error", "proc session lock poisoned"),
+        };
+        let session = match map.get_mut(&proc_id) {
+            Some(v) => v,
+            None => return ok_response(request_id, op, Some("\"meta\":{\"closed\":\"already\"}".to_string())),
+        };
+
+        log_helper_tail_snapshot(&proc_id, session, "stdin_close");
+        let sender = session.stdin_tx.take();
+        let already_closed = sender.is_none();
+        let child_alive = session.child_exit_code.is_none();
+        (sender, already_closed, child_alive)
+    };
+    if let Some(tx) = sender {
+        let _ = tx.blocking_send(ProcStdinMessage::Close);
+    }
+    log_line(&format!(
+        "proc_stdin_close request_id={} proc_id={} already_closed={} child_alive={} close_reason=stdin_eof",
+        request_id, proc_id, already_closed, child_alive
+    ));
+    ok_response(
+        request_id,
+        op,
+        Some(format!(
+            "\"meta\":{{\"alreadyClosed\":\"{}\",\"childAlive\":\"{}\",\"closeReason\":\"stdin_eof\"}}",
+            already_closed, child_alive
+        )),
+    )
+}
+
+fn proc_close_response(request_id: &str, op: &str, line: &str) -> String {
+    let proc_id = match extract_string(line, "procId") {
+        Some(v) if !v.is_empty() => v,
+        _ => return error_response(request_id, op, "invalid_request", "missing procId"),
+    };
+
+    let mut session = {
+        let mut map = match proc_sessions().lock() {
+            Ok(v) => v,
+            Err(_) => return error_response(request_id, op, "internal_error", "proc session lock poisoned"),
+        };
+        match map.remove(&proc_id) {
+            Some(v) => v,
+            None => return ok_response(request_id, op, Some("\"meta\":{\"closed\":\"already\"}".to_string())),
+        }
+    };
+
+    log_helper_tail_snapshot(&proc_id, &mut session, "proc_close");
+    if let Some(tx) = session.stdin_tx.take() {
+        let _ = tx.blocking_send(ProcStdinMessage::Close);
+    }
+    let mut close_action = "already_exited".to_string();
+    if session.child_exit_code.is_none() {
+        close_action = "killed".to_string();
+        unsafe { kill(session.child_pid, SIGKILL); }
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline && (session.child_exit_code.is_none() || !session.streams_closed) {
+        let mut rx = session.rx.blocking_lock();
+        match recv_proc_event_blocking(&mut rx, 50) {
+            BlockingRecvResult::Event(ProcEvent::Stream(_)) => {}
+            BlockingRecvResult::Event(ProcEvent::Exited { code, reason }) => {
+                session.child_exit_code = Some(code);
+                session.child_exit_reason = Some(reason);
+            }
+            BlockingRecvResult::Event(ProcEvent::StreamsClosed) => {
+                session.streams_closed = true;
+            }
+            BlockingRecvResult::Timeout => {}
+            BlockingRecvResult::Closed => {
+                session.streams_closed = true;
+            }
+        }
+    }
+    let code = session.child_exit_code.unwrap_or(1);
+    let exit_reason = session
+        .child_exit_reason
+        .clone()
+        .unwrap_or_else(|| "wait_error".to_string());
+
+    log_line(&format!(
+        "proc_close request_id={} proc_id={} exit_code={} exit_reason={} close_action={}",
+        request_id, proc_id, code, exit_reason, close_action
+    ));
+
+    ok_response(
+        request_id,
+        op,
+        Some(format!(
+            "\"meta\":{{\"exitCode\":\"{}\",\"exitReason\":\"{}\",\"closeAction\":\"{}\"}},\"exitCode\":{}",
+            code,
+            escape_json(&exit_reason),
+            escape_json(&close_action),
+            code
+        )),
     )
 }
 
@@ -2530,7 +4713,12 @@ fn start_syslog_forwarder() {
 }
 
 fn diag_write(channel: &str, message: &str) {
-    let line = format!("[{channel}] {message}");
+    let line = format!(
+        "[{channel}] ts_ms={} pid={} {}",
+        now_epoch_ms(),
+        std::process::id(),
+        message
+    );
     let lock = DIAG_LOCK.get_or_init(|| Mutex::new(None));
     let mut guard = match lock.lock() {
         Ok(v) => v,
@@ -2542,8 +4730,12 @@ fn diag_write(channel: &str, message: &str) {
     }
 }
 
+fn format_log_record(message: &str, ts_ms: u64, pid: u32) -> String {
+    format!("msl-init: ts_ms={} pid={} {}", ts_ms, pid, message)
+}
+
 fn log_line(message: &str) {
-    let line = format!("msl-init: {message}");
+    let line = format_log_record(message, now_epoch_ms(), std::process::id());
     eprintln!("{line}");
     diag_write("init", message);
 
@@ -3446,26 +5638,7 @@ fn exec_response(
     run_as_root: bool,
 ) -> String {
     let started = Instant::now();
-    let runtime = if run_as_root {
-        RuntimeUserContext {
-            username: "root".to_string(),
-            uid: 0,
-            gid: 0,
-            home: "/root".to_string(),
-            shell: "/bin/sh".to_string(),
-        }
-    } else {
-        runtime_user()
-            .lock()
-            .map(|v| v.clone())
-            .unwrap_or(RuntimeUserContext {
-                username: "root".to_string(),
-                uid: 0,
-                gid: 0,
-                home: "/root".to_string(),
-                shell: "/bin/sh".to_string(),
-            })
-    };
+    let runtime = runtime_context_for_request(run_as_root);
     let mut cmd = Command::new(&argv[0]);
     if argv.len() > 1 {
         cmd.args(&argv[1..]);
@@ -3961,6 +6134,30 @@ mod tests {
     }
 
     #[test]
+    fn guest_code_usage_is_stable() {
+        assert_eq!(guest_code_usage(), "usage: code [path]");
+    }
+
+    #[test]
+    fn guest_version_usage_is_stable() {
+        assert_eq!(guest_version_usage(), "usage: msl-init version");
+    }
+
+    #[test]
+    fn guest_version_string_contains_metadata_keys() {
+        let value = guest_version_string();
+        assert!(value.contains("msl-init git="));
+        assert!(value.contains(" built_at="));
+        assert!(value.contains(" target="));
+    }
+
+    #[test]
+    fn resolve_code_target_returns_absolute_path() {
+        let path = resolve_code_target(".").expect("resolve code target");
+        assert!(path.starts_with('/'));
+    }
+
+    #[test]
     fn format_u64_with_commas_formats_large_values() {
         assert_eq!(format_u64_with_commas(0), "0");
         assert_eq!(format_u64_with_commas(999), "999");
@@ -3983,5 +6180,154 @@ mod tests {
     #[test]
     fn format_last_event_handles_never() {
         assert_eq!(format_last_event(0), "never");
+    }
+
+    #[test]
+    fn parse_children_pids_ignores_invalid_entries() {
+        assert_eq!(parse_children_pids("12 34 nope 56\n"), vec![12, 34, 56]);
+        assert!(parse_children_pids("").is_empty());
+    }
+
+    #[test]
+    fn proc_stream_chunks_sort_by_sequence_before_encoding() {
+        let mut chunks = vec![
+            ProcStreamChunk {
+                seq: 2,
+                stream: ProcStreamKind::Stderr,
+                data: b"err".to_vec(),
+            },
+            ProcStreamChunk {
+                seq: 1,
+                stream: ProcStreamKind::Stdout,
+                data: b"out".to_vec(),
+            },
+        ];
+
+        chunks.sort_by_key(|chunk| chunk.seq);
+
+        assert_eq!(chunks[0].seq, 1);
+        assert_eq!(chunks[0].stream, ProcStreamKind::Stdout);
+        assert_eq!(chunks[0].data, b"out".to_vec());
+        assert_eq!(chunks[1].seq, 2);
+        assert_eq!(chunks[1].stream, ProcStreamKind::Stderr);
+        assert_eq!(chunks[1].data, b"err".to_vec());
+    }
+
+    #[test]
+    fn holdback_proc_stderr_chunk_matches_shell_server_sentinel_only() {
+        assert!(should_holdback_proc_stderr_chunk(SHELL_SERVER_SENTINEL));
+        assert!(!should_holdback_proc_stderr_chunk(b"err"));
+        assert!(!should_holdback_proc_stderr_chunk(b"\xE2\x90\x841"));
+    }
+
+    #[test]
+    fn extract_shell_assignment_value_handles_quoted_values() {
+        let command = "REMOTE_CONTAINERS_SOCKETS='[]' REMOTE_CONTAINERS_IPC='/tmp/vscode-remote-containers-ipc-123.sock' '/root/.vscode-server/bin/x/node' '/tmp/vscode-remote-containers-server-123.js'";
+        assert_eq!(
+            extract_shell_assignment_value(command, "REMOTE_CONTAINERS_SOCKETS").as_deref(),
+            Some("[]")
+        );
+        assert_eq!(
+            extract_shell_assignment_value(command, "REMOTE_CONTAINERS_IPC").as_deref(),
+            Some("/tmp/vscode-remote-containers-ipc-123.sock")
+        );
+    }
+
+    #[test]
+    fn extract_remote_containers_paths_finds_helper_assets() {
+        let command = "cat >/tmp/vscode-remote-containers-abc.js && '/root/.vscode-server/bin/x/node' '/tmp/vscode-remote-containers-server-abc.js' && export REMOTE_CONTAINERS_IPC='/tmp/vscode-remote-containers-ipc-abc.sock'";
+        let paths = extract_remote_containers_paths(command);
+        assert!(paths.contains(&"/tmp/vscode-remote-containers-abc.js".to_string()));
+        assert!(paths.contains(&"/tmp/vscode-remote-containers-server-abc.js".to_string()));
+        assert!(paths.contains(&"/tmp/vscode-remote-containers-ipc-abc.sock".to_string()));
+    }
+
+    #[test]
+    fn filter_shell_text_fragment_strips_binary_noise() {
+        let text = b"\x00\x01echo -n sentinel ; ( test -f '/tmp/vscode-remote-containers-1.js' ); echo -n $?\r";
+        assert_eq!(
+            filter_shell_text_fragment(&mut Vec::new(), text),
+            "echo -n sentinel ; ( test -f '/tmp/vscode-remote-containers-1.js' ); echo -n $?"
+        );
+    }
+
+    #[test]
+    fn helper_launch_requires_ipc_server_script_and_node() {
+        let reference_only = "git config --system --replace-all credential.helper '!f() { /root/.vscode-server/bin/x/node /tmp/vscode-remote-containers-abc.js git-credential-helper $*; }; f'";
+        let launch = "REMOTE_CONTAINERS_SOCKETS='[]' REMOTE_CONTAINERS_IPC='/tmp/vscode-remote-containers-ipc-123.sock' '/root/.vscode-server/bin/x/node' '/tmp/vscode-remote-containers-server-123.js'";
+
+        let reference_tail = filter_shell_text_fragment(&mut Vec::new(), reference_only.as_bytes());
+        assert!(reference_tail.contains("/tmp/vscode-remote-containers-abc.js"));
+        assert!(!reference_tail.contains("REMOTE_CONTAINERS_IPC="));
+        assert!(!reference_tail.contains("/tmp/vscode-remote-containers-server-"));
+
+        let launch_tail = filter_shell_text_fragment(&mut Vec::new(), launch.as_bytes());
+        assert!(launch_tail.contains("REMOTE_CONTAINERS_IPC="));
+        assert!(launch_tail.contains("/tmp/vscode-remote-containers-server-123.js"));
+        assert!(launch_tail.contains("/.vscode-server/bin/x/node"));
+    }
+
+    #[test]
+    fn helper_trace_keeps_only_helper_related_lines() {
+        let (_tx, rx) = tokio_mpsc::channel(1);
+        let mut session = ProcSession {
+            child_pid: 1,
+            stdin_tx: None,
+            rx: Arc::new(TokioMutex::new(rx)),
+            child_exit_code: None,
+            child_exit_reason: None,
+            streams_closed: false,
+            stdin_tail: String::new(),
+            stdin_text_tail: String::new(),
+            helper_trace: String::new(),
+            stdin_line_buffer: Vec::new(),
+            helper_watch_started: false,
+            helper_candidate_logged: false,
+            helper_reference_logged: false,
+            helper_tail_last_logged: String::new(),
+        };
+
+        append_helper_trace(
+            &mut session,
+            "echo hello\ncommand -v git\ncommand -v git >/dev/null 2>&1 && git config --system --replace-all credential.helper '!f() { /root/.vscode-server/bin/x/node /tmp/vscode-remote-containers-abc.js git-credential-helper $*; }; f'\n",
+        );
+        assert!(!session.helper_trace.contains("echo hello"));
+        assert!(session.helper_trace.contains("credential.helper"));
+        assert!(session.helper_trace.contains("/tmp/vscode-remote-containers-abc.js"));
+    }
+
+    #[test]
+    fn helper_candidate_markers_are_detected_from_helper_trace() {
+        let trace = "command -v git >/dev/null 2>&1 && git config --system --replace-all credential.helper '!f() { /root/.vscode-server/bin/x/node /tmp/vscode-remote-containers-abc.js git-credential-helper $*; }; f'\nREMOTE_CONTAINERS_SOCKETS='[]' REMOTE_CONTAINERS_IPC='/tmp/vscode-remote-containers-ipc-123.sock' '/root/.vscode-server/bin/x/node' '/tmp/vscode-remote-containers-server-123.js' ; exit";
+        assert!(trace.contains("REMOTE_CONTAINERS_IPC="));
+        assert!(trace.contains("/tmp/vscode-remote-containers-server-123.js"));
+        assert!(trace.contains("/.vscode-server/bin/x/node"));
+    }
+
+    #[test]
+    fn filter_shell_text_fragment_discards_short_printable_runs() {
+        let text = b"\x00abc123\x01/tmp/vscode-\x02";
+        assert_eq!(filter_shell_text_fragment(&mut Vec::new(), text), "");
+    }
+
+    #[test]
+    fn filter_shell_text_fragment_ignores_long_printable_binary_without_markers() {
+        let text = vec![b'A'; 6000];
+        assert_eq!(filter_shell_text_fragment(&mut Vec::new(), &text), "");
+    }
+
+    #[test]
+    fn format_log_record_includes_timestamp_and_pid() {
+        let line = format_log_record("proc_open ok proc_id=proc-1-1 argv0=/bin/sh", 123456, 789);
+        assert_eq!(
+            line,
+            "msl-init: ts_ms=123456 pid=789 proc_open ok proc_id=proc-1-1 argv0=/bin/sh"
+        );
+    }
+
+    #[test]
+    fn diag_channel_lines_keep_channel_and_add_timestamp_and_pid() {
+        let line = format!("[init] ts_ms={} pid={} ready", 123456, 789);
+        assert_eq!(line, "[init] ts_ms=123456 pid=789 ready");
     }
 }

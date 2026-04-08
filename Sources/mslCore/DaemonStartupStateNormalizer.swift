@@ -15,12 +15,19 @@ enum DaemonStartupStateNormalizer {
         let legacyStateReset = needsLegacyReset(state)
         if legacyStateReset {
             state.vmState = .stopped
+            state.lifecycleState = .stopped
             state.activeSessionCount = 0
             state.idleTimer = IdleTimerState(armed: false, deadlineEpochMs: nil)
             state.runtimeHostPid = nil
             state.runtimeControlSocket = nil
             state.runtimeUser = nil
             state.initChannel = nil
+            state.startupEpochMs = nil
+            state.startupStep = nil
+            state.startupStepName = nil
+            state.startupStepStatus = nil
+            state.lastErrorCode = nil
+            state.lastErrorMessage = nil
             state.lastTransitionEpochMs = nowMs
         }
 
@@ -30,6 +37,7 @@ enum DaemonStartupStateNormalizer {
                 if needsInstanceReset(entries[index]) {
                     var entry = entries[index]
                     entry.vmState = .stopped
+                    entry.lifecycleState = .stopped
                     entry.activeSessionCount = 0
                     entry.idleTimer = IdleTimerState(armed: false, deadlineEpochMs: nil)
                     entry.runtimeHostPid = nil
@@ -37,6 +45,12 @@ enum DaemonStartupStateNormalizer {
                     entry.runtimeUser = nil
                     entry.initChannel = nil
                     entry.lastError = nil
+                    entry.lastErrorCode = nil
+                    entry.lastErrorMessage = nil
+                    entry.startupEpochMs = nil
+                    entry.startupStep = nil
+                    entry.startupStepName = nil
+                    entry.startupStepStatus = nil
                     entry.lastTransitionEpochMs = nowMs
                     entries[index] = entry
                     normalizedInstances.append(entry.instance)
@@ -53,6 +67,7 @@ enum DaemonStartupStateNormalizer {
 
     private static func needsLegacyReset(_ state: RuntimeState) -> Bool {
         return state.vmState != .stopped
+            || state.lifecycleState != .stopped
             || state.activeSessionCount != 0
             || state.idleTimer.armed
             || state.idleTimer.deadlineEpochMs != nil
@@ -64,6 +79,7 @@ enum DaemonStartupStateNormalizer {
 
     private static func needsInstanceReset(_ state: RuntimeInstanceState) -> Bool {
         return state.vmState != .stopped
+            || state.lifecycleState != .stopped
             || state.activeSessionCount != 0
             || state.idleTimer.armed
             || state.idleTimer.deadlineEpochMs != nil

@@ -14,6 +14,9 @@ public final class InstanceRuntimeContext {
     public var metadataURL: URL?
     public var vmRunner: VirtualMachineRunner?
     public var initClient: InitChannelClient?
+    public var initWriteClient: InitChannelClient?
+    public var initReadClient: InitChannelClient?
+    public var housekeepingClient: InitChannelClient?
     public var runtimeUser: RuntimeUserState?
     public var runtimeDNSMeta: [String: String] = [:]
     public var lastError: String?

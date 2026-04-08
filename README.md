@@ -98,6 +98,9 @@ Cache toggle config:
 ./.build/debug/msl config set storageCacheToggles.docker true
 ```
 
+`storageCacheToggles.apt=true` shares only APT package archives (`/var/cache/apt/archives`).
+APT metadata under `/var/lib/apt` stays guest-local so `dpkg` and APT state remain writable.
+
 ## Step5 install/default-instance commands
 
 List installable distributions (with aliases):

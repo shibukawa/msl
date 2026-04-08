@@ -204,6 +204,20 @@ final class DistributionManagerTests: XCTestCase {
         XCTAssertTrue(descriptor?.aliases.contains("ubuntu-latest") == true)
     }
 
+    func testInternalInstanceDefaultsToEphemeralTmpStorage() {
+        let policy = DistributionInstanceMetadata.defaultTmpStoragePolicy(forNewInstanceNamed: "_imagewriter")
+        XCTAssertEqual(policy.mode, "ephemeral")
+        XCTAssertEqual(policy.sizeMiB, 1024)
+        XCTAssertTrue(policy.resetOnStop)
+    }
+
+    func testRegularInstanceDefaultsToEphemeralTmpStorage() {
+        let policy = DistributionInstanceMetadata.defaultTmpStoragePolicy(forNewInstanceNamed: "ubuntu")
+        XCTAssertEqual(policy.mode, "ephemeral")
+        XCTAssertEqual(policy.sizeMiB, 1024)
+        XCTAssertTrue(policy.resetOnStop)
+    }
+
     func testRuntimeMetadataURLPrefersConfiguredDefaultInstance() throws {
         let ctx = try DistributionContext.make()
         defer { ctx.cleanup() }
@@ -277,6 +291,56 @@ final class DistributionManagerTests: XCTestCase {
         XCTAssertEqual(loaded.cacheSharing?.enabled, true)
         XCTAssertEqual(loaded.cacheSharing?.apt, false)
         XCTAssertEqual(loaded.cacheSharing?.apk, true)
+    }
+
+    func testReadOrRebuildInstanceMetadataDoesNotPersistForceEmbeddedOverride() throws {
+        let ctx = try DistributionContext.make()
+        defer { ctx.cleanup() }
+
+        let name = "ephemeral"
+        let instanceDir = ctx.paths.distroDirectory(named: name)
+        try FileManager.default.createDirectory(at: instanceDir, withIntermediateDirectories: true)
+        let disk = ctx.paths.distroDiskFile(named: name)
+        try Data([0x00]).write(to: disk)
+
+        let metadata = DistributionInstanceMetadata(
+            name: name,
+            createdAtEpochMs: nowEpochMs(),
+            source: DistributionSourceRecord(
+                sourceType: "manifest",
+                distro: "ubuntu",
+                version: "24.04",
+                arch: "arm64",
+                manifestId: "ubuntu-24.04-arm64",
+                localPath: nil,
+                tarballFileName: "rootfs.tar.xz",
+                sha256: "abc",
+                verifiedAtEpochMs: nowEpochMs()
+            ),
+            diskPath: disk.path,
+            kernelProfileRef: nil,
+            userConvergencePolicy: nil,
+            tmpStorage: DistributionInstanceMetadata.TmpStoragePolicy(
+                mode: "ephemeral",
+                sizeMiB: 1024,
+                resetOnStop: true
+            )
+        )
+        let metadataURL = ctx.paths.distroMetadataFile(named: name)
+        try JSONEncoder().encode(metadata).write(to: metadataURL, options: .atomic)
+
+        setenv("MSL_TMP_STORAGE_FORCE_EMBEDDED", "1", 1)
+        defer { unsetenv("MSL_TMP_STORAGE_FORCE_EMBEDDED") }
+
+        let loaded = try ctx.makeManager().readOrRebuildInstanceMetadata(at: metadataURL)
+        let persisted = try JSONDecoder().decode(
+            DistributionInstanceMetadata.self,
+            from: Data(contentsOf: metadataURL)
+        )
+
+        XCTAssertEqual(loaded.tmpStorage?.mode, "ephemeral")
+        XCTAssertEqual(persisted.tmpStorage?.mode, "ephemeral")
+        XCTAssertEqual(try loaded.resolveValidatedTmpStoragePolicy().mode, "embedded")
     }
 
     func testRuntimeMetadataURLFailsForMissingExplicitInstance() throws {
@@ -393,6 +457,62 @@ final class DistributionManagerTests: XCTestCase {
             }
             XCTAssertTrue(runtime.message.contains("stage=btrfs_build"))
         }
+    }
+
+    func testImagewriterStopArgumentsUseStopSubcommand() {
+        XCTAssertEqual(
+            DistributionManager.imagewriterStopArguments(instanceName: "_imagewriter"),
+            ["--instance", "_imagewriter", "stop"]
+        )
+    }
+
+    func testCreateImageWithImagewriterFailureStillRunsStopSubcommandCleanup() throws {
+        let ctx = try DistributionContext.make()
+        defer { ctx.cleanup() }
+
+        let localTarball = ctx.root.appendingPathComponent("rootfs.tar.gz", isDirectory: false)
+        try Data("not-a-real-tarball".utf8).write(to: localTarball)
+
+        let fakeInit = ctx.root.appendingPathComponent("msl-init-fake", isDirectory: false)
+        try Data(repeating: 0x24, count: 64).write(to: fakeInit)
+        setenv("MSL_INIT_BINARY_PATH", fakeInit.path, 1)
+        defer { unsetenv("MSL_INIT_BINARY_PATH") }
+
+        let fakeImagewriter = ctx.root.appendingPathComponent("imagewriter-fail.sh", isDirectory: false)
+        try Data("#!/bin/sh\nexit 22\n".utf8).write(to: fakeImagewriter)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeImagewriter.path)
+        setenv("MSL_IMAGEWRITER_BUILD_SCRIPT", fakeImagewriter.path, 1)
+        defer { unsetenv("MSL_IMAGEWRITER_BUILD_SCRIPT") }
+
+        let recordedArgs = ctx.root.appendingPathComponent("imagewriter-stop-args.txt", isDirectory: false)
+        let fakeMSL = ctx.root.appendingPathComponent("fake-msl.sh", isDirectory: false)
+        let fakeMSLScript = """
+        #!/bin/sh
+        printf '%s\n' "$@" > "\(recordedArgs.path)"
+        exit 0
+        """
+        try Data(fakeMSLScript.utf8).write(to: fakeMSL)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeMSL.path)
+
+        let manager = ctx.makeManager()
+        XCTAssertThrowsError(try manager.createImageWithImagewriter(
+            name: "dev",
+            targetAlias: nil,
+            localFilePath: localTarball.path,
+            rebuild: false,
+            diskSizeGB: nil,
+            mslExecutablePath: fakeMSL.path
+        )) { error in
+            guard let runtime = error as? MSLRuntimeError else {
+                return XCTFail("unexpected error type: \(error)")
+            }
+            XCTAssertTrue(runtime.message.contains("stage=btrfs_build"))
+        }
+
+        let args = try String(contentsOf: recordedArgs, encoding: .utf8)
+            .split(separator: "\n")
+            .map(String.init)
+        XCTAssertEqual(args, ["--instance", "_imagewriter", "stop"])
     }
 
     func testCreateImageFromRawCopiesDiskAndWritesMetadata() throws {

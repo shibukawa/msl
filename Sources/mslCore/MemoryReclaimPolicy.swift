@@ -69,6 +69,7 @@ enum MemoryReclaimPolicyResolver {
     static let longIdleThresholdMs: Int64 = 300_000
     static let periodicPollIntervalSec: Int = 5
     static let hostPressureCooldownMs: Int64 = 30_000
+    static let recentGuestActivitySuspendMs: Int64 = 15_000
     static let defaultCacheCleanThresholdMB: UInt64 = 128
     static let defaultCacheCleanupCooldownSec: Int64 = 60
     static let defaultCacheCleanupHysteresisPercent: UInt64 = 25
@@ -251,6 +252,17 @@ enum MemoryReclaimPolicyResolver {
             return nil
         }
         return UInt64(tokens[1])
+    }
+
+    static func shouldSuspendBackgroundMaintenance(
+        activeSessionCount: Int,
+        nowMs: Int64,
+        lastGuestActivityEpochMs: Int64
+    ) -> Bool {
+        if activeSessionCount > 0 {
+            return true
+        }
+        return (nowMs - lastGuestActivityEpochMs) < recentGuestActivitySuspendMs
     }
 }
 

@@ -36,6 +36,10 @@ The server accepts JSON requests via file handoff for:
 - `pty_write`
 - `pty_resize`
 - `pty_close`
+- `proc_open`
+- `proc_read`
+- `proc_write`
+- `proc_close`
 
 Environment variables:
 - `MSL_INIT_HANDOFF_FILE` (default: `/mnt/macos/home/.msl/init-channel-handoff.json`)

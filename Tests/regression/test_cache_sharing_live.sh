@@ -30,8 +30,12 @@ run_test_output "step23 cache status rust disabled by default" "tool.rust=false"
 
 run_test "step23 apt archives bind mount when apt exists" \
   "$MSL" --instance "$CACHE_INSTANCE" run --timeout 30 sh -lc 'if command -v apt-get >/dev/null 2>&1; then awk '"'"'$5=="/var/cache/apt/archives"{found=1} END{exit(found?0:1)}'"'"' /proc/self/mountinfo; else exit 0; fi'
-run_test "step23 apt lists bind mount when apt exists" \
-  "$MSL" --instance "$CACHE_INSTANCE" run --timeout 30 sh -lc 'if command -v apt-get >/dev/null 2>&1; then awk '"'"'$5=="/var/lib/apt/lists"{found=1} END{exit(found?0:1)}'"'"' /proc/self/mountinfo; else exit 0; fi'
+run_test "step23 apt lists remain guest-local when apt exists" \
+  "$MSL" --instance "$CACHE_INSTANCE" run --timeout 30 sh -lc 'if command -v apt-get >/dev/null 2>&1; then awk '"'"'$5=="/var/lib/apt/lists"{found=1} END{exit(found?1:0)}'"'"' /proc/self/mountinfo; else exit 0; fi'
+run_test "step23 apt metadata path stays writable when apt exists" \
+  "$MSL" --instance "$CACHE_INSTANCE" run --timeout 30 sh -lc 'if command -v apt-get >/dev/null 2>&1; then probe=/var/lib/apt/.msl-write-test.$$; : > "$probe" && rm -f "$probe"; else exit 0; fi'
+run_test "step23 dpkg database path stays writable when apt exists" \
+  "$MSL" --instance "$CACHE_INSTANCE" run --timeout 30 sh -lc 'if command -v apt-get >/dev/null 2>&1; then probe=/var/lib/dpkg/.msl-write-test.$$; : > "$probe" && rm -f "$probe"; else exit 0; fi'
 run_test "step23 apk bind mount when apk exists" \
   "$MSL" --instance "$CACHE_INSTANCE" run --timeout 30 sh -lc 'if command -v apk >/dev/null 2>&1; then awk '"'"'$5=="/var/cache/apk"{found=1} END{exit(found?0:1)}'"'"' /proc/self/mountinfo; else exit 0; fi'
 run_test "step23 host cache apt dir created" test -d "$HOST_CACHE_ROOT/apt"

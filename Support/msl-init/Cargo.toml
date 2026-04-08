@@ -2,3 +2,6 @@
 name = "msl-init"
 version = "0.1.0"
 edition = "2021"
+
+[dependencies]
+tokio = { version = "1.48.0", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "process"] }

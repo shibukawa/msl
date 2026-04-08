@@ -21,13 +21,20 @@ public final class VirtualMachineRunner {
     private let bootProfile: RuntimeBootProfile?
     private let logger: MSLLogger?
     private let initProbeHandler: ((InitChannelProbeResult) -> Void)?
+    private let codeOpenRequestHandler: ((String) -> Void)?
+    private let backgroundMemoryMaintenanceAllowed: (() -> Bool)?
+    private let startupPhaseObserver: ((String) -> Void)?
     private var terminalBridge: TerminalBridge?
     private var diagnosticCollector: GuestDiagnosticLogCollector?
     private var acceptedVsockConnection: AnyObject?  // retain VZVirtioSocketConnection
+    private var initVsockListener: AnyObject?
+    private var initVsockListenerDelegate: AnyObject?
     private var dnsTunnelListener: AnyObject?
     private var dnsTunnelListenerDelegate: AnyObject?
     private var timeTunnelListener: AnyObject?
     private var timeTunnelListenerDelegate: AnyObject?
+    private var codeOpenListener: AnyObject?
+    private var codeOpenListenerDelegate: AnyObject?
     private var memoryPlan: RuntimeMemoryPlan?
 
     #if canImport(Virtualization)
@@ -46,13 +53,19 @@ public final class VirtualMachineRunner {
         metadataURL: URL,
         bootProfile: RuntimeBootProfile? = nil,
         logger: MSLLogger? = nil,
-        initProbeHandler: ((InitChannelProbeResult) -> Void)? = nil
+        initProbeHandler: ((InitChannelProbeResult) -> Void)? = nil,
+        codeOpenRequestHandler: ((String) -> Void)? = nil,
+        backgroundMemoryMaintenanceAllowed: (() -> Bool)? = nil,
+        startupPhaseObserver: ((String) -> Void)? = nil
     ) {
         self.paths = paths
         self.metadataURL = metadataURL
         self.bootProfile = bootProfile
         self.logger = logger
         self.initProbeHandler = initProbeHandler
+        self.codeOpenRequestHandler = codeOpenRequestHandler
+        self.backgroundMemoryMaintenanceAllowed = backgroundMemoryMaintenanceAllowed
+        self.startupPhaseObserver = startupPhaseObserver
     }
 
     public func runAttachedConsole() throws -> Int32 {
@@ -100,7 +113,8 @@ public final class VirtualMachineRunner {
             machineIdentifierURL: metadata.machineIdentifierURL,
             efiVariableStoreURL: metadata.efiVariableStoreURL,
             serialAttachment: serialAttachment,
-            diagnosticAttachment: diagnosticAttachment
+            diagnosticAttachment: diagnosticAttachment,
+            extraWritableDisks: metadata.ephemeralTmpDiskURL.map { [$0] } ?? []
         )
         logger?.log("vm_runner_configuration_built", fields: [
             "elapsed_ms": String(monotonicMs() - configStartMs)
@@ -224,12 +238,161 @@ public final class VirtualMachineRunner {
         let data = try Data(contentsOf: metadataURL)
         let distribution = try JSONDecoder().decode(DistributionInstanceMetadata.self, from: data)
         let instanceDir = metadataURL.deletingLastPathComponent()
+        let tmpStorage = try distribution.resolveValidatedTmpStoragePolicy()
+        let ephemeralTmpDiskURL: URL?
+        if tmpStorage.mode == "ephemeral" {
+            ephemeralTmpDiskURL = try prepareEphemeralTmpDisk(
+                instanceName: distribution.name,
+                sizeMiB: tmpStorage.sizeMiB
+            )
+        } else {
+            ephemeralTmpDiskURL = nil
+        }
+        logger?.log("tmp_storage_mode_resolved", fields: [
+            "instance": distribution.name,
+            "mode": tmpStorage.mode,
+            "size_mib": String(tmpStorage.sizeMiB),
+            "reset_on_stop": tmpStorage.resetOnStop ? "true" : "false"
+        ])
         return RuntimeInstanceMetadata(
             instanceName: distribution.name,
             diskURL: URL(fileURLWithPath: distribution.diskPath),
             machineIdentifierURL: instanceDir.appendingPathComponent("machine-identifier.bin", isDirectory: false),
-            efiVariableStoreURL: instanceDir.appendingPathComponent("efi-variable-store", isDirectory: false)
+            efiVariableStoreURL: instanceDir.appendingPathComponent("efi-variable-store", isDirectory: false),
+            tmpStorage: tmpStorage,
+            ephemeralTmpDiskURL: ephemeralTmpDiskURL
         )
+    }
+
+    private func prepareEphemeralTmpDisk(instanceName: String, sizeMiB: Int) throws -> URL {
+        let fileManager = FileManager.default
+        let tmpDir = paths.distroTmpDirectory(named: instanceName)
+        try fileManager.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+        let diskURL = paths.distroEphemeralTmpDiskFile(named: instanceName)
+        if fileManager.fileExists(atPath: diskURL.path) {
+            try fileManager.removeItem(at: diskURL)
+        }
+
+        if let mkfsHelper = resolveExt4MkfsHelperExecutable() {
+            let result = try runHostProcess(mkfsHelper, [
+                "--output", diskURL.path,
+                "--size-mb", String(sizeMiB),
+                "--label", "msl-tmp-\(instanceName)"
+            ], captureOutput: true)
+            guard result.exitCode == 0 else {
+                let detail = result.stderr.isEmpty ? result.stdout : result.stderr
+                throw MSLRuntimeError("tmp ext4 mkfs helper failed (\(result.exitCode)): \(detail)")
+            }
+        } else {
+            guard fileManager.createFile(atPath: diskURL.path, contents: nil) else {
+                throw MSLRuntimeError("failed to create tmp image file: \(diskURL.path)")
+            }
+            let handle = try FileHandle(forWritingTo: diskURL)
+            defer { try? handle.close() }
+            try handle.truncate(atOffset: UInt64(sizeMiB) * 1024 * 1024)
+        }
+        logger?.log("tmp_image_created", fields: [
+            "instance": instanceName,
+            "path": diskURL.path,
+            "size_mib": String(sizeMiB)
+        ])
+        return diskURL
+    }
+
+    private func resolveExt4MkfsHelperExecutable() -> String? {
+        let fileManager = FileManager.default
+        if let explicit = ProcessInfo.processInfo.environment["MSL_EXT4_MKFS_HELPER_PATH"],
+           !explicit.isEmpty,
+           fileManager.isExecutableFile(atPath: explicit) {
+            return explicit
+        }
+        let staged = paths.mslHostExt4MkfsHelperBinaryFile.path
+        if fileManager.isExecutableFile(atPath: staged) {
+            return staged
+        }
+        return findExecutable(["msl-ext4-mkfs"])
+    }
+
+    private func runHostProcess(
+        _ executable: String,
+        _ arguments: [String],
+        captureOutput: Bool = false
+    ) throws -> ProcessResult {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
+
+        var outPipe: Pipe?
+        var errPipe: Pipe?
+        if captureOutput {
+            let stdoutPipe = Pipe()
+            let stderrPipe = Pipe()
+            process.standardOutput = stdoutPipe
+            process.standardError = stderrPipe
+            outPipe = stdoutPipe
+            errPipe = stderrPipe
+        }
+
+        var stdoutData = Data()
+        var stderrData = Data()
+        let readGroup = DispatchGroup()
+        if let outPipe, let errPipe {
+            readGroup.enter()
+            DispatchQueue.global(qos: .utility).async {
+                stdoutData = outPipe.fileHandleForReading.readDataToEndOfFile()
+                readGroup.leave()
+            }
+            readGroup.enter()
+            DispatchQueue.global(qos: .utility).async {
+                stderrData = errPipe.fileHandleForReading.readDataToEndOfFile()
+                readGroup.leave()
+            }
+        }
+
+        do {
+            try process.run()
+        } catch {
+            if captureOutput {
+                outPipe?.fileHandleForWriting.closeFile()
+                errPipe?.fileHandleForWriting.closeFile()
+                readGroup.wait()
+            }
+            throw MSLRuntimeError("failed to execute \(executable): \(error)")
+        }
+
+        if captureOutput {
+            outPipe?.fileHandleForWriting.closeFile()
+            errPipe?.fileHandleForWriting.closeFile()
+        }
+        process.waitUntilExit()
+        if captureOutput {
+            readGroup.wait()
+        }
+
+        return ProcessResult(
+            exitCode: process.terminationStatus,
+            stdout: String(data: stdoutData, encoding: .utf8) ?? "",
+            stderr: String(data: stderrData, encoding: .utf8) ?? ""
+        )
+    }
+
+    private func findExecutable(_ names: [String]) -> String? {
+        for name in names {
+            if name.contains("/") {
+                if FileManager.default.isExecutableFile(atPath: name) {
+                    return name
+                }
+                continue
+            }
+            let result = try? runHostProcess("/usr/bin/env", ["which", name], captureOutput: true)
+            if let result, result.exitCode == 0 {
+                let path = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !path.isEmpty {
+                    return path
+                }
+            }
+        }
+        return nil
     }
 
     private func buildConfiguration(
@@ -237,7 +400,8 @@ public final class VirtualMachineRunner {
         machineIdentifierURL: URL,
         efiVariableStoreURL: URL,
         serialAttachment: (FileHandle, FileHandle)?,
-        diagnosticAttachment: (FileHandle, FileHandle)?
+        diagnosticAttachment: (FileHandle, FileHandle)?,
+        extraWritableDisks: [URL]
     ) throws -> VZVirtualMachineConfiguration {
         let vm = VZVirtualMachineConfiguration()
 
@@ -298,7 +462,12 @@ public final class VirtualMachineRunner {
 
         let diskAttachment = try VZDiskImageStorageDeviceAttachment(url: diskURL, readOnly: false)
         let blockDevice = VZVirtioBlockDeviceConfiguration(attachment: diskAttachment)
-        vm.storageDevices = [blockDevice]
+        var storageDevices: [VZStorageDeviceConfiguration] = [blockDevice]
+        for extraDiskURL in extraWritableDisks {
+            let extraAttachment = try VZDiskImageStorageDeviceAttachment(url: extraDiskURL, readOnly: false)
+            storageDevices.append(VZVirtioBlockDeviceConfiguration(attachment: extraAttachment))
+        }
+        vm.storageDevices = storageDevices
 
         if #available(macOS 12.0, *) {
             let hostShareRoot = ProcessInfo.processInfo.environment["MSL_HOST_SHARE_ROOT"].flatMap { $0.isEmpty ? nil : $0 } ?? "/"
@@ -442,7 +611,8 @@ public final class VirtualMachineRunner {
             machineIdentifierURL: metadata.machineIdentifierURL,
             efiVariableStoreURL: metadata.efiVariableStoreURL,
             serialAttachment: serialAttachment,
-            diagnosticAttachment: diagnosticAttachment
+            diagnosticAttachment: diagnosticAttachment,
+            extraWritableDisks: metadata.ephemeralTmpDiskURL.map { [$0] } ?? []
         )
         logStartupPhase(
             phase: "vm_configuration_build",
@@ -497,15 +667,21 @@ public final class VirtualMachineRunner {
             self?.handleTimeTunnelRequest(fd: fd)
         }
         timeTunnelListener.delegate = timeTunnelDelegate
+        let codeOpenListener = VZVirtioSocketListener()
+        let codeOpenDelegate = DNSTunnelListenerDelegate { [weak self] fd in
+            self?.handleCodeOpenRequest(fd: fd)
+        }
+        codeOpenListener.delegate = codeOpenDelegate
         vmQueue.async {
             vsockDevice.setSocketListener(listener, forPort: 1024)
             vsockDevice.setSocketListener(dnsTunnelListener, forPort: 1053)
             vsockDevice.setSocketListener(timeTunnelListener, forPort: 1067)
+            vsockDevice.setSocketListener(codeOpenListener, forPort: 5001)
         }
 
         let timeoutSec = resolveInitAttachTimeoutSec()
         let handshakeStartMs = monotonicMs()
-        let vsockFD = try waitForInitChannel(
+        let controlConnection = try waitForInitChannel(
             listenerDelegate: listenerDelegate,
             timeoutSec: timeoutSec
         )
@@ -522,7 +698,18 @@ public final class VirtualMachineRunner {
             retryCount: 2,
             retryDelayMs: 50,
             timeoutMs: 400,
-            vsockFD: vsockFD
+            vsockFD: controlConnection.fd,
+            retainedVsockConnection: controlConnection.retainedConnection,
+            sidebandConnector: { [weak listenerDelegate, weak self] in
+                guard let self, let listenerDelegate else {
+                    throw MSLRuntimeError("init vsock broker unavailable")
+                }
+                return try self.acquireInitVsockConnection(listenerDelegate: listenerDelegate, timeoutSec: timeoutSec, role: "sideband")
+            },
+            sidebandSupported: true,
+            traceLogger: { [weak logger] event, fields in
+                logger?.log(event, fields: fields)
+            }
         )
 
         let ping = try client.ping()
@@ -543,10 +730,14 @@ public final class VirtualMachineRunner {
         self.runningVM = virtualMachine
         self.runningVMQueue = vmQueue
         self.runningDelegate = delegate
+        self.initVsockListener = listener
+        self.initVsockListenerDelegate = listenerDelegate
         self.dnsTunnelListener = dnsTunnelListener
         self.dnsTunnelListenerDelegate = dnsTunnelDelegate
         self.timeTunnelListener = timeTunnelListener
         self.timeTunnelListenerDelegate = timeTunnelDelegate
+        self.codeOpenListener = codeOpenListener
+        self.codeOpenListenerDelegate = codeOpenDelegate
         startBalloonController(client: client)
 
         return client
@@ -581,10 +772,14 @@ public final class VirtualMachineRunner {
         self.runningVMQueue = nil
         self.runningDelegate = nil
         self.acceptedVsockConnection = nil
+        self.initVsockListener = nil
+        self.initVsockListenerDelegate = nil
         self.dnsTunnelListener = nil
         self.dnsTunnelListenerDelegate = nil
         self.timeTunnelListener = nil
         self.timeTunnelListenerDelegate = nil
+        self.codeOpenListener = nil
+        self.codeOpenListenerDelegate = nil
         self.balloonDevice = nil
         self.balloonCurrentTargetBytes = nil
         self.balloonReturnedTotalBytes = 0
@@ -691,6 +886,9 @@ public final class VirtualMachineRunner {
         client: InitChannelClient,
         plan: RuntimeMemoryPlan
     ) {
+        if let backgroundMemoryMaintenanceAllowed, backgroundMemoryMaintenanceAllowed() == false {
+            return
+        }
         guard runningVM != nil, let vmQueue = runningVMQueue, let device = balloonDevice else {
             return
         }
@@ -754,7 +952,7 @@ public final class VirtualMachineRunner {
         guard let header = readExact(handle: handle, count: 4), header.count == 4 else {
             return
         }
-        let length = Int(header.withUnsafeBytes { $0.load(as: UInt32.self).bigEndian })
+        let length = Int(readBigEndianU32(header))
         guard length > 0, length <= 64 * 1024,
               let body = readExact(handle: handle, count: length),
               let request = try? JSONDecoder().decode(DNSTunnelRequest.self, from: body) else {
@@ -784,7 +982,7 @@ public final class VirtualMachineRunner {
         guard let header = readExact(handle: handle, count: 4), header.count == 4 else {
             return
         }
-        let length = Int(header.withUnsafeBytes { $0.load(as: UInt32.self).bigEndian })
+        let length = Int(readBigEndianU32(header))
         guard length > 0, length <= 16 * 1024,
               let body = readExact(handle: handle, count: length),
               (try? JSONDecoder().decode(TimeTunnelRequest.self, from: body)) != nil else {
@@ -804,6 +1002,33 @@ public final class VirtualMachineRunner {
         } catch {
             logger?.log("time_tunnel_write_failed", fields: ["error": String(describing: error)])
         }
+    }
+
+    private func readBigEndianU32(_ data: Data) -> UInt32 {
+        precondition(data.count >= 4)
+        return (UInt32(data[data.startIndex]) << 24)
+            | (UInt32(data[data.startIndex + 1]) << 16)
+            | (UInt32(data[data.startIndex + 2]) << 8)
+            | UInt32(data[data.startIndex + 3])
+    }
+
+    private func handleCodeOpenRequest(fd: Int32) {
+        let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+        defer {
+            try? handle.close()
+        }
+        guard let data = try? handle.readToEnd(), !data.isEmpty else {
+            return
+        }
+        guard var payload = String(data: data, encoding: .utf8) else {
+            logger?.log("code_open_read_failed", fields: ["error": "payload_not_utf8"])
+            return
+        }
+        payload = payload.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !payload.isEmpty else {
+            return
+        }
+        codeOpenRequestHandler?(payload)
     }
 
     private func readExact(handle: FileHandle, count: Int) -> Data? {
@@ -890,7 +1115,7 @@ public final class VirtualMachineRunner {
 
         let timeoutSec = resolveInitAttachTimeoutSec()
         let handshakeStartMs = monotonicMs()
-        let vsockFD = try waitForInitChannel(
+        let controlConnection = try waitForInitChannel(
             listenerDelegate: listenerDelegate,
             timeoutSec: timeoutSec
         )
@@ -907,7 +1132,18 @@ public final class VirtualMachineRunner {
             retryCount: 2,
             retryDelayMs: 50,
             timeoutMs: 400,
-            vsockFD: vsockFD
+            vsockFD: controlConnection.fd,
+            retainedVsockConnection: controlConnection.retainedConnection,
+            sidebandConnector: { [weak listenerDelegate, weak self] in
+                guard let self, let listenerDelegate else {
+                    throw MSLRuntimeError("init vsock broker unavailable")
+                }
+                return try self.acquireInitVsockConnection(listenerDelegate: listenerDelegate, timeoutSec: timeoutSec, role: "sideband")
+            },
+            sidebandSupported: true,
+            traceLogger: { [weak logger] event, fields in
+                logger?.log(event, fields: fields)
+            }
         )
 
         // Verify the connection with a ping
@@ -963,7 +1199,15 @@ public final class VirtualMachineRunner {
     private func waitForInitChannel(
         listenerDelegate: VsockListenerDelegate,
         timeoutSec: Int
-    ) throws -> Int32 {
+    ) throws -> InitChannelClient.SidebandConnection {
+        try acquireInitVsockConnection(listenerDelegate: listenerDelegate, timeoutSec: timeoutSec, role: "control")
+    }
+
+    private func acquireInitVsockConnection(
+        listenerDelegate: VsockListenerDelegate,
+        timeoutSec: Int,
+        role: String
+    ) throws -> InitChannelClient.SidebandConnection {
         let initMode = bootProfile?.initMode ?? "direct-init"
         let serviceManager = bootProfile?.serviceManager ?? "-"
         let checkCommand = initHandshakeCheckCommand()
@@ -976,8 +1220,7 @@ public final class VirtualMachineRunner {
             "service_manager": serviceManager
         ])
 
-        let waitResult = listenerDelegate.semaphore.wait(timeout: .now() + .seconds(timeoutSec))
-        if waitResult == .timedOut {
+        guard let connection = listenerDelegate.takeConnection(timeoutSec: timeoutSec) else {
             logger?.log("init_handshake_timeout", fields: [
                 "timeout_sec": String(timeoutSec),
                 "serial_log": paths.serialConsoleLogFile.path,
@@ -992,19 +1235,18 @@ public final class VirtualMachineRunner {
             )
         }
 
-        guard let connection = listenerDelegate.acceptedConnection else {
-            throw MSLRuntimeError("init channel accept signaled but no connection available")
-        }
-
         let fd = connection.fileDescriptor
-        // Retain the connection object so the fd stays valid
-        self.acceptedVsockConnection = connection
+        if role == "control" {
+            self.acceptedVsockConnection = connection
+        }
         fputs("msl: msl-init connected via vsock (fd=\(fd))\n", stderr)
-        logger?.log("init_vsock_accepted", fields: [
-            "fd": String(fd)
+        logger?.log("init_vsock_connection_assigned", fields: [
+            "fd": String(fd),
+            "role": role
         ])
         logger?.log("init_service_ready", fields: [
             "fd": String(fd),
+            "role": role,
             "init_mode": initMode,
             "service_manager": serviceManager
         ])
@@ -1013,7 +1255,7 @@ public final class VirtualMachineRunner {
             "init_mode": initMode,
             "service_manager": serviceManager
         ])
-        return fd
+        return (fd: fd, retainedConnection: connection)
     }
 
     private func initHandshakeCheckCommand() -> String {
@@ -1044,6 +1286,7 @@ public final class VirtualMachineRunner {
             "elapsed_ms": String(max(0, elapsedMs)),
             "instance": instanceName
         ])
+        startupPhaseObserver?(phase)
     }
 
     private func logStartupTotal(elapsedMs: Int64, instanceName: String) {
@@ -1161,6 +1404,8 @@ private struct RuntimeInstanceMetadata {
     var diskURL: URL
     var machineIdentifierURL: URL
     var efiVariableStoreURL: URL
+    var tmpStorage: DistributionInstanceMetadata.TmpStoragePolicy
+    var ephemeralTmpDiskURL: URL?
 }
 
 #if canImport(Virtualization)
@@ -1181,19 +1426,30 @@ private final class VMDelegate: NSObject, VZVirtualMachineDelegate {
 /// Accepts the first inbound vsock connection from the guest (msl-init).
 /// The accepted connection signals that msl-init is ready.
 private final class VsockListenerDelegate: NSObject, VZVirtioSocketListenerDelegate {
-    var acceptedConnection: VZVirtioSocketConnection?
-    let semaphore = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private let semaphore = DispatchSemaphore(value: 0)
+    private var pendingConnections: [VZVirtioSocketConnection] = []
 
     func listener(
         _ listener: VZVirtioSocketListener,
         shouldAcceptNewConnection connection: VZVirtioSocketConnection,
         from socketDevice: VZVirtioSocketDevice
     ) -> Bool {
-        if acceptedConnection == nil {
-            acceptedConnection = connection
-            semaphore.signal()
-        }
+        lock.lock()
+        pendingConnections.append(connection)
+        lock.unlock()
+        semaphore.signal()
         return true
+    }
+
+    func takeConnection(timeoutSec: Int) -> VZVirtioSocketConnection? {
+        let waitResult = semaphore.wait(timeout: .now() + .seconds(timeoutSec))
+        guard waitResult != .timedOut else {
+            return nil
+        }
+        lock.lock()
+        defer { lock.unlock() }
+        return pendingConnections.isEmpty ? nil : pendingConnections.removeFirst()
     }
 }
 
