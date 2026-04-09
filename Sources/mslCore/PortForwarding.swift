@@ -246,12 +246,17 @@ final class PortForwardingManager {
 }
 
 private final class PortListener {
+    private struct BoundListener {
+        var fd: Int32
+        var host: String
+    }
+
     private let bindHost: String
     private let bindPort: Int
     private let guestIPResolver: GuestIPResolver
     private let targetPort: Int
-    private var listenFD: Int32 = -1
-    private var acceptThread: Thread?
+    private var listeners: [BoundListener] = []
+    private var acceptThreads: [Thread] = []
     private var running = false
 
     init(bindHost: String, bindPort: Int, guestIPResolver: GuestIPResolver, targetPort: Int) throws {
@@ -264,55 +269,44 @@ private final class PortListener {
     func start() throws {
         if running { return }
 
-        listenFD = socket(AF_INET, SOCK_STREAM, 0)
-        if listenFD < 0 {
-            throw MSLRuntimeError("listen socket create failed: \(lastErr())")
-        }
-
-        var yes: Int32 = 1
-        _ = setsockopt(listenFD, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
-
-        var addr = sockaddr_in()
-        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-        addr.sin_family = sa_family_t(AF_INET)
-        addr.sin_port = in_port_t(UInt16(bindPort).bigEndian)
-        if inet_pton(AF_INET, bindHost, &addr.sin_addr) != 1 {
-            throw MSLRuntimeError("invalid bind host: \(bindHost)")
-        }
-
-        let bindResult = withUnsafePointer(to: &addr) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                bind(listenFD, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+        var created: [BoundListener] = []
+        do {
+            for host in expandedBindHosts(for: bindHost) {
+                created.append(try makeListener(host: host))
             }
-        }
-        if bindResult != 0 {
-            throw MSLRuntimeError("bind failed for \(bindHost):\(bindPort): \(lastErr())")
-        }
-        if listen(listenFD, 16) != 0 {
-            throw MSLRuntimeError("listen failed for \(bindHost):\(bindPort): \(lastErr())")
+        } catch {
+            for listener in created {
+                _ = close(listener.fd)
+            }
+            throw error
         }
 
         running = true
-        acceptThread = Thread { [weak self] in
-            self?.acceptLoop()
+        listeners = created
+        acceptThreads = created.map { listener in
+            let thread = Thread { [weak self] in
+                self?.acceptLoop(listenerFD: listener.fd)
+            }
+            thread.name = "msl.port.\(bindPort).\(listener.host)"
+            thread.start()
+            return thread
         }
-        acceptThread?.name = "msl.port.\(bindPort)"
-        acceptThread?.start()
     }
 
     func stop() {
         guard running else { return }
         running = false
-        if listenFD >= 0 {
-            _ = shutdown(listenFD, SHUT_RDWR)
-            _ = close(listenFD)
-            listenFD = -1
+        for listener in listeners {
+            _ = shutdown(listener.fd, SHUT_RDWR)
+            _ = close(listener.fd)
         }
+        listeners.removeAll()
+        acceptThreads.removeAll()
     }
 
-    private func acceptLoop() {
+    private func acceptLoop(listenerFD: Int32) {
         while running {
-            let client = accept(listenFD, nil, nil)
+            let client = accept(listenerFD, nil, nil)
             if client < 0 {
                 if errno == EINTR { continue }
                 if running { usleep(30_000) }
@@ -445,5 +439,89 @@ private final class PortListener {
 
     private func lastErr() -> String {
         String(cString: strerror(errno))
+    }
+
+    private func expandedBindHosts(for bindHost: String) -> [String] {
+        switch bindHost {
+        case "127.0.0.1":
+            return ["127.0.0.1", "::1"]
+        case "0.0.0.0":
+            return ["0.0.0.0", "::"]
+        default:
+            return [bindHost]
+        }
+    }
+
+    private func makeListener(host: String) throws -> BoundListener {
+        if host.contains(":") {
+            let fd = socket(AF_INET6, SOCK_STREAM, 0)
+            if fd < 0 {
+                throw MSLRuntimeError("listen socket create failed for \(host): \(lastErr())")
+            }
+
+            var yes: Int32 = 1
+            _ = setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
+            _ = setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &yes, socklen_t(MemoryLayout<Int32>.size))
+
+            var addr = sockaddr_in6()
+            addr.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
+            addr.sin6_family = sa_family_t(AF_INET6)
+            addr.sin6_port = in_port_t(UInt16(bindPort).bigEndian)
+            if inet_pton(AF_INET6, host, &addr.sin6_addr) != 1 {
+                _ = close(fd)
+                throw MSLRuntimeError("invalid bind host: \(host)")
+            }
+
+            let bindResult = withUnsafePointer(to: &addr) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in6>.size))
+                }
+            }
+            if bindResult != 0 {
+                let error = lastErr()
+                _ = close(fd)
+                throw MSLRuntimeError("bind failed for \(host):\(bindPort): \(error)")
+            }
+            if listen(fd, 16) != 0 {
+                let error = lastErr()
+                _ = close(fd)
+                throw MSLRuntimeError("listen failed for \(host):\(bindPort): \(error)")
+            }
+            return BoundListener(fd: fd, host: host)
+        }
+
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        if fd < 0 {
+            throw MSLRuntimeError("listen socket create failed for \(host): \(lastErr())")
+        }
+
+        var yes: Int32 = 1
+        _ = setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
+
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = in_port_t(UInt16(bindPort).bigEndian)
+        if inet_pton(AF_INET, host, &addr.sin_addr) != 1 {
+            _ = close(fd)
+            throw MSLRuntimeError("invalid bind host: \(host)")
+        }
+
+        let bindResult = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        if bindResult != 0 {
+            let error = lastErr()
+            _ = close(fd)
+            throw MSLRuntimeError("bind failed for \(host):\(bindPort): \(error)")
+        }
+        if listen(fd, 16) != 0 {
+            let error = lastErr()
+            _ = close(fd)
+            throw MSLRuntimeError("listen failed for \(host):\(bindPort): \(error)")
+        }
+        return BoundListener(fd: fd, host: host)
     }
 }

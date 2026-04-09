@@ -7,6 +7,14 @@ final class DaemonServerBootstrapScriptTests: XCTestCase {
         XCTAssertTrue(DaemonServer.guestTransportReadyScript.contains("trap 'rm -f \"$UDHCP_SCRIPT\"' EXIT"))
     }
 
+    func testGuestTransportReadyScriptRepairsIPv6Transport() {
+        let command = DaemonServer.guestTransportReadyScript
+        XCTAssertTrue(command.contains("ip -6 route show default"))
+        XCTAssertTrue(command.contains("ip -6 -o addr show scope global"))
+        XCTAssertTrue(command.contains("IPv6AcceptRA=yes"))
+        XCTAssertTrue(command.contains("accept_ra=2"))
+    }
+
     func testVSCodeServerDirectoriesCommandIncludesRuntimeHomePaths() {
         let command = DaemonServer.makeVSCodeServerDirectoriesCommand(home: "/home/alice")
         XCTAssertTrue(command.contains("/home/alice/.vscode-server/extensionsCache"))
