@@ -400,6 +400,20 @@ fn interface_has_global_ipv4(iface: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn interface_has_global_ipv6(iface: &str) -> bool {
+    Command::new("ip")
+        .args(["-6", "-o", "addr", "show", "dev", iface, "scope", "global"])
+        .output()
+        .ok()
+        .map(|out| {
+            out.status.success()
+                && String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .any(|line| !line.contains(" tentative "))
+        })
+        .unwrap_or(false)
+}
+
 fn has_default_ipv4_route() -> bool {
     let text = match fs::read_to_string("/proc/net/route") {
         Ok(value) => value,
@@ -417,11 +431,31 @@ fn has_default_ipv4_route() -> bool {
     false
 }
 
+fn has_default_ipv6_route() -> bool {
+    Command::new("ip")
+        .args(["-6", "route", "show", "default"])
+        .output()
+        .ok()
+        .map(|out| out.status.success() && !String::from_utf8_lossy(&out.stdout).trim().is_empty())
+        .unwrap_or(false)
+}
+
 fn has_ipv4_transport_path(interfaces: &[String]) -> bool {
     has_default_ipv4_route()
         && interfaces
             .iter()
             .any(|iface| interface_has_global_ipv4(iface))
+}
+
+fn has_ipv6_transport_path(interfaces: &[String]) -> bool {
+    has_default_ipv6_route()
+        && interfaces
+            .iter()
+            .any(|iface| interface_has_global_ipv6(iface))
+}
+
+fn has_transport_path(interfaces: &[String]) -> bool {
+    has_ipv4_transport_path(interfaces) || has_ipv6_transport_path(interfaces)
 }
 
 fn run_dhcp_once(iface: &str) -> bool {
@@ -516,19 +550,19 @@ fn ensure_guest_network_ready() {
     for iface in &interfaces {
         ensure_interface_up(iface);
     }
-    if has_ipv4_transport_path(&interfaces) {
+    if has_transport_path(&interfaces) {
         return;
     }
     for iface in &interfaces {
         if !interface_has_global_ipv4(iface) || !has_default_ipv4_route() {
             let _ = run_dhcp_once(iface);
-            if has_ipv4_transport_path(&interfaces) {
+            if has_transport_path(&interfaces) {
                 log_line(&format!("network bootstrap succeeded interface={}", iface));
                 return;
             }
         }
     }
-    log_line("network bootstrap incomplete: missing default route or ipv4 address");
+    log_line("network bootstrap incomplete: missing default route or global ipv4/ipv6 address");
 }
 
 fn stop_dns_proxy() {
@@ -2802,12 +2836,12 @@ fn dns_reconcile_response(request_id: &str, op: &str, line: &str) -> String {
 fn dns_healthcheck_response(request_id: &str, op: &str, _line: &str) -> String {
     ensure_guest_network_ready();
     let interfaces = list_non_loopback_interfaces();
-    if !has_ipv4_transport_path(&interfaces) {
+    if !has_transport_path(&interfaces) {
         return error_response(
             request_id,
             op,
             "internal_error",
-            "network transport unavailable: missing default route or ipv4 address",
+            "network transport unavailable: missing default route or global ipv4/ipv6 address",
         );
     }
     let domains = [

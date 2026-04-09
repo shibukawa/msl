@@ -4861,9 +4861,15 @@ public final class DaemonServer {
         EOF
         chmod 0755 "$UDHCP_SCRIPT"
         has_transport() {
-          ip -4 route show default 2>/dev/null | grep -q '^default' || return 1
-          ip -4 -o addr show scope global 2>/dev/null | grep -q 'inet ' || return 1
-          return 0
+          if ip -4 route show default 2>/dev/null | grep -q '^default' \
+            && ip -4 -o addr show scope global 2>/dev/null | grep -q 'inet '; then
+            return 0
+          fi
+          if ip -6 route show default 2>/dev/null | grep -q '^default' \
+            && ip -6 -o addr show scope global 2>/dev/null | grep -v ' tentative ' | grep -q 'inet6 '; then
+            return 0
+          fi
+          return 1
         }
         repair_static_transport() {
           iface="$1"
@@ -4880,6 +4886,10 @@ public final class DaemonServer {
         repair_dynamic_transport() {
           iface="$1"
           [ -n "$expected_guest_ipv4" ] && return 1
+          if command -v sysctl >/dev/null 2>&1; then
+            sysctl -w "net.ipv6.conf.${iface}.accept_ra=2" >/dev/null 2>&1 || true
+            sysctl -w "net.ipv6.conf.${iface}.autoconf=1" >/dev/null 2>&1 || true
+          fi
           if command -v networkctl >/dev/null 2>&1; then
             unit_name="$(printf '%s' "$iface" | tr -c 'A-Za-z0-9_.-' '_')"
             unit_path="/run/systemd/network/90-msl-${unit_name}.network"
@@ -4889,6 +4899,7 @@ public final class DaemonServer {
 
         [Network]
         DHCP=ipv4
+        IPv6AcceptRA=yes
         LinkLocalAddressing=ipv6
 
         [DHCP]
@@ -5198,7 +5209,7 @@ public final class DaemonServer {
             if response.ok, (response.exitCode ?? 1) == 0 {
                 return (true, nil)
             }
-            let error = response.error?.message ?? response.stderr ?? "missing default route or ipv4 address"
+            let error = response.error?.message ?? response.stderr ?? "missing default route or global ipv4/ipv6 address"
             return (false, "network transport unavailable: \(error)")
         } catch {
             return (false, "network transport bootstrap init_channel error: \(error)")
