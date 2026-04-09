@@ -9,13 +9,15 @@ final class PortForwardingManager {
 
     private let logger: MSLLogger
     private let guestIPResolver: GuestIPResolver
+    private let exposeVMNetEndpoints: Bool
     private let lock = NSLock()
     private var active: [Int: ActiveListener] = [:]
     private var errors: [Int: String] = [:]
 
-    init(logger: MSLLogger, guestIPResolver: GuestIPResolver) {
+    init(logger: MSLLogger, guestIPResolver: GuestIPResolver, exposeVMNetEndpoints: Bool) {
         self.logger = logger
         self.guestIPResolver = guestIPResolver
+        self.exposeVMNetEndpoints = exposeVMNetEndpoints
     }
 
     func add(_ mapping: PortMapping) -> RuntimeControlResponse {
@@ -201,14 +203,28 @@ final class PortForwardingManager {
     ) -> [RuntimePortStatusItem] {
         let source: [PortMapping]
         source = mappings.sorted { $0.hostPort < $1.hostPort }
+        let guestAddress = exposeVMNetEndpoints ? guestIPResolver.preferredGuestIPHint() : nil
         return source.map { mapping in
-            RuntimePortStatusItem(
+            let localhostEndpoint = "\(mapping.bindAddress):\(mapping.hostPort)"
+            let hostnameEndpoint: String?
+            if exposeVMNetEndpoints, mapping.bindAddress == "127.0.0.1" {
+                hostnameEndpoint = "\(NetworkIdentity.serviceHostname(for: mapping.instance)):\(mapping.hostPort)"
+            } else {
+                hostnameEndpoint = nil
+            }
+            let directEndpoint = guestAddress.map { "\($0):\(mapping.guestPort)" }
+            return RuntimePortStatusItem(
                 instance: mapping.instance,
                 hostPort: mapping.hostPort,
                 guestPort: mapping.guestPort,
                 bindAddress: mapping.bindAddress,
+                source: mapping.source,
                 active: active[mapping.hostPort] != nil,
                 ownerInstance: ownerOverrides[mapping.hostPort],
+                guestAddress: guestAddress,
+                localhostEndpoint: localhostEndpoint,
+                hostnameEndpoint: hostnameEndpoint,
+                directEndpoint: directEndpoint,
                 error: externalErrors[mapping.hostPort] ?? errors[mapping.hostPort]
             )
         }
@@ -216,7 +232,8 @@ final class PortForwardingManager {
 
     private func formatBindError(_ error: Error, mapping: PortMapping) -> String {
         let message = String(describing: error)
-        guard message.localizedCaseInsensitiveContains("address already in use"),
+        guard exposeVMNetEndpoints,
+              message.localizedCaseInsensitiveContains("address already in use"),
               let guestIPHint = guestIPResolver.preferredGuestIPHint() else {
             return message
         }

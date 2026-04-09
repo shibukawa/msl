@@ -30,7 +30,8 @@ enum AutoPortForwardingPlanner {
             mergedByHostPort[hostPort] = PortMapping(
                 hostPort: hostPort,
                 guestPort: hostPort,
-                instance: instanceName
+                instance: instanceName,
+                source: "auto"
             )
             effectiveAutoPorts.insert(hostPort)
         }

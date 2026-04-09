@@ -19,6 +19,12 @@ public final class InstanceRuntimeContext {
     public var housekeepingClient: InitChannelClient?
     public var runtimeUser: RuntimeUserState?
     public var runtimeDNSMeta: [String: String] = [:]
+    public var resolvedNetworkMode: ResolvedNetworkMode = ResolvedNetworkMode(
+        configured: .auto,
+        effective: .nat,
+        reason: "network mode unresolved"
+    )
+    public var networkTopology: VMNetNetworkTopology?
     public var lastError: String?
 
     private let bootCondition = NSCondition()

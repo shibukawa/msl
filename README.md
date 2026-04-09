@@ -247,7 +247,8 @@ Even if you have an Xcode project/workspace, `swift build` only uses `Package.sw
 So you must sign the built binary explicitly when running via SwiftPM.
 
 This repo includes:
-- `msl.entitlements` (contains `com.apple.security.virtualization=true`)
+- `msl.dev.entitlements` (development entitlement set; virtualization only)
+- `msl.entitlements` (full entitlement set; includes `com.apple.vm.networking`)
 - `scripts/build-signed.sh` (build + codesign + entitlement check)
 - `scripts/build-msl-init.sh` (build guest `msl-init`)
 - `Makefile` (`make build` runs init build + signed host build, with `make reset` helper)
@@ -262,8 +263,17 @@ Manual equivalent:
 
 ```bash
 swift build
-codesign --force --sign - --entitlements ./msl.entitlements ./.build/debug/msl
+codesign --force --sign - --entitlements ./msl.dev.entitlements ./.build/debug/msl
 codesign -d --entitlements - ./.build/debug/msl
+```
+
+Notes:
+- Ad-hoc signing cannot use `com.apple.vm.networking`; macOS kills the process at launch if restricted entitlements are present on an ad-hoc signature.
+- `make build` uses ad-hoc signing by default so the CLI remains runnable and `network.mode=auto` can fall back to `nat`.
+- To produce a vmnet-capable build, provide a real signing identity:
+
+```bash
+MSL_SIGNING_IDENTITY="Developer ID Application: ..." make build
 ```
 
 ## Quick start (safe test mode)
@@ -347,17 +357,26 @@ Stop runtime:
 Legacy compatibility:
 - `msl --status` / `msl --stop` are still accepted with a deprecation warning.
 
-Port forwarding:
+Port forwarding and vmnet networking:
 
-- Runtime daemon auto-forwards guest TCP listeners (`0.0.0.0` / non-loopback IPv4, ports `1...65535`) to `localhost:<same-port>`.
+- Runtime uses a shared vmnet-backed private subnet as the primary path.
+- The daemon maintains:
+  - one shared subnet and host gateway IPv4
+  - a stable guest vmnet IPv4 per running instance
+  - host hostname `<instance>.msl.localhost`
+  - guest hostname `host.msl.localhost`
+- Runtime daemon auto-forwards guest TCP listeners (`0.0.0.0` / non-loopback IPv4, ports `1...65535`) to `localhost:<same-port>` as a convenience path.
 - Manual mappings still work and take precedence over auto mappings when host ports overlap.
-- If host already uses a port, the entry stays `inactive` and `msl port ls` shows a detail message with guest IP direct-access hint (when available).
+- If the host already uses a port, only the `localhost` binding becomes `inactive`; vmnet IP and `<instance>.msl.localhost` remain available.
+- `msl port ls` shows instance name, `localhost`, direct vmnet IP, and `<instance>.msl.localhost` endpoints for each mapping.
+- msl maintains marker-tagged `/etc/hosts` entries on both host and guest to keep these names synchronized.
 
 ```bash
 ./.build/debug/msl port
 ./.build/debug/msl port add 8080:8080
 ./.build/debug/msl port ls
 ./.build/debug/msl port rm 8080
+./.build/debug/msl network status
 ```
 
 `msl port` is a shortcut for `msl port ls`.

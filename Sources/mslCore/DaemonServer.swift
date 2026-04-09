@@ -254,10 +254,20 @@ public final class DaemonServer {
     private let dnsStateLock = NSLock()
     private let dnsReconcileLock = NSLock()
     private var runtimeDNSMeta: [String: String] = [
+        "configured_network_mode": ConfiguredNetworkMode.auto.rawValue,
+        "effective_network_mode": EffectiveNetworkMode.nat.rawValue,
+        "network_mode": EffectiveNetworkMode.nat.rawValue,
+        "network_mode_reason": "network mode unresolved",
+        "shared_subnet_ipv4": "-",
+        "shared_subnet_mask_ipv4": "-",
+        "host_gateway_ipv4": "-",
         "dns_mode": "host",
         "dns_status": "unknown",
         "dns_action": "-",
         "dns_source": "-",
+        "host_alias": "-",
+        "host_hosts_status": "unmanaged",
+        "guest_hosts_status": "unmanaged",
         "nameserver_count": "0",
         "search_domain_count": "0",
         "last_reconcile_epoch_ms": "0"
@@ -832,38 +842,34 @@ public final class DaemonServer {
 
         // 2. Start VM and get init channel client
         var activeBootStep: StartupStep = .vmConfigurationBuild
-        let runner = VirtualMachineRunner(
-            paths: paths,
-            metadataURL: metadataURL,
-            bootProfile: bootProfile,
-            logger: logger,
-            initProbeHandler: { [weak self] probe in
-                self?.updateInitChannelState(probe)
-            },
-            codeOpenRequestHandler: { [weak self] payload in
-                self?.handleGuestCodeOpenPayload(payload, sourceInstance: instanceName)
-            },
-            backgroundMemoryMaintenanceAllowed: { [weak self] in
-                !(self?.isBackgroundMemoryMaintenanceSuspended(instanceName: instanceName) ?? false)
-            },
-            startupPhaseObserver: { [weak self] phase in
-                guard let self else { return }
-                switch phase {
-                case "vm_configuration_build":
-                    activeBootStep = .vmStart
-                    self.updateStateStepCompleted(step: .vmConfigurationBuild, instanceName: instanceName)
-                    self.updateStateStarting(step: .vmStart, instanceName: instanceName)
-                case "vm_start":
-                    activeBootStep = .initHandshakeWait
-                    self.updateStateStepCompleted(step: .vmStart, instanceName: instanceName)
-                    self.updateStateStarting(step: .initHandshakeWait, instanceName: instanceName)
-                case "init_handshake_wait":
-                    self.updateStateStepCompleted(step: .initHandshakeWait, instanceName: instanceName)
-                default:
-                    break
+        var resolvedNetworkMode = resolveConfiguredNetworkMode()
+        applyResolvedNetworkMode(resolvedNetworkMode, to: instanceContext, instanceName: instanceName)
+        let makeRunner = { (_ resolved: ResolvedNetworkMode) -> VirtualMachineRunner in
+            self.makeVirtualMachineRunner(
+                metadataURL: metadataURL,
+                bootProfile: bootProfile,
+                instanceName: instanceName,
+                resolvedNetworkMode: resolved,
+                startupPhaseObserver: { [weak self] phase in
+                    guard let self else { return }
+                    switch phase {
+                    case "vm_configuration_build":
+                        activeBootStep = .vmStart
+                        self.updateStateStepCompleted(step: .vmConfigurationBuild, instanceName: instanceName)
+                        self.updateStateStarting(step: .vmStart, instanceName: instanceName)
+                    case "vm_start":
+                        activeBootStep = .initHandshakeWait
+                        self.updateStateStepCompleted(step: .vmStart, instanceName: instanceName)
+                        self.updateStateStarting(step: .initHandshakeWait, instanceName: instanceName)
+                    case "init_handshake_wait":
+                        self.updateStateStepCompleted(step: .initHandshakeWait, instanceName: instanceName)
+                    default:
+                        break
+                    }
                 }
-            }
-        )
+            )
+        }
+        var runner = makeRunner(resolvedNetworkMode)
         self.vmRunner = runner
         instanceContext.vmRunner = runner
 
@@ -878,6 +884,61 @@ public final class DaemonServer {
             }
             client = resolvedClient
         } catch {
+            if NetworkModeResolver.shouldFallbackToNAT(configured: resolvedNetworkMode.configured, error: error),
+               resolvedNetworkMode.effective == .vmnetShared {
+                resolvedNetworkMode = NetworkModeResolver.fallbackToNAT(
+                    from: resolvedNetworkMode,
+                    reason: "vmnet unavailable at startup: \(error)"
+                )
+                applyResolvedNetworkMode(resolvedNetworkMode, to: instanceContext, instanceName: instanceName)
+                runner = makeRunner(resolvedNetworkMode)
+                self.vmRunner = runner
+                instanceContext.vmRunner = runner
+                do {
+                    var fallbackClient: InitChannelClient?
+                    try instanceContext.runBootOnce {
+                        fallbackClient = try runner.startVMForDaemon()
+                    }
+                    guard let fallbackClient else {
+                        throw MSLRuntimeError("instance boot did not provide init channel")
+                    }
+                    client = fallbackClient
+                } catch {
+                    let bootFailureCode: String
+                    switch activeBootStep {
+                    case .vmConfigurationBuild:
+                        bootFailureCode = "vm_configuration_build_failed"
+                    case .vmStart:
+                        bootFailureCode = "vm_start_failed"
+                    case .initHandshakeWait:
+                        bootFailureCode = "init_handshake_wait_failed"
+                    default:
+                        bootFailureCode = "vm_start_failed"
+                    }
+                    updateStateBootFailed(
+                        step: activeBootStep,
+                        instanceName: instanceName,
+                        code: bootFailureCode,
+                        message: String(describing: error)
+                    )
+                    logger.log("daemon_vm_start_failed", fields: ["error": String(describing: error)])
+                    logRouter.logVM(
+                        instance: instanceName,
+                        event: "daemon_instance_boot_failed",
+                        fields: ["op": "boot", "result": "failed", "error": String(describing: error)]
+                    )
+                    publishInstanceStateEvent(
+                        instance: instanceName,
+                        state: "Error",
+                        reason: "boot_failed",
+                        error: String(describing: error)
+                    )
+                    instanceContext.lifecycleState = .error
+                    instanceContext.lastError = String(describing: error)
+                    updateStateStopped(lastError: String(describing: error))
+                    Foundation.exit(1)
+                }
+            } else {
             let bootFailureCode: String
             switch activeBootStep {
             case .vmConfigurationBuild:
@@ -911,9 +972,11 @@ public final class DaemonServer {
             instanceContext.lastError = String(describing: error)
             updateStateStopped(lastError: String(describing: error))
             Foundation.exit(1)
+            }
         }
         self.initClient = client
         instanceContext.initClient = client
+        instanceContext.networkTopology = runner.activeNetworkTopology
         if client.supportsDedicatedSideband {
             instanceContext.initWriteClient = client.makeSidebandClient()
             instanceContext.initReadClient = client.makeSidebandClient()
@@ -1071,9 +1134,14 @@ public final class DaemonServer {
         startDNSMonitorLoop()
 
         // 4. Set up port forwarding
-        let guestIPHint = ProcessInfo.processInfo.environment["MSL_GUEST_IP"]
+        let guestIPHint = forwardingGuestIPHint(for: instanceContext)
+            ?? ProcessInfo.processInfo.environment["MSL_GUEST_IP"]
         let guestIPResolver = GuestIPResolver(explicitIP: guestIPHint)
-        let portForwarder = PortForwardingManager(logger: logger, guestIPResolver: guestIPResolver)
+        let portForwarder = PortForwardingManager(
+            logger: logger,
+            guestIPResolver: guestIPResolver,
+            exposeVMNetEndpoints: instanceContext.resolvedNetworkMode.effective == .vmnetShared
+        )
         self.forwarder = portForwarder
 
         syncEffectivePortMappings(autoHostPorts: [], reason: "startup")
@@ -1148,6 +1216,7 @@ public final class DaemonServer {
         instanceContext.lifecycleState = .running
         instanceContext.lastError = nil
         instanceContext.clearBootError()
+        reconcileHostManagedHostnames(reason: "instance_start")
         logRouter.logVM(
             instance: instanceName,
             event: "daemon_instance_boot_ready",
@@ -1939,21 +2008,18 @@ public final class DaemonServer {
         publishInstanceStateEvent(instance: instanceName, state: "Booting", reason: "boot_started")
 
         let bootProfile = try resolveBootProfile(metadataURL: metadataURL, instanceName: instanceName)
-        let runner = VirtualMachineRunner(
-            paths: paths,
-            metadataURL: metadataURL,
-            bootProfile: bootProfile,
-            logger: logger,
-            initProbeHandler: { [weak self] probe in
-                self?.updateInitChannelState(probe)
-            },
-            codeOpenRequestHandler: { [weak self] payload in
-                self?.handleGuestCodeOpenPayload(payload, sourceInstance: instanceName)
-            },
-            backgroundMemoryMaintenanceAllowed: { [weak self] in
-                !(self?.isBackgroundMemoryMaintenanceSuspended(instanceName: instanceName) ?? false)
-            }
-        )
+        var resolvedNetworkMode = resolveConfiguredNetworkMode()
+        applyResolvedNetworkMode(resolvedNetworkMode, to: context, instanceName: instanceName)
+        let makeRunner = { (_ resolved: ResolvedNetworkMode) -> VirtualMachineRunner in
+            self.makeVirtualMachineRunner(
+                metadataURL: metadataURL,
+                bootProfile: bootProfile,
+                instanceName: instanceName,
+                resolvedNetworkMode: resolved,
+                startupPhaseObserver: nil
+            )
+        }
+        var runner = makeRunner(resolvedNetworkMode)
         context.vmRunner = runner
 
         do {
@@ -1964,54 +2030,57 @@ public final class DaemonServer {
             guard let resolvedClient else {
                 throw MSLRuntimeError("instance boot did not provide init channel")
             }
-            context.initClient = resolvedClient
-            if resolvedClient.supportsDedicatedSideband {
-                context.initWriteClient = resolvedClient.makeSidebandClient()
-                context.initReadClient = resolvedClient.makeSidebandClient()
-                context.housekeepingClient = context.initReadClient?.makeSidebandClient()
-            } else {
-                context.initWriteClient = nil
-                context.initReadClient = nil
-                context.housekeepingClient = nil
-            }
-            try prepareTmpStorageOnStartup(
-                client: resolvedClient,
+            return try finalizeBootedInstance(
+                context: context,
+                instanceName: instanceName,
                 metadataURL: metadataURL,
-                instanceName: instanceName
-            )
-            prepareHostShareRootMountOnStartup(client: resolvedClient)
-            syncGuestClockAtStartup(client: resolvedClient, instanceName: instanceName)
-            let resolved = try convergeRuntimeUser(
                 client: resolvedClient,
-                metadataURL: metadataURL,
-                instanceName: instanceName
+                runner: runner
             )
-            context.runtimeUser = resolved.runtimeUser
-            ensureGuestMSLCommandAlias(client: resolvedClient)
-
-            try lock.withExclusiveLock {
-                var state = try store.loadState()
-                upsertInstanceState(
-                    &state,
-                    instanceName: instanceName,
-                    lifecycleState: .running,
-                    activeSessionCount: state.instances?.first(where: { $0.instance == instanceName })?.activeSessionCount ?? 0,
-                    idleTimer: state.instances?.first(where: { $0.instance == instanceName })?.idleTimer
-                        ?? IdleTimerState(armed: false, deadlineEpochMs: nil),
-                    runtimeHostPid: Int32(getpid()),
-                    runtimeControlSocket: paths.runtimeControlSocketFile.path,
-                    runtimeUser: resolved.runtimeUser,
-                    initChannel: state.instances?.first(where: { $0.instance == instanceName })?.initChannel,
-                    lastError: nil
-                )
-                try store.saveState(state)
-            }
-            try ensureAttachedContainerDaemonStarted(instanceName: instanceName)
-            context.lifecycleState = .running
-            context.lastError = nil
-            publishInstanceStateEvent(instance: instanceName, state: "Running", reason: "boot_ready")
-            return context
         } catch {
+            if NetworkModeResolver.shouldFallbackToNAT(configured: resolvedNetworkMode.configured, error: error),
+               resolvedNetworkMode.effective == .vmnetShared {
+                context.vmRunner?.stopRunningVM()
+                resolvedNetworkMode = NetworkModeResolver.fallbackToNAT(
+                    from: resolvedNetworkMode,
+                    reason: "vmnet unavailable at startup: \(error)"
+                )
+                applyResolvedNetworkMode(resolvedNetworkMode, to: context, instanceName: instanceName)
+                runner = makeRunner(resolvedNetworkMode)
+                context.vmRunner = runner
+                do {
+                    var resolvedClient: InitChannelClient?
+                    try context.runBootOnce {
+                        resolvedClient = try runner.startVMForDaemon()
+                    }
+                    guard let resolvedClient else {
+                        throw MSLRuntimeError("instance boot did not provide init channel")
+                    }
+                    return try finalizeBootedInstance(
+                        context: context,
+                        instanceName: instanceName,
+                        metadataURL: metadataURL,
+                        client: resolvedClient,
+                        runner: runner
+                    )
+                } catch {
+                    context.lifecycleState = .error
+                    context.lastError = String(describing: error)
+                    context.vmRunner?.stopRunningVM()
+                    context.vmRunner = nil
+                    context.initClient = nil
+                    context.initWriteClient = nil
+                    context.initReadClient = nil
+                    context.housekeepingClient = nil
+                    publishInstanceStateEvent(
+                        instance: instanceName,
+                        state: "Error",
+                        reason: "boot_failed",
+                        error: String(describing: error)
+                    )
+                    throw error
+                }
+            }
             context.lifecycleState = .error
             context.lastError = String(describing: error)
             context.vmRunner?.stopRunningVM()
@@ -3926,6 +3995,8 @@ public final class DaemonServer {
         }
 
         do {
+            let context = instanceRegistry.context(for: instanceName)
+            let exposeVMNetEndpoints = context.resolvedNetworkMode.effective == .vmnetShared
             let mappings = try lock.withExclusiveLock(timeoutSec: 1) {
                 try store.loadPortMappings().mappings
                     .filter { $0.instance == instanceName }
@@ -3937,8 +4008,15 @@ public final class DaemonServer {
                     hostPort: mapping.hostPort,
                     guestPort: mapping.guestPort,
                     bindAddress: mapping.bindAddress,
+                    source: mapping.source,
                     active: false,
                     ownerInstance: nil,
+                    guestAddress: nil,
+                    localhostEndpoint: "\(mapping.bindAddress):\(mapping.hostPort)",
+                    hostnameEndpoint: exposeVMNetEndpoints && mapping.bindAddress == "127.0.0.1"
+                        ? "\(NetworkIdentity.serviceHostname(for: mapping.instance)):\(mapping.hostPort)"
+                        : nil,
+                    directEndpoint: nil,
                     error: nil
                 )
             }
@@ -3972,7 +4050,14 @@ public final class DaemonServer {
     private func handleDNSStatus(_ request: RuntimeControlRequest) -> RuntimeControlResponse {
         let instanceName = resolveTargetInstanceName(request)
         let context = instanceRegistry.context(for: instanceName)
-        let meta = context.runtimeDNSMeta.isEmpty ? runtimeDNSMeta : context.runtimeDNSMeta
+        var meta = context.runtimeDNSMeta.isEmpty ? runtimeDNSMeta : context.runtimeDNSMeta
+        applyNetworkModeMeta(&meta, resolved: context.resolvedNetworkMode, instanceName: instanceName, topology: context.networkTopology)
+        meta["host_hosts_status"] = meta["host_hosts_status"] ?? "unknown"
+        meta["guest_hosts_status"] = meta["guest_hosts_status"] ?? "unknown"
+        if context.resolvedNetworkMode.effective == .vmnetShared,
+           let topology = probeGuestNetworkAddressInfo(instanceName: instanceName, preferredClient: context.housekeepingClient ?? context.initClient ?? initClient) {
+            mergeNetworkTopologyMeta(&meta, topology: topology)
+        }
         return RuntimeControlResponse(ok: true, meta: meta)
     }
 
@@ -4098,7 +4183,10 @@ public final class DaemonServer {
                 )
             }
 
-            let transportReady = ensureGuestTransportReadyViaExec(client: client)
+            let transportReady = ensureGuestTransportReadyViaExec(
+                client: client,
+                topology: context.networkTopology
+            )
             if !transportReady.ok {
                 return updateDNSStateAndRespond(
                     instanceName: instanceName,
@@ -4152,6 +4240,69 @@ public final class DaemonServer {
                 )
             }
 
+            if context.resolvedNetworkMode.effective != .vmnetShared {
+                return updateDNSStateAndRespond(
+                    instanceName: instanceName,
+                    mode: policy.mode.rawValue,
+                    status: "healthy",
+                    action: "applied",
+                    source: dnsSource,
+                    nameserverCount: policy.nameservers.count,
+                    searchDomainCount: policy.searchDomains.count,
+                    snapshotHash: snapshot.hash,
+                    errorClass: nil,
+                    error: nil
+                )
+            }
+
+            guard let topology = probeGuestNetworkAddressInfo(instanceName: instanceName, preferredClient: client) else {
+                return updateDNSStateAndRespond(
+                    instanceName: instanceName,
+                    mode: policy.mode.rawValue,
+                    status: "degraded",
+                    action: "applied",
+                    source: dnsSource,
+                    nameserverCount: policy.nameservers.count,
+                    searchDomainCount: policy.searchDomains.count,
+                    snapshotHash: snapshot.hash,
+                    errorClass: "network_topology",
+                    error: "network topology unavailable: failed to resolve guest/private IPv4 endpoints"
+                )
+            }
+            guard let hostGatewayIPv4 = topology.hostGatewayIPv4, !hostGatewayIPv4.isEmpty else {
+                return updateDNSStateAndRespond(
+                    instanceName: instanceName,
+                    mode: policy.mode.rawValue,
+                    status: "degraded",
+                    action: "applied",
+                    source: dnsSource,
+                    nameserverCount: policy.nameservers.count,
+                    searchDomainCount: policy.searchDomains.count,
+                    snapshotHash: snapshot.hash,
+                    errorClass: "host_alias",
+                    error: "host alias unavailable: missing host gateway IPv4"
+                )
+            }
+
+            let hostAliasResult = ensureGuestHostAlias(
+                client: client,
+                hostGatewayIPv4: hostGatewayIPv4
+            )
+            if !hostAliasResult.ok {
+                return updateDNSStateAndRespond(
+                    instanceName: instanceName,
+                    mode: policy.mode.rawValue,
+                    status: "degraded",
+                    action: "applied",
+                    source: dnsSource,
+                    nameserverCount: policy.nameservers.count,
+                    searchDomainCount: policy.searchDomains.count,
+                    snapshotHash: snapshot.hash,
+                    errorClass: "host_alias",
+                    error: hostAliasResult.error ?? "host alias update failed"
+                )
+            }
+
             return updateDNSStateAndRespond(
                 instanceName: instanceName,
                 mode: policy.mode.rawValue,
@@ -4197,11 +4348,14 @@ public final class DaemonServer {
         error: String?
     ) -> RuntimeControlResponse {
         let now = nowEpochMs()
+        let context = instanceRegistry.context(for: instanceName)
         var meta: [String: String] = [
             "dns_mode": mode,
             "dns_status": status,
             "dns_action": action,
             "dns_source": source,
+            "host_hosts_status": currentDNSMetaSnapshot(instanceName: instanceName)["host_hosts_status"] ?? "unknown",
+            "guest_hosts_status": currentDNSMetaSnapshot(instanceName: instanceName)["guest_hosts_status"] ?? "unknown",
             "nameserver_count": String(nameserverCount),
             "search_domain_count": String(searchDomainCount),
             "snapshot_hash": snapshotHash,
@@ -4213,15 +4367,19 @@ public final class DaemonServer {
         if let error, !error.isEmpty {
             meta["error"] = error
         }
-        let context = instanceRegistry.context(for: instanceName)
+        applyNetworkModeMeta(&meta, resolved: context.resolvedNetworkMode, instanceName: instanceName, topology: context.networkTopology)
+        if !snapshotHash.isEmpty {
+            lastHostResolverSnapshotHash = snapshotHash
+        }
+        if context.resolvedNetworkMode.effective == .vmnetShared,
+           let topology = probeGuestNetworkAddressInfo(instanceName: instanceName, preferredClient: housekeepingClient(for: instanceName) ?? context.initClient ?? initClient) {
+            mergeNetworkTopologyMeta(&meta, topology: topology)
+        }
         context.runtimeDNSMeta = meta
         if instanceName == currentRuntimeInstanceName() {
             dnsStateLock.lock()
             runtimeDNSMeta = meta
             dnsStateLock.unlock()
-        }
-        if !snapshotHash.isEmpty {
-            lastHostResolverSnapshotHash = snapshotHash
         }
 
         let event: String
@@ -4234,6 +4392,405 @@ public final class DaemonServer {
         }
         logger.log(event, fields: meta)
         return RuntimeControlResponse(ok: status != "failed", error: error, meta: meta)
+    }
+
+    private func mergeNetworkTopologyMeta(_ meta: inout [String: String], topology: GuestNetworkAddressInfo) {
+        if let guestIPv4 = topology.guestIPv4, !guestIPv4.isEmpty {
+            meta["guest_private_ipv4"] = guestIPv4
+        }
+        if let hostGatewayIPv4 = topology.hostGatewayIPv4, !hostGatewayIPv4.isEmpty {
+            meta["host_gateway_ipv4"] = hostGatewayIPv4
+            meta["host_alias_endpoint"] = "\(NetworkIdentity.hostAlias):<port> (\(hostGatewayIPv4))"
+        }
+    }
+
+    private func resolveConfiguredNetworkMode() -> ResolvedNetworkMode {
+        let config = try? defaultInstanceStore.loadConfig()
+        let configured = NetworkModeResolver.configuredMode(from: config)
+        return NetworkModeResolver.resolve(configured: configured, executablePath: executablePath)
+    }
+
+    private func applyResolvedNetworkMode(
+        _ resolved: ResolvedNetworkMode,
+        to context: InstanceRuntimeContext,
+        instanceName: String
+    ) {
+        context.resolvedNetworkMode = resolved
+        if resolved.effective == .vmnetShared {
+            context.networkTopology = plannedNetworkTopology(for: instanceName)
+        } else {
+            context.networkTopology = nil
+        }
+        var meta = context.runtimeDNSMeta
+        applyNetworkModeMeta(&meta, resolved: resolved, instanceName: instanceName, topology: context.networkTopology)
+        context.runtimeDNSMeta = meta
+    }
+
+    private func applyNetworkModeMeta(
+        _ meta: inout [String: String],
+        resolved: ResolvedNetworkMode,
+        instanceName: String,
+        topology: VMNetNetworkTopology?
+    ) {
+        meta["configured_network_mode"] = resolved.configured.rawValue
+        meta["effective_network_mode"] = resolved.effective.rawValue
+        meta["network_mode"] = resolved.effective.rawValue
+        meta["network_mode_reason"] = resolved.reason ?? ""
+        if resolved.effective == .vmnetShared {
+            let sharedNetwork = NetworkIdentity.sharedNetwork()
+            meta["shared_subnet_ipv4"] = sharedNetwork.subnetIPv4
+            meta["shared_subnet_mask_ipv4"] = sharedNetwork.subnetMaskIPv4
+            meta["host_alias"] = NetworkIdentity.hostAlias
+            meta["service_host_pattern"] = NetworkIdentity.serviceHostnamePatternDescription(for: instanceName)
+            meta["service_hostname"] = NetworkIdentity.serviceHostname(for: instanceName)
+            if let topology {
+                meta["guest_private_ipv4"] = topology.guestIPv4
+                meta["host_gateway_ipv4"] = topology.hostIPv4
+                meta["host_alias_endpoint"] = "\(NetworkIdentity.hostAlias):<port> (\(topology.hostIPv4))"
+            } else {
+                meta["guest_private_ipv4"] = "-"
+                meta["host_gateway_ipv4"] = sharedNetwork.hostGatewayIPv4
+                meta["host_alias_endpoint"] = "\(NetworkIdentity.hostAlias):<port> (\(sharedNetwork.hostGatewayIPv4))"
+            }
+        } else {
+            meta["shared_subnet_ipv4"] = "-"
+            meta["shared_subnet_mask_ipv4"] = "-"
+            meta["guest_private_ipv4"] = "-"
+            meta["host_gateway_ipv4"] = "-"
+            meta["host_alias"] = "-"
+            meta["host_alias_endpoint"] = "-"
+            meta["service_host_pattern"] = "-"
+            meta["service_hostname"] = "-"
+            meta["host_hosts_status"] = "unmanaged"
+            meta["guest_hosts_status"] = "unmanaged"
+        }
+    }
+
+    private func makeVirtualMachineRunner(
+        metadataURL: URL,
+        bootProfile: RuntimeBootProfile,
+        instanceName: String,
+        resolvedNetworkMode: ResolvedNetworkMode,
+        startupPhaseObserver: ((String) -> Void)?
+    ) -> VirtualMachineRunner {
+        VirtualMachineRunner(
+            paths: paths,
+            metadataURL: metadataURL,
+            bootProfile: bootProfile,
+            logger: logger,
+            initProbeHandler: { [weak self] probe in
+                self?.updateInitChannelState(probe)
+            },
+            codeOpenRequestHandler: { [weak self] payload in
+                self?.handleGuestCodeOpenPayload(payload, sourceInstance: instanceName)
+            },
+            backgroundMemoryMaintenanceAllowed: { [weak self] in
+                !(self?.isBackgroundMemoryMaintenanceSuspended(instanceName: instanceName) ?? false)
+            },
+            startupPhaseObserver: startupPhaseObserver,
+            networkMode: resolvedNetworkMode.effective,
+            networkTopologyOverride: resolvedNetworkMode.effective == .vmnetShared ? plannedNetworkTopology(for: instanceName) : nil
+        )
+    }
+
+    private func finalizeBootedInstance(
+        context: InstanceRuntimeContext,
+        instanceName: String,
+        metadataURL: URL,
+        client: InitChannelClient,
+        runner: VirtualMachineRunner
+    ) throws -> InstanceRuntimeContext {
+        context.initClient = client
+        if client.supportsDedicatedSideband {
+            context.initWriteClient = client.makeSidebandClient()
+            context.initReadClient = client.makeSidebandClient()
+            context.housekeepingClient = context.initReadClient?.makeSidebandClient()
+        } else {
+            context.initWriteClient = nil
+            context.initReadClient = nil
+            context.housekeepingClient = nil
+        }
+        context.networkTopology = runner.activeNetworkTopology
+        applyResolvedNetworkMode(context.resolvedNetworkMode, to: context, instanceName: instanceName)
+
+        try prepareTmpStorageOnStartup(
+            client: client,
+            metadataURL: metadataURL,
+            instanceName: instanceName
+        )
+        prepareHostShareRootMountOnStartup(client: client)
+        syncGuestClockAtStartup(client: client, instanceName: instanceName)
+        let resolved = try convergeRuntimeUser(
+            client: client,
+            metadataURL: metadataURL,
+            instanceName: instanceName
+        )
+        context.runtimeUser = resolved.runtimeUser
+        ensureGuestMSLCommandAlias(client: client)
+
+        try lock.withExclusiveLock {
+            var state = try store.loadState()
+            upsertInstanceState(
+                &state,
+                instanceName: instanceName,
+                lifecycleState: .running,
+                activeSessionCount: state.instances?.first(where: { $0.instance == instanceName })?.activeSessionCount ?? 0,
+                idleTimer: state.instances?.first(where: { $0.instance == instanceName })?.idleTimer
+                    ?? IdleTimerState(armed: false, deadlineEpochMs: nil),
+                runtimeHostPid: Int32(getpid()),
+                runtimeControlSocket: paths.runtimeControlSocketFile.path,
+                runtimeUser: resolved.runtimeUser,
+                initChannel: state.instances?.first(where: { $0.instance == instanceName })?.initChannel,
+                lastError: nil
+            )
+            try store.saveState(state)
+        }
+        try ensureAttachedContainerDaemonStarted(instanceName: instanceName)
+        context.lifecycleState = .running
+        context.lastError = nil
+        publishInstanceStateEvent(instance: instanceName, state: "Running", reason: "boot_ready")
+        return context
+    }
+
+    private func plannedNetworkTopology(for instanceName: String) -> VMNetNetworkTopology {
+        let reserved = Set(
+            instanceRegistry.allContexts()
+                .filter { $0.instanceName != instanceName }
+                .compactMap(\.networkTopology?.guestIPv4)
+        )
+        return NetworkIdentity.vmnetTopology(for: instanceName, reservedGuestIPv4s: reserved)
+    }
+
+    private func probeGuestNetworkAddressInfo(
+        instanceName: String,
+        preferredClient: InitChannelClient?
+    ) -> GuestNetworkAddressInfo? {
+        guard let client = preferredClient ?? housekeepingClient(for: instanceName) else {
+            return nil
+        }
+        let script = """
+        set -eu
+        guest=""
+        gateway=""
+        if command -v ip >/dev/null 2>&1; then
+          gateway="$(ip -4 route show default 2>/dev/null | awk '/default/ { for (i = 1; i <= NF; i++) if ($i == "via") { print $(i + 1); exit } }')"
+          guest="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{ for (i = 1; i <= NF; i++) if ($i == "src") { print $(i + 1); exit } }')"
+          if [ -z "$guest" ]; then
+            guest="$(ip -4 -o addr show scope global up 2>/dev/null | awk '{ split($4, addr, \"/\"); print addr[1]; exit }')"
+          fi
+        fi
+        printf 'guest_ipv4=%s\\n' "$guest"
+        printf 'host_gateway_ipv4=%s\\n' "$gateway"
+        """
+        do {
+            let response = try client.send(InitChannelRequest(
+                op: "exec",
+                argv: ["/bin/sh", "-lc", script],
+                timeoutMs: 2_000
+            ))
+            guard response.ok else {
+                return nil
+            }
+            let info = NetworkIdentity.parseGuestAddressProbeOutput(response.stdout ?? "")
+            if info.guestIPv4 == nil, info.hostGatewayIPv4 == nil {
+                return nil
+            }
+            return info
+        } catch {
+            logger.log("network_topology_probe_failed", fields: [
+                "instance": instanceName,
+                "error": String(describing: error)
+            ])
+            return nil
+        }
+    }
+
+    private func forwardingGuestIPHint(for context: InstanceRuntimeContext) -> String? {
+        if let guestIPv4 = context.networkTopology?.guestIPv4, !guestIPv4.isEmpty {
+            return guestIPv4
+        }
+        if let guestIPv4 = context.runtimeDNSMeta["guest_private_ipv4"],
+           !guestIPv4.isEmpty,
+           guestIPv4 != "-" {
+            return guestIPv4
+        }
+        return probeGuestNetworkAddressInfo(
+            instanceName: context.instanceName,
+            preferredClient: context.housekeepingClient ?? context.initClient ?? initClient
+        )?.guestIPv4
+    }
+
+    private func reconcileHostManagedHostnames(reason: String) {
+        let desiredTopologies = instanceRegistry.allContexts()
+            .filter { $0.lifecycleState == .running && $0.resolvedNetworkMode.effective == .vmnetShared }
+            .compactMap(\.networkTopology)
+
+        if desiredTopologies.isEmpty {
+            updateHostHostsMeta(status: "unmanaged", error: nil)
+            return
+        }
+
+        do {
+            let existing = (try? String(contentsOfFile: "/etc/hosts", encoding: .utf8)) ?? ""
+            let render = NetworkIdentity.reconcileHostHostsFile(existing: existing, topologies: desiredTopologies)
+            if render.rendered != existing {
+                try writeHostHostsFile(render.rendered)
+            }
+            let status = render.conflicts.isEmpty ? "managed" : "degraded"
+            updateHostHostsMeta(
+                status: status,
+                error: render.conflicts.isEmpty ? nil : "unmanaged hostname conflicts: \(render.conflicts.joined(separator: ","))"
+            )
+            logger.log("host_hosts_reconciled", fields: [
+                "reason": reason,
+                "instance_count": String(desiredTopologies.count),
+                "status": status
+            ])
+        } catch {
+            updateHostHostsMeta(status: "degraded", error: String(describing: error))
+            logger.log("host_hosts_reconcile_failed", fields: [
+                "reason": reason,
+                "error": String(describing: error)
+            ])
+        }
+    }
+
+    private func writeHostHostsFile(_ rendered: String) throws {
+        if FileManager.default.isWritableFile(atPath: "/etc/hosts") {
+            try rendered.write(toFile: "/etc/hosts", atomically: true, encoding: .utf8)
+            return
+        }
+
+        let tempURL = paths.runtime.appendingPathComponent("hosts.msl.tmp", isDirectory: false)
+        try rendered.write(to: tempURL, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: tempURL) }
+
+        if try runHostCommand("/usr/bin/sudo", arguments: ["-n", "/usr/bin/install", "-m", "644", tempURL.path, "/etc/hosts"]) {
+            return
+        }
+
+        let shellCommand = "/usr/bin/install -m 644 '\(escapeSingleQuotes(tempURL.path))' /etc/hosts"
+        let script = "do shell script \"\(escapeAppleScript(shellCommand))\" with administrator privileges"
+        let success = try runHostCommand("/usr/bin/osascript", arguments: ["-e", script])
+        guard success else {
+            throw MSLRuntimeError("failed to update host /etc/hosts with administrator privileges")
+        }
+    }
+
+    private func runHostCommand(_ executable: String, arguments: [String]) throws -> Bool {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
+        process.standardInput = nil
+        process.standardOutput = Pipe()
+        process.standardError = Pipe()
+        try process.run()
+        process.waitUntilExit()
+        return process.terminationStatus == 0
+    }
+
+    private func escapeSingleQuotes(_ value: String) -> String {
+        value.replacingOccurrences(of: "'", with: "'\\''")
+    }
+
+    private func escapeAppleScript(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+    }
+
+    private func updateHostHostsMeta(status: String, error: String?) {
+        for context in instanceRegistry.allContexts() where context.lifecycleState == .running {
+            if context.resolvedNetworkMode.effective == .vmnetShared {
+                context.runtimeDNSMeta["host_hosts_status"] = status
+                if let error, !error.isEmpty {
+                    context.runtimeDNSMeta["host_hosts_error"] = error
+                } else {
+                    context.runtimeDNSMeta.removeValue(forKey: "host_hosts_error")
+                }
+            } else {
+                context.runtimeDNSMeta["host_hosts_status"] = "unmanaged"
+                context.runtimeDNSMeta.removeValue(forKey: "host_hosts_error")
+            }
+        }
+        dnsStateLock.lock()
+        if instanceRegistry.context(for: currentRuntimeInstanceName()).resolvedNetworkMode.effective == .vmnetShared {
+            runtimeDNSMeta["host_hosts_status"] = status
+            if let error, !error.isEmpty {
+                runtimeDNSMeta["host_hosts_error"] = error
+            } else {
+                runtimeDNSMeta.removeValue(forKey: "host_hosts_error")
+            }
+        } else {
+            runtimeDNSMeta["host_hosts_status"] = "unmanaged"
+            runtimeDNSMeta.removeValue(forKey: "host_hosts_error")
+        }
+        dnsStateLock.unlock()
+    }
+
+    private func ensureGuestHostAlias(
+        client: InitChannelClient,
+        hostGatewayIPv4: String
+    ) -> (ok: Bool, error: String?) {
+        if instanceRegistry.context(for: currentRuntimeInstanceName()).resolvedNetworkMode.effective != .vmnetShared {
+            dnsStateLock.lock()
+            runtimeDNSMeta["guest_hosts_status"] = "unmanaged"
+            runtimeDNSMeta.removeValue(forKey: "guest_hosts_error")
+            dnsStateLock.unlock()
+            return (true, nil)
+        }
+        do {
+            let readResponse = try client.send(InitChannelRequest(
+                op: "exec",
+                argv: ["/bin/cat", "/etc/hosts"],
+                timeoutMs: 1_000
+            ))
+            guard readResponse.ok else {
+                return (false, readResponse.error?.message ?? readResponse.stderr ?? "failed to read /etc/hosts")
+            }
+
+            let renderedHosts = NetworkIdentity.renderGuestHostsFile(
+                existing: readResponse.stdout ?? "",
+                hostGatewayIPv4: hostGatewayIPv4
+            )
+            let marker = "__MSL_HOSTS_EOF__"
+            let script = """
+            set -eu
+            tmp=/etc/hosts.msl.tmp
+            cat > "$tmp" <<'\(marker)'
+            \(renderedHosts)
+            \(marker)
+            mv "$tmp" /etc/hosts
+            """
+            let writeResponse = try client.send(InitChannelRequest(
+                op: "exec",
+                argv: ["/bin/sh", "-lc", script],
+                runAsRoot: true,
+                timeoutMs: 2_000
+            ))
+            guard writeResponse.ok, (writeResponse.exitCode ?? 0) == 0 else {
+                return (false, writeResponse.error?.message ?? writeResponse.stderr ?? "failed to update /etc/hosts")
+            }
+            if let activeInstanceName {
+                instanceRegistry.context(for: activeInstanceName).runtimeDNSMeta["guest_hosts_status"] = "managed"
+                instanceRegistry.context(for: activeInstanceName).runtimeDNSMeta.removeValue(forKey: "guest_hosts_error")
+            }
+            dnsStateLock.lock()
+            runtimeDNSMeta["guest_hosts_status"] = "managed"
+            runtimeDNSMeta.removeValue(forKey: "guest_hosts_error")
+            dnsStateLock.unlock()
+            return (true, nil)
+        } catch {
+            if let activeInstanceName {
+                instanceRegistry.context(for: activeInstanceName).runtimeDNSMeta["guest_hosts_status"] = "degraded"
+                instanceRegistry.context(for: activeInstanceName).runtimeDNSMeta["guest_hosts_error"] = String(describing: error)
+            }
+            dnsStateLock.lock()
+            runtimeDNSMeta["guest_hosts_status"] = "degraded"
+            runtimeDNSMeta["guest_hosts_error"] = String(describing: error)
+            dnsStateLock.unlock()
+            return (false, String(describing: error))
+        }
     }
 
     private func classifyDNSHealthcheckError(_ error: String?) -> String {
@@ -4259,8 +4816,15 @@ public final class DaemonServer {
         return runtimeDNSMeta
     }
 
-    static let guestTransportReadyScript = """
+    static func makeGuestTransportReadyScript(topology: VMNetNetworkTopology?) -> String {
+        let expectedGuestIPv4 = topology?.guestIPv4 ?? ""
+        let expectedGatewayIPv4 = topology?.hostIPv4 ?? ""
+        let prefixLength = topology.map { ipv4PrefixLength(mask: $0.subnetMaskIPv4) } ?? 24
+        return """
         set -eu
+        expected_guest_ipv4='\(expectedGuestIPv4)'
+        expected_gateway_ipv4='\(expectedGatewayIPv4)'
+        expected_prefix_len='\(prefixLength)'
         UDHCP_SCRIPT="$(mktemp /tmp/msl-udhcpc-script.XXXXXX)"
         trap 'rm -f "$UDHCP_SCRIPT"' EXIT
         cat > "$UDHCP_SCRIPT" <<'EOF'
@@ -4301,39 +4865,81 @@ public final class DaemonServer {
           ip -4 -o addr show scope global 2>/dev/null | grep -q 'inet ' || return 1
           return 0
         }
+        repair_static_transport() {
+          iface="$1"
+          [ -n "$expected_guest_ipv4" ] || return 1
+          [ -n "$expected_gateway_ipv4" ] || return 1
+          ip link set dev "$iface" up >/dev/null 2>&1 || true
+          if ! ip -4 -o addr show dev "$iface" 2>/dev/null | grep -q "inet $expected_guest_ipv4/"; then
+            ip -4 addr flush dev "$iface" scope global >/dev/null 2>&1 || true
+            ip -4 addr add "$expected_guest_ipv4/$expected_prefix_len" dev "$iface" >/dev/null 2>&1 || true
+          fi
+          ip route replace default via "$expected_gateway_ipv4" dev "$iface" >/dev/null 2>&1 || true
+          has_transport
+        }
+        repair_dynamic_transport() {
+          iface="$1"
+          [ -n "$expected_guest_ipv4" ] && return 1
+          if command -v networkctl >/dev/null 2>&1; then
+            unit_name="$(printf '%s' "$iface" | tr -c 'A-Za-z0-9_.-' '_')"
+            unit_path="/run/systemd/network/90-msl-${unit_name}.network"
+            cat > "$unit_path" <<EOF
+        [Match]
+        Name=$iface
+
+        [Network]
+        DHCP=ipv4
+        LinkLocalAddressing=ipv6
+
+        [DHCP]
+        ClientIdentifier=mac
+        EOF
+            networkctl reload >/dev/null 2>&1 || true
+            networkctl reconfigure "$iface" >/dev/null 2>&1 || systemctl restart systemd-networkd >/dev/null 2>&1 || true
+            sleep 1
+            has_transport && return 0
+          fi
+          return 1
+        }
         has_transport && exit 0
         for iface in $(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | sed 's/@.*//' | grep -Ev '^(lo|sit|ip6tnl)' || true); do
-          if command -v sudo >/dev/null 2>&1; then
-            sudo -n ip link set dev "$iface" up >/dev/null 2>&1 || true
-          else
-            ip link set dev "$iface" up >/dev/null 2>&1 || true
-          fi
+          ip link set dev "$iface" up >/dev/null 2>&1 || true
           if ip -4 -o addr show dev "$iface" scope global 2>/dev/null | grep -q 'inet '; then
+            if repair_static_transport "$iface"; then
+              exit 0
+            fi
             continue
           fi
           if command -v udhcpc >/dev/null 2>&1; then
-            if command -v sudo >/dev/null 2>&1; then
-              sudo -n udhcpc -i "$iface" -n -q -t 3 -T 1 -s "$UDHCP_SCRIPT" >/dev/null 2>&1 || true
-            else
-              udhcpc -i "$iface" -n -q -t 3 -T 1 -s "$UDHCP_SCRIPT" >/dev/null 2>&1 || true
-            fi
+            udhcpc -i "$iface" -n -q -t 3 -T 1 -s "$UDHCP_SCRIPT" >/dev/null 2>&1 || true
           elif command -v busybox >/dev/null 2>&1; then
-            if command -v sudo >/dev/null 2>&1; then
-              sudo -n busybox udhcpc -i "$iface" -n -q -t 3 -T 1 -s "$UDHCP_SCRIPT" >/dev/null 2>&1 || true
-            else
-              busybox udhcpc -i "$iface" -n -q -t 3 -T 1 -s "$UDHCP_SCRIPT" >/dev/null 2>&1 || true
-            fi
+            busybox udhcpc -i "$iface" -n -q -t 3 -T 1 -s "$UDHCP_SCRIPT" >/dev/null 2>&1 || true
           elif command -v dhclient >/dev/null 2>&1; then
-            if command -v sudo >/dev/null 2>&1; then
-              sudo -n dhclient -4 -1 "$iface" >/dev/null 2>&1 || true
-            else
-              dhclient -4 -1 "$iface" >/dev/null 2>&1 || true
-            fi
+            dhclient -4 -1 "$iface" >/dev/null 2>&1 || true
+          fi
+          if repair_static_transport "$iface"; then
+            exit 0
+          fi
+          if repair_dynamic_transport "$iface"; then
+            exit 0
           fi
           has_transport && exit 0
         done
         has_transport
         """
+    }
+
+    static var guestTransportReadyScript: String {
+        makeGuestTransportReadyScript(topology: nil)
+    }
+
+    private static func ipv4PrefixLength(mask: String) -> Int {
+        let octets = mask.split(separator: ".").compactMap { UInt8($0) }
+        guard octets.count == 4 else {
+            return 24
+        }
+        return octets.reduce(0) { $0 + Int($1.nonzeroBitCount) }
+    }
 
     static func makeVSCodeServerDirectoriesCommand(home: String) -> String {
         let safeHome = home.isEmpty ? "/root" : home
@@ -4576,13 +5182,17 @@ public final class DaemonServer {
         )
     }
 
-    private func ensureGuestTransportReadyViaExec(client: InitChannelClient) -> (ok: Bool, error: String?) {
-        let script = Self.guestTransportReadyScript
+    private func ensureGuestTransportReadyViaExec(
+        client: InitChannelClient,
+        topology: VMNetNetworkTopology?
+    ) -> (ok: Bool, error: String?) {
+        let script = Self.makeGuestTransportReadyScript(topology: topology)
 
         do {
             let response = try client.send(InitChannelRequest(
                 op: "exec",
                 argv: ["/bin/sh", "-lc", script],
+                runAsRoot: true,
                 timeoutMs: 8_000
             ))
             if response.ok, (response.exitCode ?? 1) == 0 {
@@ -5039,6 +5649,7 @@ public final class DaemonServer {
         context.initReadClient = nil
         context.housekeepingClient = nil
         context.runtimeUser = nil
+        context.networkTopology = nil
         context.lifecycleState = .stopped
         context.lastError = nil
         context.clearBootError()
@@ -5085,6 +5696,7 @@ public final class DaemonServer {
             event: "daemon_instance_stop_done",
             fields: ["op": "stop", "result": "ok", "reason": reason]
         )
+        reconcileHostManagedHostnames(reason: reason)
         publishInstanceStateEvent(instance: instanceName, state: "Stopped", reason: reason)
     }
 
@@ -5143,8 +5755,10 @@ public final class DaemonServer {
             context.vmRunner = nil
             context.initClient = nil
             context.runtimeUser = nil
+            context.networkTopology = nil
             context.lastError = nil
         }
+        reconcileHostManagedHostnames(reason: "daemon_shutdown")
         updateStateStopped()
         logger.log("daemon_stopped")
     }

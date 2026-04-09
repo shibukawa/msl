@@ -4,6 +4,13 @@ import Darwin
 private let runtimeControlMaxLineBytes = 4 * 1024 * 1024
 private let runtimeControlFrameMagic: UInt32 = 0x4D534C52 // "MSLR"
 
+private func runtimeControlConfigureNoSigPipe(fd: Int32) throws {
+    var enabled: Int32 = 1
+    if setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &enabled, socklen_t(MemoryLayout<Int32>.size)) != 0 {
+        throw MSLRuntimeError("failed to configure control socket SO_NOSIGPIPE: \(String(cString: strerror(errno)))")
+    }
+}
+
 private struct RuntimeControlDirectHeader: Codable {
     var op: String
     var status: String?
@@ -353,8 +360,13 @@ public struct RuntimePortStatusItem: Codable {
     public var hostPort: Int
     public var guestPort: Int
     public var bindAddress: String
+    public var source: String?
     public var active: Bool
     public var ownerInstance: String?
+    public var guestAddress: String?
+    public var localhostEndpoint: String?
+    public var hostnameEndpoint: String?
+    public var directEndpoint: String?
     public var error: String?
 
     public init(
@@ -362,16 +374,26 @@ public struct RuntimePortStatusItem: Codable {
         hostPort: Int,
         guestPort: Int,
         bindAddress: String,
+        source: String? = nil,
         active: Bool,
         ownerInstance: String? = nil,
+        guestAddress: String? = nil,
+        localhostEndpoint: String? = nil,
+        hostnameEndpoint: String? = nil,
+        directEndpoint: String? = nil,
         error: String?
     ) {
         self.instance = instance
         self.hostPort = hostPort
         self.guestPort = guestPort
         self.bindAddress = bindAddress
+        self.source = source
         self.active = active
         self.ownerInstance = ownerInstance
+        self.guestAddress = guestAddress
+        self.localhostEndpoint = localhostEndpoint
+        self.hostnameEndpoint = hostnameEndpoint
+        self.directEndpoint = directEndpoint
         self.error = error
     }
 }
@@ -574,6 +596,7 @@ final class RuntimeControlServer {
         if listenFD < 0 {
             throw MSLRuntimeError("failed to create runtime control socket: \(lastErr())")
         }
+        try runtimeControlConfigureNoSigPipe(fd: listenFD)
 
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
@@ -626,6 +649,12 @@ final class RuntimeControlServer {
             if clientFD < 0 {
                 if errno == EINTR { continue }
                 if running { usleep(50_000) }
+                continue
+            }
+            do {
+                try runtimeControlConfigureNoSigPipe(fd: clientFD)
+            } catch {
+                _ = close(clientFD)
                 continue
             }
             let thread = Thread { [weak self] in
@@ -882,6 +911,7 @@ final class RuntimeControlClient {
         if fd < 0 {
             throw MSLRuntimeError("failed to create control client socket: \(String(cString: strerror(errno)))")
         }
+        try runtimeControlConfigureNoSigPipe(fd: fd)
 
         let originalFlags = fcntl(fd, F_GETFL)
         if originalFlags < 0 {

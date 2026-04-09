@@ -130,6 +130,7 @@ final class DefaultInstanceStoreTests: XCTestCase {
         let config = MSLConfig(
             schemaVersion: 1,
             network: MSLConfig.NetworkConfig(
+                mode: "nat",
                 dns: MSLConfig.NetworkDNSConfig(
                     mode: "unmanaged",
                     manualNameservers: ["1.1.1.1"],
@@ -140,6 +141,7 @@ final class DefaultInstanceStoreTests: XCTestCase {
 
         try store.saveConfig(config)
         let loaded = try store.loadConfig()
+        XCTAssertEqual(loaded.network?.mode, "nat")
         XCTAssertEqual(loaded.network?.dns?.mode, "unmanaged")
         XCTAssertEqual(loaded.network?.dns?.manualNameservers, ["1.1.1.1"])
         XCTAssertEqual(loaded.network?.dns?.manualSearchDomains, ["corp.example"])

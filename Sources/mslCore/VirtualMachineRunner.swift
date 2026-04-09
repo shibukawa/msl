@@ -2,6 +2,10 @@ import Foundation
 #if canImport(Virtualization)
 import Virtualization
 #endif
+#if canImport(vmnet)
+import vmnet
+#endif
+import Darwin
 
 public struct MemoryBalloonRuntimeStats {
     public var allocatedBytes: UInt64
@@ -24,6 +28,8 @@ public final class VirtualMachineRunner {
     private let codeOpenRequestHandler: ((String) -> Void)?
     private let backgroundMemoryMaintenanceAllowed: (() -> Bool)?
     private let startupPhaseObserver: ((String) -> Void)?
+    private let networkMode: EffectiveNetworkMode
+    private let networkTopologyOverride: VMNetNetworkTopology?
     private var terminalBridge: TerminalBridge?
     private var diagnosticCollector: GuestDiagnosticLogCollector?
     private var acceptedVsockConnection: AnyObject?  // retain VZVirtioSocketConnection
@@ -36,6 +42,7 @@ public final class VirtualMachineRunner {
     private var codeOpenListener: AnyObject?
     private var codeOpenListenerDelegate: AnyObject?
     private var memoryPlan: RuntimeMemoryPlan?
+    public private(set) var activeNetworkTopology: VMNetNetworkTopology?
 
     #if canImport(Virtualization)
     private var runningVM: VZVirtualMachine?
@@ -46,6 +53,9 @@ public final class VirtualMachineRunner {
     private var balloonReturnedTotalBytes: UInt64 = 0
     private var balloonControllerTimer: DispatchSourceTimer?
     private let balloonControllerQueue = DispatchQueue(label: "msl.vm.balloon")
+    #if canImport(vmnet)
+    private var retainedVMNetNetwork: vmnet_network_ref?
+    #endif
     #endif
 
     public init(
@@ -56,7 +66,9 @@ public final class VirtualMachineRunner {
         initProbeHandler: ((InitChannelProbeResult) -> Void)? = nil,
         codeOpenRequestHandler: ((String) -> Void)? = nil,
         backgroundMemoryMaintenanceAllowed: (() -> Bool)? = nil,
-        startupPhaseObserver: ((String) -> Void)? = nil
+        startupPhaseObserver: ((String) -> Void)? = nil,
+        networkMode: EffectiveNetworkMode = .vmnetShared,
+        networkTopologyOverride: VMNetNetworkTopology? = nil
     ) {
         self.paths = paths
         self.metadataURL = metadataURL
@@ -66,6 +78,8 @@ public final class VirtualMachineRunner {
         self.codeOpenRequestHandler = codeOpenRequestHandler
         self.backgroundMemoryMaintenanceAllowed = backgroundMemoryMaintenanceAllowed
         self.startupPhaseObserver = startupPhaseObserver
+        self.networkMode = networkMode
+        self.networkTopologyOverride = networkTopologyOverride
     }
 
     public func runAttachedConsole() throws -> Int32 {
@@ -109,6 +123,7 @@ public final class VirtualMachineRunner {
         let diagnosticAttachment = makeDiagnosticAttachment(instanceName: metadata.instanceName)
         let configStartMs = monotonicMs()
         let configuration = try buildConfiguration(
+            instanceName: metadata.instanceName,
             diskURL: diskURL,
             machineIdentifierURL: metadata.machineIdentifierURL,
             efiVariableStoreURL: metadata.efiVariableStoreURL,
@@ -396,6 +411,7 @@ public final class VirtualMachineRunner {
     }
 
     private func buildConfiguration(
+        instanceName: String,
         diskURL: URL,
         machineIdentifierURL: URL,
         efiVariableStoreURL: URL,
@@ -455,9 +471,24 @@ public final class VirtualMachineRunner {
         }
         vm.serialPorts = serialPorts
 
-        let nat = VZNATNetworkDeviceAttachment()
         let network = VZVirtioNetworkDeviceConfiguration()
-        network.attachment = nat
+        switch networkMode {
+        case .nat:
+            network.attachment = VZNATNetworkDeviceAttachment()
+            activeNetworkTopology = nil
+        case .vmnetShared:
+            if #available(macOS 26.0, *) {
+                let vmnetAttachment = try buildVMNetAttachment(instanceName: instanceName)
+                network.attachment = vmnetAttachment.attachment
+                network.macAddress = vmnetAttachment.macAddress
+                activeNetworkTopology = vmnetAttachment.topology
+                #if canImport(vmnet)
+                retainedVMNetNetwork = vmnetAttachment.retainedNetwork
+                #endif
+            } else {
+                throw MSLRuntimeError("vmnet networking requires macOS 26 or later")
+            }
+        }
         vm.networkDevices = [network]
 
         let diskAttachment = try VZDiskImageStorageDeviceAttachment(url: diskURL, readOnly: false)
@@ -487,6 +518,88 @@ public final class VirtualMachineRunner {
         try vm.validate()
         return vm
     }
+
+    #if canImport(vmnet)
+    @available(macOS 26.0, *)
+    private func buildVMNetAttachment(instanceName: String) throws -> (
+        attachment: VZVmnetNetworkDeviceAttachment,
+        macAddress: VZMACAddress,
+        topology: VMNetNetworkTopology,
+        retainedNetwork: vmnet_network_ref
+    ) {
+        let topology = networkTopologyOverride ?? NetworkIdentity.vmnetTopology(for: instanceName)
+        guard var subnetAddress = parseIPv4Address(topology.subnetIPv4),
+              var subnetMask = parseIPv4Address(topology.subnetMaskIPv4),
+              var reservedGuestAddress = parseIPv4Address(topology.guestIPv4) else {
+            throw MSLRuntimeError("vmnet topology generation produced an invalid IPv4 address")
+        }
+
+        guard let macAddress = VZMACAddress(string: topology.guestMACAddress) else {
+            throw MSLRuntimeError("invalid vmnet MAC address: \(topology.guestMACAddress)")
+        }
+
+        var status = vmnet_return_t(rawValue: 1000)!
+        guard let configuration = vmnet_network_configuration_create(operating_modes_t(rawValue: 1001)!, &status) else {
+            throw MSLRuntimeError("failed to create vmnet network configuration: \(describeVMNetStatus(status))")
+        }
+        defer { releaseVMNetObject(configuration) }
+
+        let subnetStatus = vmnet_network_configuration_set_ipv4_subnet(configuration, &subnetAddress, &subnetMask)
+        guard subnetStatus.rawValue == 1000 else {
+            throw MSLRuntimeError("failed to configure vmnet IPv4 subnet: \(describeVMNetStatus(subnetStatus))")
+        }
+
+        var ethernetAddress = macAddress.ethernetAddress
+        let reservationStatus = vmnet_network_configuration_add_dhcp_reservation(configuration, &ethernetAddress, &reservedGuestAddress)
+        guard reservationStatus.rawValue == 1000 else {
+            throw MSLRuntimeError("failed to reserve vmnet DHCP address: \(describeVMNetStatus(reservationStatus))")
+        }
+
+        guard let network = vmnet_network_create(configuration, &status) else {
+            throw MSLRuntimeError("failed to create vmnet network: \(describeVMNetStatus(status))")
+        }
+
+        let attachment = VZVmnetNetworkDeviceAttachment(network: network)
+        logger?.log("vmnet_network_created", fields: [
+            "instance": instanceName,
+            "subnet_ipv4": topology.subnetIPv4,
+            "subnet_mask_ipv4": topology.subnetMaskIPv4,
+            "host_ipv4": topology.hostIPv4,
+            "guest_ipv4": topology.guestIPv4,
+            "guest_mac": topology.guestMACAddress
+        ])
+        return (attachment, macAddress, topology, network)
+    }
+
+    private func parseIPv4Address(_ value: String) -> in_addr? {
+        var address = in_addr()
+        let result = value.withCString {
+            inet_pton(AF_INET, $0, &address)
+        }
+        return result == 1 ? address : nil
+    }
+
+    private func releaseVMNetObject(_ object: OpaquePointer) {
+        Unmanaged<AnyObject>.fromOpaque(UnsafeRawPointer(object)).release()
+    }
+
+    private func describeVMNetStatus(_ status: vmnet_return_t) -> String {
+        switch Int(status.rawValue) {
+        case 1000: return "success"
+        case 1001: return "failure"
+        case 1002: return "memory_or_authorization_failure"
+        case 1003: return "invalid_argument"
+        case 1004: return "setup_incomplete"
+        case 1005: return "invalid_access"
+        case 1006: return "packet_too_big"
+        case 1007: return "buffer_exhausted"
+        case 1008: return "too_many_packets"
+        case 1009: return "sharing_service_busy"
+        case 1010: return "not_authorized"
+        default: return "status_\(status.rawValue)"
+        }
+    }
+    #endif
 
     private func resolveLinuxBootLoaderIfRequested() throws -> VZLinuxBootLoader? {
         let env = ProcessInfo.processInfo.environment
@@ -607,6 +720,7 @@ public final class VirtualMachineRunner {
         let diagnosticAttachment = makeDiagnosticAttachment(instanceName: metadata.instanceName)
         let configStartMs = monotonicMs()
         let configuration = try buildConfiguration(
+            instanceName: metadata.instanceName,
             diskURL: diskURL,
             machineIdentifierURL: metadata.machineIdentifierURL,
             efiVariableStoreURL: metadata.efiVariableStoreURL,
@@ -783,6 +897,13 @@ public final class VirtualMachineRunner {
         self.balloonDevice = nil
         self.balloonCurrentTargetBytes = nil
         self.balloonReturnedTotalBytes = 0
+        activeNetworkTopology = nil
+        #if canImport(vmnet)
+        if let network = retainedVMNetNetwork {
+            releaseVMNetObject(network)
+            retainedVMNetNetwork = nil
+        }
+        #endif
         self.diagnosticCollector?.stop()
         self.diagnosticCollector = nil
         logger?.log("vm_daemon_stopped")
