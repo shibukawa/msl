@@ -19,11 +19,11 @@ APK_RETRY_LIMIT="5"
 usage() {
   cat >&2 <<'EOF_USAGE'
 usage:
-  imagewriter-build-guest.sh --mode stage1 --rootfs <rootfs-archive> --output <output-image> [--size-mb N] [--init-binary <path>] [--packages "<apk packages>"]
-  imagewriter-build-guest.sh --mode stage2 --rootfs <rootfs-archive> --output <output-image> [--size-mb N] [--init-binary <path>] [--packages "<apk packages>"]
+  imagewriter-build-guest.sh --mode stage1 --rootfs <rootfs-archive> --output <output-image> --size-mb <n> [--init-binary <path>] [--packages "<apk packages>"]
+  imagewriter-build-guest.sh --mode stage2 --rootfs <rootfs-archive> --output <output-image> --size-mb <n> [--init-binary <path>] [--packages "<apk packages>"]
 
 legacy:
-  imagewriter-build-guest.sh <rootfs-archive> <output-image> [btrfs|ext4] [size-mb] [init-binary]
+  imagewriter-build-guest.sh <rootfs-archive> <output-image> [btrfs|ext4] <size-mb> [init-binary]
 EOF_USAGE
 }
 
@@ -356,16 +356,14 @@ apply_btrfs_policy() {
   set_btrfs_compression "$mount_dir/var/cache/apt" none
 }
 
-resolve_size_from_rootfs() {
+resolve_size() {
+  if [ -z "$SIZE_MB" ]; then
+    echo "error: size-mb is required; msl install must pass an explicit size" >&2
+    exit 1
+  fi
   if [ "$SIZE_MB" -le 0 ] 2>/dev/null; then
-    rootfs_mb="$(du -sm "$ROOTFS_DIR" | awk '{print $1}')"
-    if [ -z "$rootfs_mb" ] || [ "$rootfs_mb" -le 0 ]; then
-      rootfs_mb=256
-    fi
-    SIZE_MB=$((rootfs_mb + rootfs_mb / 2 + 512))
-    if [ "$SIZE_MB" -lt 1024 ]; then
-      SIZE_MB=1024
-    fi
+    echo "error: size-mb must be a positive integer" >&2
+    exit 1
   fi
 }
 
@@ -499,7 +497,7 @@ case "$MODE" in
     install_init_binary
     install_packages
     progress_step "installed stage packages"
-    resolve_size_from_rootfs
+    resolve_size
     build_from_source_dir "$ROOTFS_DIR"
     ;;
 esac

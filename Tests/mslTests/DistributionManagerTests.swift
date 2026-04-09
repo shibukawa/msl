@@ -459,6 +459,86 @@ final class DistributionManagerTests: XCTestCase {
         }
     }
 
+    func testCreateImageWithImagewriterUses64GiBDefaultWhenDiskSizeIsNil() throws {
+        let ctx = try DistributionContext.make()
+        defer { ctx.cleanup() }
+
+        let localTarball = ctx.root.appendingPathComponent("rootfs.tar.gz", isDirectory: false)
+        try Data("not-a-real-tarball".utf8).write(to: localTarball)
+
+        let fakeInit = ctx.root.appendingPathComponent("msl-init-fake", isDirectory: false)
+        try Data(repeating: 0x42, count: 64).write(to: fakeInit)
+        setenv("MSL_INIT_BINARY_PATH", fakeInit.path, 1)
+        defer { unsetenv("MSL_INIT_BINARY_PATH") }
+
+        let recordedSize = ctx.root.appendingPathComponent("imagewriter-size.txt", isDirectory: false)
+        let fakeImagewriter = ctx.root.appendingPathComponent("imagewriter-success.sh", isDirectory: false)
+        try ctx.makeShellScript(
+            at: fakeImagewriter,
+            contents: """
+            #!/bin/sh
+            printf '%s' "$IMAGE_SIZE_MB" > "\(recordedSize.path)"
+            : > "$OUTPUT_RAW"
+            exit 0
+            """
+        )
+        setenv("MSL_IMAGEWRITER_BUILD_SCRIPT", fakeImagewriter.path, 1)
+        defer { unsetenv("MSL_IMAGEWRITER_BUILD_SCRIPT") }
+
+        let manager = ctx.makeManager()
+        _ = try manager.createImageWithImagewriter(
+            name: "dev",
+            targetAlias: nil,
+            localFilePath: localTarball.path,
+            rebuild: false,
+            diskSizeGB: nil,
+            mslExecutablePath: "/usr/bin/true"
+        )
+
+        let size = try String(contentsOf: recordedSize, encoding: .utf8)
+        XCTAssertEqual(size, "65536")
+    }
+
+    func testCreateImageWithImagewriterHonorsExplicitDiskSizeGB() throws {
+        let ctx = try DistributionContext.make()
+        defer { ctx.cleanup() }
+
+        let localTarball = ctx.root.appendingPathComponent("rootfs.tar.gz", isDirectory: false)
+        try Data("not-a-real-tarball".utf8).write(to: localTarball)
+
+        let fakeInit = ctx.root.appendingPathComponent("msl-init-fake", isDirectory: false)
+        try Data(repeating: 0x43, count: 64).write(to: fakeInit)
+        setenv("MSL_INIT_BINARY_PATH", fakeInit.path, 1)
+        defer { unsetenv("MSL_INIT_BINARY_PATH") }
+
+        let recordedSize = ctx.root.appendingPathComponent("imagewriter-size-explicit.txt", isDirectory: false)
+        let fakeImagewriter = ctx.root.appendingPathComponent("imagewriter-success-explicit.sh", isDirectory: false)
+        try ctx.makeShellScript(
+            at: fakeImagewriter,
+            contents: """
+            #!/bin/sh
+            printf '%s' "$IMAGE_SIZE_MB" > "\(recordedSize.path)"
+            : > "$OUTPUT_RAW"
+            exit 0
+            """
+        )
+        setenv("MSL_IMAGEWRITER_BUILD_SCRIPT", fakeImagewriter.path, 1)
+        defer { unsetenv("MSL_IMAGEWRITER_BUILD_SCRIPT") }
+
+        let manager = ctx.makeManager()
+        _ = try manager.createImageWithImagewriter(
+            name: "dev",
+            targetAlias: nil,
+            localFilePath: localTarball.path,
+            rebuild: false,
+            diskSizeGB: 16,
+            mslExecutablePath: "/usr/bin/true"
+        )
+
+        let size = try String(contentsOf: recordedSize, encoding: .utf8)
+        XCTAssertEqual(size, "16384")
+    }
+
     func testImagewriterStopArgumentsUseStopSubcommand() {
         XCTAssertEqual(
             DistributionManager.imagewriterStopArguments(instanceName: "_imagewriter"),
@@ -736,6 +816,13 @@ private struct DistributionContext {
         let dir = path.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         try Data("#!/bin/sh\nexit 0\n".utf8).write(to: path, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: path.path)
+    }
+
+    func makeShellScript(at path: URL, contents: String) throws {
+        let dir = path.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try Data(contents.utf8).write(to: path, options: .atomic)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: path.path)
     }
 

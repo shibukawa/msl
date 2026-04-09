@@ -223,7 +223,7 @@ case "$IMAGE_FS" in
 esac
 
 OUTPUT_RAW="${OUTPUT_RAW:-$APP_SUPPORT/images/imagewriter-${IMAGE_FS}.raw}"
-IMAGE_SIZE_MB="${IMAGE_SIZE_MB:-0}"
+IMAGE_SIZE_MB="${IMAGE_SIZE_MB:-}"
 TWO_STAGE_BTRFS=0
 
 if [ "$IMAGE_FS" = "btrfs" ]; then
@@ -237,6 +237,11 @@ fi
 if [ "$TWO_STAGE_BTRFS" -eq 1 ] && [ -z "$INIT_BINARY_PATH" ]; then
   echo "error: IMAGEWRITER_INIT_BINARY is required for _imagewriter disk builds (missing /sbin/msl-init risk)." >&2
   echo "hint: export MSL_INIT_BINARY_PATH or run make build-init, then re-run make build-imagewriter." >&2
+  exit 1
+fi
+
+if [ -z "$IMAGE_SIZE_MB" ]; then
+  echo "error: IMAGE_SIZE_MB is required; msl install must pass an explicit size." >&2
   exit 1
 fi
 
