@@ -107,6 +107,7 @@ struct ProcessExecutor {
 
 final class DistributionManager {
     static let reservedInternalInstanceNames: Set<String> = ["_imagewriter"]
+    static let defaultImagewriterDiskSizeGB = 64
 
     private let paths: MSLPaths
     private let logger: MSLLogger
@@ -468,7 +469,8 @@ final class DistributionManager {
         do {
             let tarballURL = URL(fileURLWithPath: verified.tarballPath)
             let imagewriterScript = try resolveImagewriterBuildScriptPath(mslExecutablePath: mslExecutablePath)
-            let requestedSizeMB = max(0, (diskSizeGB ?? 0) * 1024)
+            let requestedSizeGB = diskSizeGB ?? Self.defaultImagewriterDiskSizeGB
+            let requestedSizeMB = max(1, requestedSizeGB) * 1024
             let initBinaryPath = try resolveImagewriterInitBinaryPath()
 
             emitStatus("install: creating btrfs disk image via imagewriter")
