@@ -605,9 +605,11 @@ public struct MSLConfig: Codable, Equatable {
     }
 
     public struct NetworkConfig: Codable, Equatable {
+        public var mode: String?
         public var dns: NetworkDNSConfig?
 
-        public init(dns: NetworkDNSConfig? = nil) {
+        public init(mode: String? = nil, dns: NetworkDNSConfig? = nil) {
+            self.mode = mode
             self.dns = dns
         }
     }

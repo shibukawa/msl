@@ -28,7 +28,15 @@ final class RuntimeControlTests: XCTestCase {
         let item = RuntimePortStatusItem(
             instance: "ubuntu",
             hostPort: 8080, guestPort: 80,
-            bindAddress: "127.0.0.1", active: true, ownerInstance: "alpine", error: nil
+            bindAddress: "127.0.0.1",
+            source: "auto",
+            active: true,
+            ownerInstance: "alpine",
+            guestAddress: "192.168.64.8",
+            localhostEndpoint: "127.0.0.1:8080",
+            hostnameEndpoint: "ubuntu.msl.localhost:8080",
+            directEndpoint: "192.168.64.8:80",
+            error: nil
         )
         let resp = RuntimeControlResponse(ok: true, error: nil, items: [item])
         let data = try JSONEncoder().encode(resp)
@@ -39,6 +47,9 @@ final class RuntimeControlTests: XCTestCase {
         XCTAssertEqual(decoded.items?.first?.guestPort, 80)
         XCTAssertEqual(decoded.items?.first?.ownerInstance, "alpine")
         XCTAssertEqual(decoded.items?.first?.active, true)
+        XCTAssertEqual(decoded.items?.first?.source, "auto")
+        XCTAssertEqual(decoded.items?.first?.guestAddress, "192.168.64.8")
+        XCTAssertEqual(decoded.items?.first?.directEndpoint, "192.168.64.8:80")
     }
 
     // MARK: - U11: New ops request/response format

@@ -101,6 +101,21 @@ public final class RuntimeManager {
         let value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
 
         let prefix = "storageCacheToggles."
+        if path == "network.mode" {
+            let mode = value.lowercased()
+            guard mode == "auto" || mode == "vmnet" || mode == "nat" else {
+                throw MSLRuntimeError("invalid network.mode '\(value)'. supported: auto|vmnet|nat")
+            }
+            var config = try defaultInstanceStore.loadConfig()
+            var network = config.network ?? MSLConfig.NetworkConfig()
+            network.mode = mode
+            config.network = network
+            try defaultInstanceStore.saveConfig(config)
+            logger.log("config_network_mode_updated", fields: ["mode": mode])
+            print("config updated: network.mode=\(mode)")
+            Foundation.exit(0)
+        }
+
         if path == "network.dns.mode" {
             let mode = value.lowercased()
             guard mode == "host" || mode == "manual" || mode == "unmanaged" else {
@@ -154,7 +169,7 @@ public final class RuntimeManager {
 
         guard path.hasPrefix(prefix) else {
             throw MSLRuntimeError(
-                "unsupported config key '\(path)'. supported: storageCacheToggles.<name>, network.dns.mode, network.dns.manualNameservers, network.dns.manualSearchDomains"
+                "unsupported config key '\(path)'. supported: storageCacheToggles.<name>, network.mode, network.dns.mode, network.dns.manualNameservers, network.dns.manualSearchDomains"
             )
         }
 
@@ -1066,11 +1081,30 @@ public final class RuntimeManager {
             throw MSLRuntimeError(response.error ?? "failed to fetch dns status")
         }
         let meta = response.meta ?? [:]
+        let runtimePorts: [RuntimePortStatusItem] = (try? daemonClient.send(
+            RuntimeControlRequest(op: "port_ls", instance: target.instanceName)
+        ).items) ?? []
         print("instance: \(target.instanceName)")
-        print("mode: \(meta["dns_mode"] ?? "unknown")")
-        print("status: \(meta["dns_status"] ?? "unknown")")
-        print("action: \(meta["dns_action"] ?? "-")")
-        print("source: \(meta["dns_source"] ?? "-")")
+        print("configuredNetworkMode: \(meta["configured_network_mode"] ?? ConfiguredNetworkMode.auto.rawValue)")
+        print("effectiveNetworkMode: \(meta["effective_network_mode"] ?? EffectiveNetworkMode.nat.rawValue)")
+        print("networkMode: \(meta["network_mode"] ?? EffectiveNetworkMode.nat.rawValue)")
+        if let reason = meta["network_mode_reason"], !reason.isEmpty {
+            print("networkModeReason: \(reason)")
+        }
+        print("sharedSubnetIPv4: \(meta["shared_subnet_ipv4"] ?? "-")")
+        print("sharedSubnetMaskIPv4: \(meta["shared_subnet_mask_ipv4"] ?? "-")")
+        print("guestPrivateIPv4: \(meta["guest_private_ipv4"] ?? "-")")
+        print("hostGatewayIPv4: \(meta["host_gateway_ipv4"] ?? "-")")
+        print("hostAlias: \(meta["host_alias"] ?? "-")")
+        print("hostAliasEndpoint: \(meta["host_alias_endpoint"] ?? "-")")
+        print("serviceHostname: \(meta["service_hostname"] ?? "-")")
+        print("serviceHostPattern: \(meta["service_host_pattern"] ?? "-")")
+        print("hostHostsStatus: \(meta["host_hosts_status"] ?? "unknown")")
+        print("guestHostsStatus: \(meta["guest_hosts_status"] ?? "unknown")")
+        print("dnsMode: \(meta["dns_mode"] ?? "unknown")")
+        print("dnsStatus: \(meta["dns_status"] ?? "unknown")")
+        print("dnsAction: \(meta["dns_action"] ?? "-")")
+        print("dnsSource: \(meta["dns_source"] ?? "-")")
         print("nameservers: \(meta["nameserver_count"] ?? "0")")
         print("searchDomains: \(meta["search_domain_count"] ?? "0")")
         if let errorClass = meta["error_class"], !errorClass.isEmpty {
@@ -1079,6 +1113,14 @@ public final class RuntimeManager {
         if let error = meta["error"], !error.isEmpty {
             print("error: \(error)")
         }
+        if let hostHostsError = meta["host_hosts_error"], !hostHostsError.isEmpty {
+            print("hostHostsError: \(hostHostsError)")
+        }
+        if let guestHostsError = meta["guest_hosts_error"], !guestHostsError.isEmpty {
+            print("guestHostsError: \(guestHostsError)")
+        }
+        print("")
+        renderPortStatusTable(runtimePorts, manualHostPorts: [])
     }
 
     public func runNetworkDNSReconcile(instanceName: String? = nil) throws {
@@ -1252,19 +1294,39 @@ public final class RuntimeManager {
                     guestPort: $0.guestPort,
                     bindAddress: $0.bindAddress,
                     createdAtEpochMs: nowEpochMs(),
-                    instance: $0.instance ?? target.instanceName
+                    instance: $0.instance ?? target.instanceName,
+                    source: $0.source ?? "manual"
                 )
             }
         }
-
-        print("HOST\tGUEST\tBIND\tSOURCE\tSTATE\tDETAIL")
-        for mapping in mappings {
-            let item = runtimeStatus.first(where: { $0.hostPort == mapping.hostPort })
-            let source = manualHostPorts.contains(mapping.hostPort) ? "manual" : "auto"
-            let status = (item?.active == true) ? "active" : "inactive"
-            let detail = item?.error?.replacingOccurrences(of: "\n", with: " ") ?? "-"
-            print("\(mapping.hostPort)\t\(mapping.guestPort)\t\(mapping.bindAddress)\t\(source)\t\(status)\t\(detail)")
+        let renderedItems: [RuntimePortStatusItem]
+        if !runtimeStatus.isEmpty {
+            renderedItems = runtimeStatus
+        } else {
+            let resolvedNetworkMode = NetworkModeResolver.resolve(
+                configured: NetworkModeResolver.configuredMode(from: try? defaultInstanceStore.loadConfig()),
+                executablePath: executablePath
+            )
+            renderedItems = mappings.map { mapping in
+                RuntimePortStatusItem(
+                    instance: mapping.instance,
+                    hostPort: mapping.hostPort,
+                    guestPort: mapping.guestPort,
+                    bindAddress: mapping.bindAddress,
+                    source: mapping.source,
+                    active: false,
+                    ownerInstance: nil,
+                    guestAddress: nil,
+                    localhostEndpoint: "\(mapping.bindAddress):\(mapping.hostPort)",
+                    hostnameEndpoint: resolvedNetworkMode.effective == .vmnetShared && mapping.bindAddress == "127.0.0.1"
+                        ? "\(NetworkIdentity.serviceHostname(for: mapping.instance)):\(mapping.hostPort)"
+                        : nil,
+                    directEndpoint: nil,
+                    error: nil
+                )
+            }
         }
+        renderPortStatusTable(renderedItems, manualHostPorts: manualHostPorts)
     }
 
     public func removePortMapping(_ hostPortArg: String, instanceName: String? = nil) throws {
@@ -1492,7 +1554,11 @@ public final class RuntimeManager {
                 logger: logger,
                 initProbeHandler: { [weak self] probe in
                     self?.updateInitChannelState(probe)
-                }
+                },
+                networkMode: NetworkModeResolver.resolve(
+                    configured: NetworkModeResolver.configuredMode(from: try? defaultInstanceStore.loadConfig()),
+                    executablePath: executablePath
+                ).effective
             )
             return try runner.runAttachedConsole()
         } catch {
@@ -1595,6 +1661,25 @@ public final class RuntimeManager {
             throw MSLRuntimeError("invalid mapping '\(raw)'. ports must be in 1..65535")
         }
         return PortMapping(hostPort: hostPort, guestPort: guestPort, instance: instanceName)
+    }
+
+    private func renderPortStatusTable(_ items: [RuntimePortStatusItem], manualHostPorts: Set<Int>) {
+        if items.isEmpty {
+            print("no port mappings")
+            return
+        }
+        print("INSTANCE\tHOST\tGUEST\tBIND\tSOURCE\tSTATE\tLOCALHOST\tDIRECT\tHOSTNAME\tDETAIL")
+        for item in items.sorted(by: {
+            ($0.instance ?? "", $0.hostPort, $0.guestPort) < ($1.instance ?? "", $1.hostPort, $1.guestPort)
+        }) {
+            let source = item.source ?? (manualHostPorts.contains(item.hostPort) ? "manual" : "auto")
+            let status = item.active ? "active" : "inactive"
+            let localhost = item.localhostEndpoint ?? "\(item.bindAddress):\(item.hostPort)"
+            let direct = item.directEndpoint ?? "-"
+            let hostname = item.hostnameEndpoint ?? "-"
+            let detail = item.error?.replacingOccurrences(of: "\n", with: " ") ?? "-"
+            print("\(item.instance ?? "-")\t\(item.hostPort)\t\(item.guestPort)\t\(item.bindAddress)\t\(source)\t\(status)\t\(localhost)\t\(direct)\t\(hostname)\t\(detail)")
+        }
     }
 
     private func isInstanceRunning(_ state: RuntimeState, instanceName: String) -> Bool {
