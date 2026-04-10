@@ -698,7 +698,7 @@ public final class VirtualMachineRunner {
                 entry: "clock.epoch_ms=\(hostEpochMs)"
             ),
             .init(
-                targetKind: .environment,
+                targetKind: .execEnv,
                 flags: 0,
                 entry: "TZ=\(hostTimeZoneID)"
             )

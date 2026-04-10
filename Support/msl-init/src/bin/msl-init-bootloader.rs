@@ -23,6 +23,8 @@ const REQUIRED_FLAG: u8 = 0x01;
 const MIN_PAYLOAD_BYTES: usize = 4096;
 const MAX_METADATA_RECORDS: u32 = 256;
 const MAX_METADATA_ENTRY_BYTES: u32 = 64 * 1024;
+const RUNTIME_INIT_DIR: &str = "/run/msl-init";
+const RUNTIME_INIT_BINARY: &str = "/run/msl-init/msl-init";
 
 #[repr(C)]
 struct SockaddrVm {
@@ -114,11 +116,8 @@ fn determine_init_mode(self_path: &Path) -> &'static str {
 }
 
 fn determine_exec_target(self_path: &Path) -> &'static str {
-    if self_path.starts_with("/sbin/") {
-        "/sbin/msl-init"
-    } else {
-        "/usr/local/bin/msl-init"
-    }
+    let _ = self_path;
+    RUNTIME_INIT_BINARY
 }
 
 fn connect_vsock_with_timeout(port: u32, timeout: Duration) -> Result<std::fs::File, String> {
@@ -408,10 +407,8 @@ fn validate_payload(payload: &[u8]) -> Result<(), String> {
 }
 
 fn install_payload(payload: &[u8]) -> Result<(), String> {
-    for target in ["/sbin/msl-init", "/usr/local/bin/msl-init"] {
-        install_payload_at(payload, Path::new(target))?;
-    }
-    Ok(())
+    ensure_runtime_init_dir()?;
+    install_payload_at(payload, Path::new(RUNTIME_INIT_BINARY))
 }
 
 fn install_payload_at(payload: &[u8], target: &Path) -> Result<(), String> {
@@ -441,6 +438,75 @@ fn install_payload_at(payload: &[u8], target: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn ensure_runtime_init_dir() -> Result<(), String> {
+    let run_path = Path::new("/run");
+    if !run_path.exists() {
+        fs::create_dir_all(run_path).map_err(|e| format!("create /run failed: {e}"))?;
+    }
+    if let Err(err) = mount_tmpfs_if_needed(run_path) {
+        eprintln!("warning: failed to ensure /run tmpfs: {err}");
+    }
+    fs::create_dir_all(RUNTIME_INIT_DIR)
+        .map_err(|e| format!("create {} failed: {e}", RUNTIME_INIT_DIR))?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn mount_tmpfs_if_needed(target: &Path) -> Result<(), String> {
+    match fs::read_to_string("/proc/self/mountinfo") {
+        Ok(mountinfo) => {
+            if mountinfo.lines().any(|line| {
+                let mut fields = line.split_whitespace();
+                let _mount_id = fields.next();
+                let _parent_id = fields.next();
+                let _major_minor = fields.next();
+                let _root = fields.next();
+                let mount_point = fields.next();
+                mount_point == Some("/run")
+            }) {
+                return Ok(());
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            // Early in direct-init boot, /proc may not be mounted yet. In that
+            // case, optimistically attempt the tmpfs mount for /run.
+        }
+        Err(err) => {
+            return Err(format!("read /proc/self/mountinfo failed: {err}"));
+        }
+    }
+
+    let source = b"tmpfs\0";
+    let fstype = b"tmpfs\0";
+    let options = b"mode=0755\0";
+    let target_cstr = std::ffi::CString::new(target.as_os_str().as_encoded_bytes().to_vec())
+        .map_err(|e| format!("invalid /run path for mount: {e}"))?;
+    let rc = unsafe {
+        libc::mount(
+            source.as_ptr() as *const libc::c_char,
+            target_cstr.as_ptr(),
+            fstype.as_ptr() as *const libc::c_char,
+            0,
+            options.as_ptr() as *const libc::c_void,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EBUSY) {
+            Ok(())
+        } else {
+            Err(err.to_string())
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn mount_tmpfs_if_needed(_target: &Path) -> Result<(), String> {
+    Ok(())
+}
+
 fn temp_path_for(target: &Path) -> PathBuf {
     let pid = std::process::id();
     let file_name = target
@@ -465,29 +531,29 @@ mod tests {
     #[test]
     fn determine_paths_from_invocation_path() {
         assert_eq!(determine_init_mode(Path::new("/sbin/msl-init-bootloader")), "direct-init");
-        assert_eq!(determine_exec_target(Path::new("/sbin/msl-init-bootloader")), "/sbin/msl-init");
+        assert_eq!(determine_exec_target(Path::new("/sbin/msl-init-bootloader")), RUNTIME_INIT_BINARY);
         assert_eq!(determine_init_mode(Path::new("/usr/local/bin/msl-init-bootloader")), "service-managed-init");
-        assert_eq!(determine_exec_target(Path::new("/usr/local/bin/msl-init-bootloader")), "/usr/local/bin/msl-init");
+        assert_eq!(determine_exec_target(Path::new("/usr/local/bin/msl-init-bootloader")), RUNTIME_INIT_BINARY);
     }
 
     #[test]
     fn read_metadata_block_parses_multiple_records() {
         let bytes = metadata_bytes(&[
             (1_u8, REQUIRED_FLAG, "clock.epoch_ms=1775800000123"),
-            (2_u8, 0_u8, "TZ=Asia/Tokyo"),
+            (3_u8, 0_u8, "TZ=Asia/Tokyo"),
             (3_u8, 0_u8, "DISPLAY=/tmp/.X11-unix/X0"),
         ]);
         let records = read_metadata_block(&mut Cursor::new(bytes)).unwrap();
         assert_eq!(records.len(), 3);
         assert_eq!(records[0].target_kind, TargetKind::Bootloader);
         assert!(records[0].is_required());
-        assert_eq!(records[1].target_kind, TargetKind::Environment);
+        assert_eq!(records[1].target_kind, TargetKind::ExecEnv);
         assert_eq!(records[2].target_kind, TargetKind::ExecEnv);
     }
 
     #[test]
     fn read_metadata_block_rejects_truncated_record() {
-        let mut bytes = metadata_bytes(&[(2_u8, 0_u8, "TZ=Asia/Tokyo")]);
+        let mut bytes = metadata_bytes(&[(3_u8, 0_u8, "TZ=Asia/Tokyo")]);
         bytes.pop();
         assert!(read_metadata_block(&mut Cursor::new(bytes)).is_err());
     }
@@ -533,6 +599,17 @@ mod tests {
         let envs = build_exec_environment(vec!["TZ=Asia/Tokyo".to_string(), "DISPLAY=:0".to_string()]).unwrap();
         assert!(envs.iter().any(|(k, v)| k == &OsString::from("TZ") && v == &OsString::from("Asia/Tokyo")));
         assert!(envs.iter().any(|(k, v)| k == &OsString::from("DISPLAY") && v == &OsString::from(":0")));
+    }
+
+    #[test]
+    fn install_payload_uses_runtime_path() {
+        let temp_dir = std::env::temp_dir().join(format!("msl-init-bootloader-test-{}", std::process::id()));
+        let target = temp_dir.join("msl-init");
+        let payload = vec![0_u8; MIN_PAYLOAD_BYTES];
+        fs::create_dir_all(&temp_dir).unwrap();
+        install_payload_at(&payload, &target).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), payload);
+        fs::remove_dir_all(&temp_dir).unwrap();
     }
 
     #[test]

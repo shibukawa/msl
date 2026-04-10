@@ -400,6 +400,32 @@ public final class DaemonServer {
     fi
     mount --bind /run/msl/tmp /tmp
     chmod 1777 /tmp
+    root_fstype="$(findmnt -n -o FSTYPE / 2>/dev/null || true)"
+    if [ "$root_fstype" = "erofs" ]; then
+      phase="ephemeral_state"
+      mkdir -p /run/msl/tmp/var /run/msl/tmp/etc
+      if [ -d /var ]; then
+        cp -a /var/. /run/msl/tmp/var/ >/dev/null 2>&1 || true
+      fi
+      mkdir -p /run/msl/tmp/var/log /run/msl/tmp/var/tmp /run/msl/tmp/var/devcontainer
+      chmod 1777 /run/msl/tmp/var/tmp
+      if ! mountpoint -q /var; then
+        mount --bind /run/msl/tmp/var /var
+      fi
+      chmod 1777 /var/tmp >/dev/null 2>&1 || true
+      for etc_name in hosts resolv.conf; do
+        src="/etc/$etc_name"
+        dst="/run/msl/tmp/etc/$etc_name"
+        if [ -f "$src" ]; then
+          cp -f "$src" "$dst" >/dev/null 2>&1 || true
+        else
+          : > "$dst"
+        fi
+        if [ -e "$src" ]; then
+          mount --bind "$dst" "$src"
+        fi
+      done
+    fi
     echo "phase=done"
     """
     private static let legacyHostSharePrepareScript = """
@@ -4956,6 +4982,10 @@ public final class DaemonServer {
             return "\(key)=\"\(escapedValue)\""
         }
         return """
+    root_fstype="$(findmnt -n -o FSTYPE / 2>/dev/null || true)"
+    if [ "$root_fstype" = "erofs" ]; then
+      exit 0
+    fi
     cat >> /etc/environment <<'etcEnvironmentEOF'
 
     \(lines.joined(separator: "\n"))
@@ -4964,7 +4994,13 @@ public final class DaemonServer {
     }
 
     static func makeVSCodePatchEtcProfileCommand() -> String {
-        "sed -i -E 's/((^|\\\\s)PATH=)([^\\\\$]*)$/\\\\1\\${PATH:-\\\\3}/g' /etc/profile || true"
+        """
+    root_fstype="$(findmnt -n -o FSTYPE / 2>/dev/null || true)"
+    if [ "$root_fstype" = "erofs" ]; then
+      exit 0
+    fi
+    sed -i -E 's/((^|\\\\s)PATH=)([^\\\\$]*)$/\\\\1\\${PATH:-\\\\3}/g' /etc/profile || true
+    """
     }
 
     static func makeVSCodeRuntimeEnvironment(user: String, home: String, shell: String) -> [String: String] {

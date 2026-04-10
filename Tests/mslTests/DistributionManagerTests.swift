@@ -483,7 +483,7 @@ final class DistributionManagerTests: XCTestCase {
         }
     }
 
-    func testCreateImageWithImagewriterUses64GiBDefaultWhenDiskSizeIsNil() throws {
+    func testCreateImageWithImagewriterUses16GiBDefaultWhenDiskSizeIsNil() throws {
         let ctx = try DistributionContext.make()
         defer { ctx.cleanup() }
 
@@ -520,7 +520,126 @@ final class DistributionManagerTests: XCTestCase {
         )
 
         let size = try String(contentsOf: recordedSize, encoding: .utf8)
-        XCTAssertEqual(size, "65536")
+        XCTAssertEqual(size, "16384")
+    }
+
+    func testCreateImageWithImagewriterRequiresExistingErofsImagewriter() throws {
+        let ctx = try DistributionContext.make()
+        defer { ctx.cleanup() }
+
+        let localTarball = ctx.root.appendingPathComponent("rootfs.tar.gz", isDirectory: false)
+        try Data("not-a-real-tarball".utf8).write(to: localTarball)
+
+        let fakeInit = ctx.root.appendingPathComponent("msl-init-bootloader-fake-require-erofs", isDirectory: false)
+        try Data(repeating: 0x42, count: 64).write(to: fakeInit)
+        setenv("MSL_INIT_BOOTLOADER_BINARY_PATH", fakeInit.path, 1)
+        defer { unsetenv("MSL_INIT_BOOTLOADER_BINARY_PATH") }
+
+        let recordedEnv = ctx.root.appendingPathComponent("imagewriter-env.txt", isDirectory: false)
+        let fakeImagewriter = ctx.root.appendingPathComponent("imagewriter-success-record-env.sh", isDirectory: false)
+        try ctx.makeShellScript(
+            at: fakeImagewriter,
+            contents: """
+            #!/bin/sh
+            {
+              printf 'allow=%s\n' "$IMAGEWRITER_ALLOW_SETUP_WHEN_MISSING"
+              printf 'required_fs=%s\n' "$IMAGEWRITER_REQUIRED_FS"
+              printf 'force_setup=%s\n' "$IMAGEWRITER_FORCE_SETUP"
+            } > "\(recordedEnv.path)"
+            : > "$OUTPUT_RAW"
+            exit 0
+            """
+        )
+        setenv("MSL_IMAGEWRITER_BUILD_SCRIPT", fakeImagewriter.path, 1)
+        defer { unsetenv("MSL_IMAGEWRITER_BUILD_SCRIPT") }
+
+        let manager = ctx.makeManager()
+        _ = try manager.createImageWithImagewriter(
+            name: "dev",
+            targetAlias: nil,
+            localFilePath: localTarball.path,
+            rebuild: false,
+            diskSizeGB: nil,
+            mslExecutablePath: "/usr/bin/true"
+        )
+
+        let recorded = try String(contentsOf: recordedEnv, encoding: .utf8)
+        XCTAssertTrue(recorded.contains("allow=0"))
+        XCTAssertTrue(recorded.contains("required_fs=erofs"))
+        XCTAssertTrue(recorded.contains("force_setup=0"))
+    }
+
+    func testCreateImageUses1GiBDefaultForInternalImagewriterWhenDiskSizeIsNil() throws {
+        let ctx = try DistributionContext.make()
+        defer { ctx.cleanup() }
+
+        let localTarball = ctx.root.appendingPathComponent("rootfs-imagewriter.tar.gz", isDirectory: false)
+        let rootfsDir = ctx.root.appendingPathComponent("rootfs-imagewriter-src", isDirectory: true)
+        try FileManager.default.createDirectory(at: rootfsDir, withIntermediateDirectories: true)
+        let tar = Process()
+        tar.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
+        tar.arguments = ["-czf", localTarball.path, "-C", rootfsDir.path, "."]
+        try tar.run()
+        tar.waitUntilExit()
+        XCTAssertEqual(tar.terminationStatus, 0)
+
+        let recordedSize = ctx.root.appendingPathComponent("bootstrap-size.txt", isDirectory: false)
+        let fakeMkfs = ctx.root.appendingPathComponent("fake-mkfs.sh", isDirectory: false)
+        try ctx.makeShellScript(
+            at: fakeMkfs,
+            contents: """
+            #!/bin/sh
+            while [ "$#" -gt 0 ]; do
+              case "$1" in
+                --size-gb)
+                  shift
+                  printf '%s' "$1" > "\(recordedSize.path)"
+                  ;;
+              esac
+              shift
+            done
+            exit 0
+            """
+        )
+        setenv("MSL_EXT4_MKFS_HELPER_PATH", fakeMkfs.path, 1)
+        defer { unsetenv("MSL_EXT4_MKFS_HELPER_PATH") }
+
+        let fakePopulate = ctx.root.appendingPathComponent("fake-populate.sh", isDirectory: false)
+        try ctx.makeShellScript(
+            at: fakePopulate,
+            contents: """
+            #!/bin/sh
+            while [ "$#" -gt 0 ]; do
+              case "$1" in
+                --output)
+                  shift
+                  : > "$1"
+                  ;;
+              esac
+              shift
+            done
+            exit 0
+            """
+        )
+        setenv("MSL_EXT4_HELPER_PATH", fakePopulate.path, 1)
+        defer { unsetenv("MSL_EXT4_HELPER_PATH") }
+
+        let fakeInit = ctx.root.appendingPathComponent("msl-init-bootloader-fake-bootstrap-size", isDirectory: false)
+        try Data(repeating: 0x44, count: 64).write(to: fakeInit)
+        setenv("MSL_INIT_BOOTLOADER_BINARY_PATH", fakeInit.path, 1)
+        defer { unsetenv("MSL_INIT_BOOTLOADER_BINARY_PATH") }
+
+        let manager = ctx.makeManager()
+        _ = try manager.createImage(
+            name: "_imagewriter",
+            targetAlias: nil,
+            localFilePath: localTarball.path,
+            rebuild: false,
+            diskSizeGB: nil
+        )
+
+        let size = try String(contentsOf: recordedSize, encoding: .utf8)
+        XCTAssertEqual(size, "1")
     }
 
     func testCreateImageWithImagewriterHonorsExplicitDiskSizeGB() throws {
@@ -561,6 +680,74 @@ final class DistributionManagerTests: XCTestCase {
 
         let size = try String(contentsOf: recordedSize, encoding: .utf8)
         XCTAssertEqual(size, "16384")
+    }
+
+    func testCreateImageWithImagewriterReportsImagewriterVerifyStageHint() throws {
+        let ctx = try DistributionContext.make()
+        defer { ctx.cleanup() }
+
+        let localTarball = ctx.root.appendingPathComponent("rootfs.tar.gz", isDirectory: false)
+        try Data("not-a-real-tarball".utf8).write(to: localTarball)
+
+        let fakeInit = ctx.root.appendingPathComponent("msl-init-bootloader-fake-verify-stage", isDirectory: false)
+        try Data(repeating: 0x43, count: 64).write(to: fakeInit)
+        setenv("MSL_INIT_BOOTLOADER_BINARY_PATH", fakeInit.path, 1)
+        defer { unsetenv("MSL_INIT_BOOTLOADER_BINARY_PATH") }
+
+        let fakeImagewriter = ctx.root.appendingPathComponent("imagewriter-verify-stage.sh", isDirectory: false)
+        try Data("#!/bin/sh\nexit 24\n".utf8).write(to: fakeImagewriter)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeImagewriter.path)
+        setenv("MSL_IMAGEWRITER_BUILD_SCRIPT", fakeImagewriter.path, 1)
+        defer { unsetenv("MSL_IMAGEWRITER_BUILD_SCRIPT") }
+
+        let manager = ctx.makeManager()
+        XCTAssertThrowsError(try manager.createImageWithImagewriter(
+            name: "dev",
+            targetAlias: nil,
+            localFilePath: localTarball.path,
+            rebuild: false,
+            diskSizeGB: nil,
+            mslExecutablePath: "/usr/bin/true"
+        )) { error in
+            guard let runtime = error as? MSLRuntimeError else {
+                return XCTFail("unexpected error type: \(error)")
+            }
+            XCTAssertTrue(runtime.message.contains("stage=imagewriter_verify"))
+        }
+    }
+
+    func testCreateImageWithImagewriterReportsImagewriterMissingStageHint() throws {
+        let ctx = try DistributionContext.make()
+        defer { ctx.cleanup() }
+
+        let localTarball = ctx.root.appendingPathComponent("rootfs.tar.gz", isDirectory: false)
+        try Data("not-a-real-tarball".utf8).write(to: localTarball)
+
+        let fakeInit = ctx.root.appendingPathComponent("msl-init-bootloader-fake-missing-stage", isDirectory: false)
+        try Data(repeating: 0x44, count: 64).write(to: fakeInit)
+        setenv("MSL_INIT_BOOTLOADER_BINARY_PATH", fakeInit.path, 1)
+        defer { unsetenv("MSL_INIT_BOOTLOADER_BINARY_PATH") }
+
+        let fakeImagewriter = ctx.root.appendingPathComponent("imagewriter-missing-stage.sh", isDirectory: false)
+        try Data("#!/bin/sh\nexit 25\n".utf8).write(to: fakeImagewriter)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeImagewriter.path)
+        setenv("MSL_IMAGEWRITER_BUILD_SCRIPT", fakeImagewriter.path, 1)
+        defer { unsetenv("MSL_IMAGEWRITER_BUILD_SCRIPT") }
+
+        let manager = ctx.makeManager()
+        XCTAssertThrowsError(try manager.createImageWithImagewriter(
+            name: "dev",
+            targetAlias: nil,
+            localFilePath: localTarball.path,
+            rebuild: false,
+            diskSizeGB: nil,
+            mslExecutablePath: "/usr/bin/true"
+        )) { error in
+            guard let runtime = error as? MSLRuntimeError else {
+                return XCTFail("unexpected error type: \(error)")
+            }
+            XCTAssertTrue(runtime.message.contains("stage=imagewriter_missing"))
+        }
     }
 
     func testImagewriterStopArgumentsUseStopSubcommand() {

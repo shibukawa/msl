@@ -5,7 +5,7 @@ SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 ROOT_DIR="$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)"
 MSL_BIN="${MSL_BIN:-$ROOT_DIR/.build/debug/msl}"
 INSTANCE="${IMAGEWRITER_INSTANCE:-_imagewriter}"
-PACKAGES="${IMAGEWRITER_PACKAGES:-btrfs-progs e2fsprogs util-linux tar zstd xz coreutils}"
+PACKAGES="${IMAGEWRITER_PACKAGES:-btrfs-progs e2fsprogs erofs-utils util-linux tar zstd xz coreutils}"
 CLEAN_DISTROS="${IMAGEWRITER_CLEAN_DISTROS:-1}"
 REBUILD_BOOTSTRAP="${IMAGEWRITER_REBUILD_BOOTSTRAP:-1}"
 RETRY_LIMIT="${IMAGEWRITER_RETRY_LIMIT:-1}"
@@ -38,6 +38,16 @@ ensure_virtualization_entitlement() {
 
 ensure_virtualization_entitlement
 
+resolve_app_support() {
+  if [ -n "${MSL_HOME:-}" ]; then
+    printf '%s\n' "${MSL_HOME}/Library/Application Support/msl"
+  else
+    printf '%s\n' "${HOME}/Library/Application Support/msl"
+  fi
+}
+
+APP_SUPPORT="$(resolve_app_support)"
+
 msl_retry() {
   attempts=0
   while true; do
@@ -52,14 +62,18 @@ msl_retry() {
   done
 }
 
+instance_disk_path() {
+  printf '%s\n' "$APP_SUPPORT/distros/$INSTANCE/disk.raw"
+}
+
 instance_exists() {
-  "$MSL_BIN" --list 2>/dev/null | sed -e 's/ \[default\]$//' | awk '{print $1}' | grep -Fx "$INSTANCE" >/dev/null 2>&1
+  [ -f "$(instance_disk_path)" ]
 }
 
 if [ "$CLEAN_DISTROS" = "1" ]; then
   echo "cleaning distros before imagewriter setup..."
   "$MSL_BIN" stop >/dev/null 2>&1 || true
-  INSTANCES="$($MSL_BIN --list 2>/dev/null | sed -e 's/ \[default\]$//' | awk '{print $1}')"
+  INSTANCES="$($MSL_BIN list --all 2>/dev/null | sed -e 's/ \[default\]$//' | awk '{print $1}')"
   if [ -n "$INSTANCES" ]; then
     for name in $INSTANCES; do
       echo "uninstalling instance (keep cache): $name"
@@ -154,3 +168,4 @@ done
 
 echo "imagewriter setup completed"
 echo "instance: $INSTANCE"
+echo "bootstrap_fs: ext4"

@@ -55,10 +55,12 @@ final class DaemonServerBootstrapScriptTests: XCTestCase {
         XCTAssertTrue(command.contains("SHELL=\"/bin/bash\""))
         XCTAssertTrue(command.contains("USER=\"alice\""))
         XCTAssertTrue(command.contains("etcEnvironmentEOF"))
+        XCTAssertTrue(command.contains("if [ \"$root_fstype\" = \"erofs\" ]"))
     }
 
     func testVSCodePatchEtcProfileCommandMatchesVendorSed() {
         let command = DaemonServer.makeVSCodePatchEtcProfileCommand()
+        XCTAssertTrue(command.contains("if [ \"$root_fstype\" = \"erofs\" ]"))
         XCTAssertTrue(command.contains("sed -i -E"))
         XCTAssertTrue(command.contains("/etc/profile"))
         XCTAssertTrue(command.contains("PATH"))

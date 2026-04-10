@@ -10,13 +10,13 @@ final class InitBootTransferProtocolTests: XCTestCase {
     func testEncodeDecodeMetadataBlockRoundTrip() throws {
         let encoded = try MSLInitBootTransferProtocol.encodeMetadataBlock(records: [
             .init(targetKind: .bootloader, flags: MSLInitBootTransferProtocol.requiredFlag, entry: "clock.epoch_ms=1775800000123"),
-            .init(targetKind: .environment, flags: 0, entry: "TZ=Asia/Tokyo"),
+            .init(targetKind: .execEnv, flags: 0, entry: "TZ=Asia/Tokyo"),
             .init(targetKind: .execEnv, flags: 0, entry: "DISPLAY=/tmp/.X11-unix/X0")
         ])
         let decoded = MSLInitBootTransferProtocol.decodeMetadataBlock(encoded)
         XCTAssertEqual(decoded, [
             .init(targetKind: .bootloader, flags: MSLInitBootTransferProtocol.requiredFlag, entry: "clock.epoch_ms=1775800000123"),
-            .init(targetKind: .environment, flags: 0, entry: "TZ=Asia/Tokyo"),
+            .init(targetKind: .execEnv, flags: 0, entry: "TZ=Asia/Tokyo"),
             .init(targetKind: .execEnv, flags: 0, entry: "DISPLAY=/tmp/.X11-unix/X0")
         ])
     }
@@ -32,7 +32,7 @@ final class InitBootTransferProtocolTests: XCTestCase {
 
     func testDecodeMetadataBlockRejectsTruncatedRecord() throws {
         var encoded = try MSLInitBootTransferProtocol.encodeMetadataBlock(records: [
-            .init(targetKind: .environment, flags: 0, entry: "TZ=Asia/Tokyo")
+            .init(targetKind: .execEnv, flags: 0, entry: "TZ=Asia/Tokyo")
         ])
         encoded.removeLast()
         XCTAssertNil(MSLInitBootTransferProtocol.decodeMetadataBlock(encoded))

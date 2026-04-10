@@ -1614,6 +1614,33 @@ fn is_mountpoint(target: &str) -> bool {
     })
 }
 
+fn mount_fstype(target: &str) -> Option<String> {
+    let text = fs::read_to_string("/proc/self/mountinfo").ok()?;
+    for line in text.lines() {
+        let mut parts = line.split(" - ");
+        let left = parts.next()?;
+        let right = parts.next()?;
+        if parts.next().is_some() {
+            continue;
+        }
+
+        let mut left_fields = left.split_whitespace();
+        let _id = left_fields.next();
+        let _parent = left_fields.next();
+        let _majmin = left_fields.next();
+        let _root = left_fields.next();
+        let mount_point = left_fields.next()?;
+        if mount_point != target {
+            continue;
+        }
+
+        let mut right_fields = right.split_whitespace();
+        let fstype = right_fields.next()?;
+        return Some(fstype.to_string());
+    }
+    None
+}
+
 fn mount_fs_if_needed(target: &str, source: &[u8], fstype: &[u8], data: Option<&[u8]>) {
     if let Err(e) = fs::create_dir_all(target) {
         log_line(&format!("failed to create mountpoint {}: {}", target, e));
@@ -1667,6 +1694,9 @@ fn to_c_string_bytes(value: &str) -> Vec<u8> {
 }
 
 fn mount_virtiofs_macos_if_needed() -> Result<bool, String> {
+    if mount_fstype("/").as_deref() == Some("erofs") {
+        mount_fs_if_needed("/mnt", b"tmpfs\0", b"tmpfs\0", Some(b"mode=0755\0"));
+    }
     fs::create_dir_all("/mnt/macos")
         .map_err(|e| format!("failed to create /mnt/macos: {}", e))?;
     let source = b"macos\0";
@@ -2926,6 +2956,7 @@ fn host_share_prepare_response(request_id: &str, op: &str, line: &str) -> String
     let share_root = extract_string(line, "hostShareRoot")
         .and_then(|v| normalize_absolute_path(&v))
         .unwrap_or_else(|| "/".to_string());
+    let readonly_root = mount_fstype("/").as_deref() == Some("erofs");
 
     let source_root = if share_root == "/" {
         "/mnt/macos".to_string()
@@ -2948,7 +2979,7 @@ fn host_share_prepare_response(request_id: &str, op: &str, line: &str) -> String
     }
 
     let mut applied = false;
-    if share_root != "/" {
+    if !readonly_root && share_root != "/" {
         let root_applied = match bind_mount_if_needed(&source_root, &target_root) {
             Ok(v) => v,
             Err(e) => return error_response(request_id, op, "internal_error", &e),
@@ -2970,7 +3001,7 @@ fn host_share_prepare_response(request_id: &str, op: &str, line: &str) -> String
                 &format!("workspace source is not accessible: {}", source_workspace),
             );
         }
-        if share_root == "/" {
+        if !readonly_root && share_root == "/" {
             let workspace_applied = match bind_mount_if_needed(&source_workspace, &workspace_path) {
                 Ok(v) => v,
                 Err(e) => return error_response(request_id, op, "internal_error", &e),

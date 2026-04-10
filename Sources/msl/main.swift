@@ -232,9 +232,12 @@ struct ListCommand: ParsableCommand {
         abstract: "List installed instances."
     )
 
+    @Flag(name: [.long, .customLong("include-reserved")], help: "Include reserved internal instances.")
+    var all = false
+
     mutating func run() throws {
         withRuntimeManager { manager in
-            try manager.listInstalledInstances()
+            try manager.listInstalledInstances(includeReserved: all)
         }
     }
 }
