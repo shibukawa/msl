@@ -8,10 +8,9 @@ cd "$ROOT_DIR/Support/msl-init"
 TARGET="aarch64-unknown-linux-musl"
 STAGING_DIR="${MSL_HOME:-$HOME}/.msl-system"
 STAGING_OUT="$STAGING_DIR/msl-init"
-STAGING_VERSION_OUT="$STAGING_DIR/msl-init.version"
+STAGING_BOOTLOADER_OUT="$STAGING_DIR/msl-init-bootloader"
 BUILD_GIT_COMMIT="$(git -C "$ROOT_DIR" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
 BUILD_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-VERSION_STRING="msl-init git=$BUILD_GIT_COMMIT built_at=$BUILD_TIMESTAMP target=$TARGET"
 
 if command -v rustup >/dev/null 2>&1; then
   if ! rustup target list --installed | grep -q "^$TARGET$"; then
@@ -28,6 +27,7 @@ MSL_INIT_BUILD_TIMESTAMP="$BUILD_TIMESTAMP" \
 MSL_INIT_BUILD_TARGET="$TARGET" \
 cargo build --release --target "$TARGET"
 OUT="$ROOT_DIR/Support/msl-init/target/$TARGET/release/msl-init"
+BOOTLOADER_OUT="$ROOT_DIR/Support/msl-init/target/$TARGET/release/msl-init-bootloader"
 if command -v file >/dev/null 2>&1; then
   FILE_OUT="$(file "$OUT")"
   echo "$FILE_OUT"
@@ -35,11 +35,19 @@ if command -v file >/dev/null 2>&1; then
     echo "error: unexpected msl-init binary format (expected Linux aarch64 ELF)." >&2
     exit 1
   fi
+  BOOTLOADER_FILE_OUT="$(file "$BOOTLOADER_OUT")"
+  echo "$BOOTLOADER_FILE_OUT"
+  if ! echo "$BOOTLOADER_FILE_OUT" | grep -q "ELF 64-bit.*ARM aarch64"; then
+    echo "error: unexpected msl-init-bootloader binary format (expected Linux aarch64 ELF)." >&2
+    exit 1
+  fi
 fi
+chmod 0755 "$OUT"
 echo "built: $OUT"
 mkdir -p "$STAGING_DIR"
 cp -f "$OUT" "$STAGING_OUT"
 chmod 0755 "$STAGING_OUT"
-printf '%s\n' "$VERSION_STRING" > "$STAGING_VERSION_OUT"
+cp -f "$BOOTLOADER_OUT" "$STAGING_BOOTLOADER_OUT"
+chmod 0755 "$STAGING_BOOTLOADER_OUT"
 echo "staged: $STAGING_OUT"
-echo "staged-version: $VERSION_STRING"
+echo "staged-bootloader: $STAGING_BOOTLOADER_OUT"

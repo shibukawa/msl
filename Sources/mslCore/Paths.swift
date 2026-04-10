@@ -30,14 +30,10 @@ public struct MSLPaths {
     public let legacyCacheDownloadsDir: URL
     public let legacyCacheStagingDir: URL
     public let kernelsDir: URL
-    public let bootstrapArtifactsDir: URL
-    public let bootstrapCloudInitDir: URL
-    public let bootstrapCloudInitUserDataFile: URL
-    public let bootstrapCloudInitMetaDataFile: URL
-    public let bootstrapCloudInitSeedISOFile: URL
     public let mslHostToolsDir: URL
     public let mslHostExt4MkfsHelperBinaryFile: URL
     public let mslHostInitBinaryFile: URL
+    public let mslHostInitBootloaderBinaryFile: URL
     public let mslHostExt4HelperBinaryFile: URL
     public let mslHostInitBootstrapLogFile: URL
     public let serialConsoleLogFile: URL
@@ -66,6 +62,7 @@ public struct MSLPaths {
         self.mslHostToolsDir = mslSystemHome
         self.mslHostExt4MkfsHelperBinaryFile = mslHostToolsDir.appendingPathComponent("msl-ext4-mkfs", isDirectory: false)
         self.mslHostInitBinaryFile = mslHostToolsDir.appendingPathComponent("msl-init", isDirectory: false)
+        self.mslHostInitBootloaderBinaryFile = mslHostToolsDir.appendingPathComponent("msl-init-bootloader", isDirectory: false)
         self.mslHostExt4HelperBinaryFile = mslHostToolsDir.appendingPathComponent("msl-ext4-image", isDirectory: false)
         self.mslHostInitBootstrapLogFile = mslHostToolsDir.appendingPathComponent("init-bootstrap.log", isDirectory: false)
         self.serialConsoleLogFile = logs.appendingPathComponent("serial-console.log", isDirectory: false)
@@ -85,11 +82,6 @@ public struct MSLPaths {
         self.legacyCacheDownloadsDir = legacyCacheDir.appendingPathComponent("downloads", isDirectory: true)
         self.legacyCacheStagingDir = legacyCacheDir.appendingPathComponent("staging", isDirectory: true)
         self.kernelsDir = appSupport.appendingPathComponent("kernels", isDirectory: true)
-        self.bootstrapArtifactsDir = appSupport.appendingPathComponent("bootstrap", isDirectory: true)
-        self.bootstrapCloudInitDir = bootstrapArtifactsDir.appendingPathComponent("cloud-init", isDirectory: true)
-        self.bootstrapCloudInitUserDataFile = bootstrapCloudInitDir.appendingPathComponent("user-data", isDirectory: false)
-        self.bootstrapCloudInitMetaDataFile = bootstrapCloudInitDir.appendingPathComponent("meta-data", isDirectory: false)
-        self.bootstrapCloudInitSeedISOFile = bootstrapArtifactsDir.appendingPathComponent("seed.iso", isDirectory: false)
     }
 
     public func distroDirectory(named name: String) -> URL {
@@ -114,10 +106,6 @@ public struct MSLPaths {
 
     public func distroEphemeralTmpDiskFile(named name: String) -> URL {
         distroTmpDirectory(named: name).appendingPathComponent("ephemeral-tmp.raw", isDirectory: false)
-    }
-
-    public func distroCloudInitDirectory(named name: String) -> URL {
-        distroDirectory(named: name).appendingPathComponent("cloud-init", isDirectory: true)
     }
 
     public func diagnosticLogsDirectory(named instanceName: String) -> URL {

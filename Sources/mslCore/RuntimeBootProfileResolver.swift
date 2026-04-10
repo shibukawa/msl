@@ -47,7 +47,7 @@ struct RuntimeBootProfileResolver {
             let rootRaw = environment["MSL_KERNEL_ROOT"]?.trimmingCharacters(in: .whitespacesAndNewlines)
             let root = ((rootRaw?.isEmpty == false) ? rootRaw : nil) ?? "/dev/vda"
             let initPathRaw = environment["MSL_KERNEL_INIT_PATH"]?.trimmingCharacters(in: .whitespacesAndNewlines)
-            let defaultInitPath = resolvedMode == "service-managed-init" ? "/sbin/init" : "/sbin/msl-init"
+            let defaultInitPath = resolvedMode == "service-managed-init" ? "/sbin/init" : "/sbin/msl-init-bootloader"
             let initPath = ((initPathRaw?.isEmpty == false) ? initPathRaw : nil) ?? defaultInitPath
             commandLine = "root=\(root) rw console=hvc0 init=\(initPath)"
         }

@@ -137,7 +137,7 @@ final class DistributionManager {
         manifestStore.installableDescriptors()
     }
 
-    func installedInstances() -> [InstalledInstanceDescriptor] {
+    func installedInstances(includeReserved: Bool = false) -> [InstalledInstanceDescriptor] {
         guard let contents = try? fileManager.contentsOfDirectory(
             at: paths.distrosDir,
             includingPropertiesForKeys: [.isDirectoryKey],
@@ -153,6 +153,9 @@ final class DistributionManager {
             }
             let name = item.lastPathComponent
             if name == "default" {
+                continue
+            }
+            if !includeReserved, isReservedInternalInstanceName(name) {
                 continue
             }
             let diskPath = paths.distroDiskFile(named: name)
@@ -176,7 +179,7 @@ final class DistributionManager {
     func instanceExists(named rawName: String) -> Bool {
         let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty else { return false }
-        return installedInstances().contains { $0.name == name && $0.hasDisk }
+        return installedInstances(includeReserved: true).contains { $0.name == name && $0.hasDisk }
     }
 
     func runtimeMetadataURL(explicitInstanceName: String?, defaultInstanceName: String?) throws -> URL {
@@ -328,7 +331,7 @@ final class DistributionManager {
         try validateTarArchiveEntries(tarballURL)
         emitStatus("install: extracting rootfs")
         try extractTarArchive(tarballURL, to: rootfsDir)
-        emitStatus("install: injecting msl-init")
+        emitStatus("install: injecting msl-init bootloader")
         let runtimeProfile = initialRuntimeProfile(for: source, instanceName: name)
         try stageInitBinary(intoRootfs: rootfsDir, runtimeProfile: runtimeProfile)
 
@@ -471,7 +474,7 @@ final class DistributionManager {
             let imagewriterScript = try resolveImagewriterBuildScriptPath(mslExecutablePath: mslExecutablePath)
             let requestedSizeGB = diskSizeGB ?? Self.defaultImagewriterDiskSizeGB
             let requestedSizeMB = max(1, requestedSizeGB) * 1024
-            let initBinaryPath = try resolveImagewriterInitBinaryPath()
+            let initBinaryPath = try resolveImagewriterBootloaderBinaryPath()
 
             emitStatus("install: creating btrfs disk image via imagewriter")
             didRunImagewriterBuild = true
@@ -1292,19 +1295,19 @@ final class DistributionManager {
         }
     }
 
-    private func resolveImagewriterInitBinaryPath() throws -> String {
-        let envPath = ProcessInfo.processInfo.environment["MSL_INIT_BINARY_PATH"]?
+    private func resolveImagewriterBootloaderBinaryPath() throws -> String {
+        let envPath = ProcessInfo.processInfo.environment["MSL_INIT_BOOTLOADER_BINARY_PATH"]?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let sourcePath: String
         if let envPath, !envPath.isEmpty {
             sourcePath = envPath
         } else {
-            sourcePath = paths.mslHostInitBinaryFile.path
+            sourcePath = paths.mslHostInitBootloaderBinaryFile.path
         }
 
         guard fileManager.fileExists(atPath: sourcePath) else {
             throw MSLRuntimeError(
-                "msl-init binary not found at \(sourcePath). run `make build-init` or set MSL_INIT_BINARY_PATH."
+                "msl-init-bootloader binary not found at \(sourcePath). run `./scripts/build-msl-init.sh` or set MSL_INIT_BOOTLOADER_BINARY_PATH."
             )
         }
         return sourcePath
@@ -1797,25 +1800,25 @@ final class DistributionManager {
         intoRootfs rootfsDir: URL,
         runtimeProfile: DistributionInstanceMetadata.RuntimeInitProfile? = nil
     ) throws {
-        let envPath = ProcessInfo.processInfo.environment["MSL_INIT_BINARY_PATH"]?
+        let envPath = ProcessInfo.processInfo.environment["MSL_INIT_BOOTLOADER_BINARY_PATH"]?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let sourcePath: String
         if let envPath, !envPath.isEmpty {
             sourcePath = envPath
         } else {
-            sourcePath = paths.mslHostInitBinaryFile.path
+            sourcePath = paths.mslHostInitBootloaderBinaryFile.path
         }
 
         guard fileManager.fileExists(atPath: sourcePath) else {
             throw MSLRuntimeError(
-                "msl-init binary not found at \(sourcePath). run `make build-init` or set MSL_INIT_BINARY_PATH."
+                "msl-init-bootloader binary not found at \(sourcePath). run `./scripts/build-msl-init.sh` or set MSL_INIT_BOOTLOADER_BINARY_PATH."
             )
         }
 
         let sourceURL = URL(fileURLWithPath: sourcePath)
         let destinations = [
-            rootfsDir.appendingPathComponent("sbin/msl-init", isDirectory: false),
-            rootfsDir.appendingPathComponent("usr/local/bin/msl-init", isDirectory: false)
+            rootfsDir.appendingPathComponent("sbin/msl-init-bootloader", isDirectory: false),
+            rootfsDir.appendingPathComponent("usr/local/bin/msl-init-bootloader", isDirectory: false)
         ]
         for dst in destinations {
             try fileManager.createDirectory(at: dst.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -1826,20 +1829,6 @@ final class DistributionManager {
             try fileManager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dst.path)
         }
 
-        let guestMSL = rootfsDir.appendingPathComponent("usr/local/bin/msl", isDirectory: false)
-        if fileManager.fileExists(atPath: guestMSL.path) {
-            try fileManager.removeItem(at: guestMSL)
-        }
-        try fileManager.createSymbolicLink(atPath: guestMSL.path, withDestinationPath: "msl-init")
-        let guestCode = rootfsDir.appendingPathComponent("usr/local/bin/code", isDirectory: false)
-        if fileManager.fileExists(atPath: guestCode.path) {
-            try fileManager.removeItem(at: guestCode)
-        }
-        do {
-            try fileManager.linkItem(at: destinations[1], to: guestCode)
-        } catch {
-            try fileManager.createSymbolicLink(atPath: guestCode.path, withDestinationPath: "msl-init")
-        }
         try normalizeRootFstabForVirtualDisk(rootfsDir: rootfsDir)
 
         guard let runtimeProfile,
@@ -1889,7 +1878,7 @@ final class DistributionManager {
         Type=simple
         Environment=MSL_VSOCK_PORT=1024
         Environment=MSL_INIT_LOG_FILE=/var/log/msl-init.log
-        ExecStart=/usr/local/bin/msl-init
+        ExecStart=/usr/local/bin/msl-init-bootloader
         Restart=always
         RestartSec=1
 
@@ -1967,7 +1956,7 @@ final class DistributionManager {
         #!/sbin/openrc-run
         name="msl-init"
         description="msl init control server"
-        command="/usr/local/bin/msl-init"
+        command="/usr/local/bin/msl-init-bootloader"
         command_background="yes"
         pidfile="/run/msl-init.pid"
         output_log="/var/log/msl-init.log"

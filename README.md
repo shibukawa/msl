@@ -18,7 +18,6 @@ This repository currently contains a Swift prototype for bootstrap/lifecycle + S
 - Session tracking and idle auto-stop timer (10 seconds)
 - VM attach path via `Virtualization.framework` + `msl-init` control channel
 - First-run bootstrap creates writable `disk.raw` separate from base image
-- First-run bootstrap generates cloud-init NoCloud seed (`user-data`, `meta-data`, `seed.iso`)
 - Guest mount target `/mnt/macos` and bind mapping `/home/<user>` -> `/mnt/macos/Users/<mac-user>/msl-home`
 - Guest system-control bind mount `/mnt/msl-system` -> `/mnt/macos/Users/<mac-user>/.msl-system`
 
@@ -427,11 +426,6 @@ Current runtime is instance-based:
   - serial fallback (`--serial-console`) still configures `hvc0`/`ttyS0` autologin
   - terminal type defaults to your host `TERM` when safe, with fallback to `xterm-256color` for compatibility
 - If you set `MSL_DEFAULT_PASSWORD`, password authentication is provisioned for that user.
-
-Install/build helper artifacts (cloud-init seed inputs) are staged under:
-- `~/Library/Application Support/msl/bootstrap/cloud-init/user-data`
-- `~/Library/Application Support/msl/bootstrap/cloud-init/meta-data`
-- `~/Library/Application Support/msl/bootstrap/seed.iso`
 
 Package installs (`apt-get install ...`) are persisted to the selected instance `disk.raw`, not the base image.
 

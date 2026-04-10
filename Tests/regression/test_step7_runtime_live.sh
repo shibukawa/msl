@@ -19,7 +19,7 @@ STEP7_SECOND_INSTANCE="$(printf "%s\n" "$STEP7_INSTANCE_LIST" | sed -n '2p')"
 
 if [ -z "$STEP7_INSTANCE" ]; then
   skip_test "step7 live boot/attach" "no installed instance"
-  skip_test "step7 no-seed boot path" "no installed instance"
+  skip_test "step7 direct-rootfs boot path" "no installed instance"
   skip_test "step7 diagnostic logs" "no installed instance"
   skip_test "step7 instance mismatch guidance" "no installed instance"
   return 0
@@ -34,12 +34,8 @@ run_test_output "step7 explicit instance uname" "Linux" \
 run_test_output "step7 run timeout command" "step7-live-ok" \
   "$MSL" --instance "$STEP7_INSTANCE" run --timeout 30 echo step7-live-ok
 
-# I4: seed.iso absence must not block normal boot path.
-STEP7_SEED_ISO="$APP_SUPPORT_DIR/distros/$STEP7_INSTANCE/seed.iso"
-if [ -f "$STEP7_SEED_ISO" ]; then
-  rm -f "$STEP7_SEED_ISO"
-fi
-run_test_output "step7 boot without seed.iso" "Linux" \
+# I4: direct rootfs boot path should work without bootstrap artifacts.
+run_test_output "step7 direct-rootfs boot path" "Linux" \
   "$MSL" --instance "$STEP7_INSTANCE" run --timeout 30 uname -s
 
 # I6/I9: forwarded logs and runtime observability should be available.

@@ -303,32 +303,6 @@ public final class DaemonServer {
     private let autoImageCompactThresholdBytes: Int64
     private let autoImageCompactThresholdPercent: Double
     private let autoImageCompactCooldownMs: Int64
-    private static let readInitVersionScript = """
-    if [ -x /usr/local/bin/msl-init ]; then
-      /usr/local/bin/msl-init version 2>/dev/null || /usr/local/bin/msl-init --version 2>/dev/null || sha256sum /usr/local/bin/msl-init 2>/dev/null | awk '{print $1}'
-    fi
-    """
-    private static let autoRefreshInitScript = """
-    set -eu
-    src="$1"
-    dst="/usr/local/bin/msl-init"
-    tmp="/usr/local/bin/.msl-init.tmp.$$"
-    if [ ! -f "$src" ]; then
-      echo "source_missing" >&2
-      exit 20
-    fi
-    mkdir -p /usr/local/bin
-    if [ -f "$dst" ] && cmp -s "$src" "$dst"; then
-      printf "skipped"
-      exit 0
-    fi
-    cp "$src" "$tmp"
-    chmod 0755 "$tmp"
-    mv "$tmp" "$dst"
-    ln -sf /usr/local/bin/msl-init /usr/local/bin/msl
-    ln -sf /usr/local/bin/msl-init /usr/local/bin/code
-    printf "updated"
-    """
     private static let autoTrimScript = """
     set -eu
     if ! command -v fstrim >/dev/null 2>&1; then
@@ -1897,7 +1871,6 @@ public final class DaemonServer {
         case "cache_share_prepare":
             return handleCacheSharePrepare()
 
-        // --- provision_status ---
         case "provision_status":
             return handleProvisionStatus(request)
 
@@ -2180,8 +2153,6 @@ public final class DaemonServer {
         }
     }
 
-    // MARK: - provision_status
-
     private func handleProvisionStatus(_ request: RuntimeControlRequest) -> RuntimeControlResponse {
         guard let context = resolveContext(for: request),
               let client = context.initClient ?? initClient else {
@@ -2190,10 +2161,9 @@ public final class DaemonServer {
 
         do {
             let resp = try client.convergeStatus()
-            let cloudInit = resp.meta?["cloud_init"] ?? resp.meta?["convergence"] ?? "unknown"
             return RuntimeControlResponse(
                 ok: true,
-                meta: ["cloud_init": cloudInit]
+                meta: ["convergence": resp.meta?["convergence"] ?? "unknown"]
             )
         } catch {
             return RuntimeControlResponse(ok: false, error: String(describing: error))
@@ -2854,35 +2824,6 @@ public final class DaemonServer {
             return true
         }
         return false
-    }
-
-    private func readGuestInitVersion(client: InitChannelClient) -> String? {
-        do {
-            let response = try client.send(InitChannelRequest(
-                op: "exec",
-                argv: ["/bin/sh", "-lc", Self.readInitVersionScript],
-                timeoutMs: 2_000
-            ))
-            guard response.ok, (response.exitCode ?? 1) == 0 else {
-                return nil
-            }
-            let value = response.stdout?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            return value.isEmpty ? nil : value
-        } catch {
-            return nil
-        }
-    }
-
-    private func readHostInitVersion(at path: String) -> String? {
-        let sidecar = path + ".version"
-        guard FileManager.default.isReadableFile(atPath: sidecar),
-              let data = FileManager.default.contents(atPath: sidecar),
-              let value = String(data: data, encoding: .utf8)?
-                .trimmingCharacters(in: .whitespacesAndNewlines),
-              !value.isEmpty else {
-            return nil
-        }
-        return value
     }
 
     private func allocatedBytes(of fileURL: URL) -> Int64? {

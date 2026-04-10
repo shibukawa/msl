@@ -1060,10 +1060,6 @@ fn run_guest_cli_if_requested(args: &[String]) -> Option<Result<(), String>> {
         return Some(run_guest_code_cli(command_args));
     }
 
-    if args.len() >= 2 && (args[1] == "version" || args[1] == "--version" || args[1] == "-V") {
-        return Some(run_guest_version_cli(&args[1..]));
-    }
-
     if !invoked_as_msl && (args.len() < 2 || args[1] != "memory") {
         return None;
     }
@@ -1103,27 +1099,6 @@ fn run_guest_code_cli(args: &[String]) -> Result<(), String> {
 
 fn guest_code_usage() -> String {
     "usage: code [path]".to_string()
-}
-
-fn run_guest_version_cli(args: &[String]) -> Result<(), String> {
-    if args.is_empty() || args.len() > 1 {
-        return Err(guest_version_usage());
-    }
-    println!("{}", guest_version_string());
-    Ok(())
-}
-
-fn guest_version_usage() -> String {
-    "usage: msl-init version".to_string()
-}
-
-fn guest_version_string() -> String {
-    format!(
-        "msl-init git={} built_at={} target={}",
-        BUILD_GIT_COMMIT,
-        BUILD_TIMESTAMP,
-        BUILD_TARGET
-    )
 }
 
 fn resolve_code_target(raw: &str) -> Result<String, String> {
@@ -1574,6 +1549,46 @@ fn ensure_process_environment() {
     if env::var_os("TERM").is_none() {
         env::set_var("TERM", "xterm-256color");
     }
+    if env::var_os("TZ").is_none() {
+        if let Some(time_zone_id) = load_timezone_from_process_or_etc_environment() {
+            env::set_var("TZ", time_zone_id);
+        }
+    }
+}
+
+fn load_timezone_from_process_or_etc_environment() -> Option<String> {
+    if let Some(value) = env::var_os("TZ") {
+        let value = value.to_string_lossy().trim().to_string();
+        if is_valid_timezone_id(&value) {
+            return Some(value);
+        }
+    }
+    let text = fs::read_to_string("/etc/environment").ok()?;
+    load_timezone_from_text(&text)
+}
+
+fn load_timezone_from_text(text: &str) -> Option<String> {
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with("TZ=") {
+            continue;
+        }
+        let raw = trimmed.trim_start_matches("TZ=").trim();
+        let unquoted = raw
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+            .unwrap_or(raw)
+            .trim();
+        if is_valid_timezone_id(unquoted) {
+            return Some(unquoted.to_string());
+        }
+    }
+    None
+}
+
+fn is_valid_timezone_id(value: &str) -> bool {
+    !value.is_empty()
+        && !value.chars().any(|ch| ch.is_control() || ch.is_whitespace())
 }
 
 fn ensure_mount_prerequisites() {
@@ -3031,6 +3046,9 @@ fn pty_open_response(request_id: &str, op: &str, line: &str) -> String {
         "LANG=C.UTF-8".to_string(),
         "LC_ALL=C.UTF-8".to_string(),
     ];
+    if let Some(time_zone_id) = load_timezone_from_process_or_etc_environment() {
+        env_values.push(format!("TZ={}", time_zone_id));
+    }
     for (key, value) in env_additions {
         if is_valid_env_key(&key) {
             env_values.push(format!("{}={}", key, value));
@@ -4206,6 +4224,9 @@ fn proc_open_response(request_id: &str, op: &str, line: &str) -> String {
     cmd.env("SHELL", &runtime.shell);
     cmd.env("LANG", "C.UTF-8");
     cmd.env("LC_ALL", "C.UTF-8");
+    if let Some(time_zone_id) = load_timezone_from_process_or_etc_environment() {
+        cmd.env("TZ", time_zone_id);
+    }
     for (key, value) in env_additions {
         if is_valid_env_key(&key) {
             cmd.env(key, value);
@@ -4794,36 +4815,10 @@ fn log_line(message: &str) {
 }
 
 fn converge_status_response(request_id: &str) -> String {
-    let cloud_init_result = Path::new("/run/cloud-init/result.json");
-    let cloud_init_status = if cloud_init_result.exists() {
-        match fs::read_to_string(cloud_init_result) {
-            Ok(content) => {
-                // Parse the status from the JSON. The file typically contains:
-                // {"v1": {"datasource": "...", "errors": [], ...}}
-                // If the file exists and is parsable, cloud-init has completed.
-                if content.contains("\"errors\": []") || content.contains("\"errors\":[]") {
-                    "done"
-                } else if content.contains("\"errors\"") {
-                    "error"
-                } else {
-                    "done"
-                }
-            }
-            Err(_) => "running",
-        }
-    } else if Path::new("/run/cloud-init").exists() {
-        "running"
-    } else {
-        "not_started"
-    };
-
     ok_response(
         request_id,
         "converge_status",
-        Some(format!(
-            "\"meta\":{{\"cloud_init\":\"{}\",\"status\":\"ok\"}}",
-            cloud_init_status
-        )),
+        Some("\"meta\":{\"convergence\":\"done\",\"status\":\"ok\"}".to_string()),
     )
 }
 
@@ -6091,6 +6086,29 @@ mod tests {
     }
 
     #[test]
+    fn timezone_loader_reads_tz_from_environment_file() {
+        let path = "/tmp/msl-init-test-environment";
+        fs::write(path, "PATH=\"/usr/bin\"\nTZ=\"Asia/Tokyo\"\n").unwrap();
+        let current_tz = env::var_os("TZ");
+        env::remove_var("TZ");
+        assert_eq!(
+            load_timezone_from_text(&fs::read_to_string(path).unwrap()).as_deref(),
+            Some("Asia/Tokyo")
+        );
+        let _ = fs::remove_file(path);
+        match current_tz {
+            Some(value) => env::set_var("TZ", value),
+            None => env::remove_var("TZ"),
+        }
+    }
+
+    #[test]
+    fn timezone_loader_rejects_invalid_values() {
+        assert_eq!(load_timezone_from_text("TZ=\n"), None);
+        assert_eq!(load_timezone_from_text("TZ=\"Asia/ Tokyo\"\n"), None);
+    }
+
+    #[test]
     fn normalize_hostname_uses_instance_safe_form() {
         assert_eq!(normalize_hostname("Ubuntu_24.04"), "ubuntu-24-04");
         assert_eq!(normalize_hostname("___"), "msl");
@@ -6170,19 +6188,6 @@ mod tests {
     #[test]
     fn guest_code_usage_is_stable() {
         assert_eq!(guest_code_usage(), "usage: code [path]");
-    }
-
-    #[test]
-    fn guest_version_usage_is_stable() {
-        assert_eq!(guest_version_usage(), "usage: msl-init version");
-    }
-
-    #[test]
-    fn guest_version_string_contains_metadata_keys() {
-        let value = guest_version_string();
-        assert!(value.contains("msl-init git="));
-        assert!(value.contains(" built_at="));
-        assert!(value.contains(" target="));
     }
 
     #[test]
