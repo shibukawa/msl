@@ -638,7 +638,7 @@ public final class RuntimeManager {
         try daemon.run()
     }
 
-    /// Run `msl provision`: wait for cloud-init to complete.
+    /// Run `msl provision`: compatibility readiness check for the init channel.
     public func runProvision(timeoutSec: Int = 600, instanceName: String? = nil) throws -> Never {
         let startMs = runtimeMonotonicMs()
         let target = try resolveRuntimeTarget(explicitInstanceName: instanceName)
@@ -673,52 +673,24 @@ public final class RuntimeManager {
             daemonClient.disconnect()
         }
 
-        // Poll provision_status
-        fputs("msl: waiting for provisioning (cloud-init)... (Ctrl+C to cancel)\n", stderr)
-        let deadline = Date().addingTimeInterval(TimeInterval(timeoutSec))
-        var pollCount = 0
-        while Date() < deadline {
-            if isInterrupted() {
-                fputs("\nmsl: provisioning interrupted by user\n", stderr)
-                Foundation.exit(130)
-            }
-            pollCount += 1
-            let resp = try daemonClient.send(RuntimeControlRequest(op: "provision_status", sessionId: sessionID))
-            if resp.ok {
-                let cloudInit = resp.meta?["cloud_init"] ?? "unknown"
-                logger.log("provision_polling", fields: [
-                    "cloud_init": cloudInit,
-                    "poll_count": String(pollCount)
-                ])
-                if pollCount % 5 == 0 {
-                    fputs("msl: provisioning status: \(cloudInit) (poll #\(pollCount))\n", stderr)
-                }
-                if cloudInit == "done" {
-                    let elapsed = runtimeMonotonicMs() - startMs
-                    logger.log("provision_completed", fields: ["elapsed_ms": String(elapsed)])
-                    fputs("msl: provisioning complete (\(elapsed / 1000)s)\n", stderr)
-                    Foundation.exit(0)
-                }
-                if cloudInit == "error" {
-                    let detail = resp.meta?["cloud_init_detail"] ?? ""
-                    fputs("msl: provisioning failed (cloud-init error)\(detail.isEmpty ? "" : ": \(detail)")\n", stderr)
-                    Foundation.exit(1)
-                }
-            } else {
-                let errMsg = resp.error ?? "unknown"
-                fputs("msl: provision_status error: \(errMsg)\n", stderr)
-            }
-            // Sleep in small increments to check interrupt flag quickly
-            for _ in 0..<20 {
-                if isInterrupted() { break }
-                Thread.sleep(forTimeInterval: 0.1)
-            }
+        if isInterrupted() {
+            fputs("\nmsl: readiness check interrupted by user\n", stderr)
+            Foundation.exit(130)
         }
 
+        let resp = try daemonClient.send(RuntimeControlRequest(op: "provision_status", sessionId: sessionID))
+        guard resp.ok else {
+            throw MSLRuntimeError(resp.error ?? "failed to check runtime readiness")
+        }
+
+        let convergence = resp.meta?["convergence"] ?? "unknown"
         let elapsed = runtimeMonotonicMs() - startMs
-        logger.log("provision_timeout", fields: ["elapsed_ms": String(elapsed)])
-        fputs("msl: provisioning timed out after \(timeoutSec)s\n", stderr)
-        Foundation.exit(1)
+        logger.log("provision_completed", fields: [
+            "elapsed_ms": String(elapsed),
+            "convergence": convergence
+        ])
+        fputs("msl: runtime ready (\(convergence), \(elapsed / 1000)s)\n", stderr)
+        Foundation.exit(0)
     }
 
     /// Run `msl run <cmd>`: execute a command in the VM.
@@ -1599,19 +1571,17 @@ public final class RuntimeManager {
     }
 
     /// Returns the idle timeout in milliseconds.
-    /// During initial provisioning (no bootstrap log yet), cloud-init may still
-    /// be writing to the filesystem. Killing the VM prematurely causes FS corruption.
-    /// Use a long timeout (5 min) to allow cloud-init to complete safely.
+    /// Give newly booted runtimes a longer initial idle window before enabling
+    /// the normal short shutdown timeout.
     private func resolveIdleTimeoutMs() -> Int64 {
         if let raw = ProcessInfo.processInfo.environment["MSL_IDLE_TIMEOUT_MS"],
            let val = Int64(raw), val > 0 {
             return val
         }
         if !FileManager.default.fileExists(atPath: paths.mslHostInitBootstrapLogFile.path) {
-            // First provisioning — cloud-init may still be running
-            return 300_000  // 5 minutes
+            return 300_000
         }
-        return 10_000  // 10 seconds (normal)
+        return 10_000
     }
 
     private func updateInitChannelState(_ probe: InitChannelProbeResult) {
@@ -2017,40 +1987,6 @@ public final class RuntimeManager {
         return URL(fileURLWithPath: fileManager.currentDirectoryPath, isDirectory: true)
             .appendingPathComponent(fileName, isDirectory: false)
             .path
-    }
-
-    private func readGuestInitVersionViaDaemon(instanceName: String) throws -> String? {
-        let response = try daemonClient.send(RuntimeControlRequest(
-            op: "exec",
-            instance: instanceName,
-            argv: [
-                "/bin/sh",
-                "-lc",
-                """
-                if [ -x /usr/local/bin/msl-init ]; then
-                  /usr/local/bin/msl-init version 2>/dev/null || /usr/local/bin/msl-init --version 2>/dev/null || sha256sum /usr/local/bin/msl-init 2>/dev/null | awk '{print $1}'
-                fi
-                """
-            ],
-            timeoutMs: 2_000
-        ))
-        guard response.ok, (response.exitCode ?? 1) == 0 else {
-            return nil
-        }
-        let value = response.stdout?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        return value.isEmpty ? nil : value
-    }
-
-    private func readHostInitVersion(at path: String) -> String? {
-        let sidecar = path + ".version"
-        guard fileManager.isReadableFile(atPath: sidecar),
-              let data = fileManager.contents(atPath: sidecar),
-              let value = String(data: data, encoding: .utf8)?
-                .trimmingCharacters(in: .whitespacesAndNewlines),
-              !value.isEmpty else {
-            return nil
-        }
-        return value
     }
 
     private func logicalBytes(of fileURL: URL) -> Int64? {

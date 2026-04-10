@@ -235,8 +235,8 @@ if [ "$IMAGE_FS" = "btrfs" ]; then
 fi
 
 if [ "$TWO_STAGE_BTRFS" -eq 1 ] && [ -z "$INIT_BINARY_PATH" ]; then
-  echo "error: IMAGEWRITER_INIT_BINARY is required for _imagewriter disk builds (missing /sbin/msl-init risk)." >&2
-  echo "hint: export MSL_INIT_BINARY_PATH or run make build-init, then re-run make build-imagewriter." >&2
+  echo "error: IMAGEWRITER_INIT_BINARY is required for _imagewriter disk builds (missing /sbin/msl-init-bootloader risk)." >&2
+  echo "hint: export MSL_INIT_BOOTLOADER_BINARY_PATH or run ./scripts/build-msl-init.sh, then re-run make build-imagewriter." >&2
   exit 1
 fi
 

@@ -117,7 +117,7 @@ public final class VirtualMachineRunner {
         } else {
             self.terminalBridge = nil
             // Always attach a serial port and capture output to a log file
-            // so kernel boot, cloud-init, and msl-init logs are available.
+            // so kernel boot and msl-init logs are available.
             serialAttachment = try makeSerialLogAttachment()
         }
         let diagnosticAttachment = makeDiagnosticAttachment(instanceName: metadata.instanceName)
@@ -655,6 +655,13 @@ public final class VirtualMachineRunner {
         return loader
     }
 
+    private func initBinaryData() throws -> Data {
+        guard let data = FileManager.default.contents(atPath: paths.mslHostInitBinaryFile.path) else {
+            throw MSLRuntimeError("staged msl-init binary not found at \(paths.mslHostInitBinaryFile.path)")
+        }
+        return data
+    }
+
     private func isGzipKernelImage(_ kernelURL: URL) -> Bool {
         guard let handle = try? FileHandle(forReadingFrom: kernelURL) else {
             return false
@@ -664,6 +671,126 @@ public final class VirtualMachineRunner {
             return false
         }
         return header[0] == 0x1f && header[1] == 0x8b
+    }
+
+    private func performBootloaderTransfer(
+        listenerDelegate: VsockListenerDelegate,
+        timeoutSec: Int
+    ) throws {
+        let connection = try acquireInitVsockConnection(
+            listenerDelegate: listenerDelegate,
+            timeoutSec: timeoutSec,
+            role: "bootloader"
+        )
+
+        let line = try readBootProtocolLine(fd: connection.fd, timeoutSec: timeoutSec)
+        guard let hello = MSLInitBootTransferProtocol.parseHelloLine(line) else {
+            throw MSLRuntimeError("invalid bootloader hello: \(line)")
+        }
+
+        let payload = try initBinaryData()
+        let hostEpochMs = UInt64(Date().timeIntervalSince1970 * 1000)
+        let hostTimeZoneID = TimeZone.current.identifier
+        let metadataRecords: [MSLInitBootTransferProtocol.MetadataRecord] = [
+            .init(
+                targetKind: .bootloader,
+                flags: MSLInitBootTransferProtocol.requiredFlag,
+                entry: "clock.epoch_ms=\(hostEpochMs)"
+            ),
+            .init(
+                targetKind: .environment,
+                flags: 0,
+                entry: "TZ=\(hostTimeZoneID)"
+            )
+        ]
+        let metadata = try MSLInitBootTransferProtocol.encodeMetadataBlock(records: metadataRecords)
+
+        logger?.log("init_bootloader_hello_received", fields: [
+            "version": hello.version,
+            "init_mode": hello.initMode,
+            "payload_size": String(payload.count)
+        ])
+
+        try writeAll(fd: connection.fd, data: metadata)
+        logger?.log("init_bootloader_metadata_sent", fields: [
+            "metadata_version": String(MSLInitBootTransferProtocol.metadataVersion),
+            "record_count": String(metadataRecords.count)
+        ])
+        for record in metadataRecords {
+            logger?.log("init_bootloader_metadata_record_sent", fields: [
+                "target_kind": String(record.targetKind.rawValue),
+                "flags": String(record.flags),
+                "entry": record.entry
+            ])
+        }
+        try writeAll(fd: connection.fd, data: payload)
+
+        logger?.log("init_bootloader_transfer_completed", fields: [
+            "payload_size": String(payload.count),
+            "metadata_version": String(MSLInitBootTransferProtocol.metadataVersion),
+            "record_count": String(metadataRecords.count)
+        ])
+    }
+
+    private func readBootProtocolLine(fd: Int32, timeoutSec: Int) throws -> String {
+        var bytes: [UInt8] = []
+        let deadlineMs = monotonicMs() + Int64(timeoutSec * 1000)
+        while monotonicMs() < deadlineMs {
+            let remainingMs = max(1, Int(deadlineMs - monotonicMs()))
+            var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+            let pollResult = Darwin.poll(&pfd, 1, Int32(remainingMs))
+            if pollResult == 0 {
+                throw MSLRuntimeError("boot protocol read timed out")
+            }
+            if pollResult < 0 {
+                if errno == EINTR {
+                    continue
+                }
+                throw MSLRuntimeError("boot protocol poll failed: \(String(cString: strerror(errno)))")
+            }
+            var ch: UInt8 = 0
+            let rc = Darwin.read(fd, &ch, 1)
+            if rc == 1 {
+                if ch == 0x0a {
+                    return String(decoding: bytes, as: UTF8.self)
+                }
+                bytes.append(ch)
+                if bytes.count > 4096 {
+                    throw MSLRuntimeError("boot protocol line exceeded maximum length")
+                }
+                continue
+            }
+            if rc == 0 {
+                break
+            }
+            let err = errno
+            if err == EINTR {
+                continue
+            }
+            throw MSLRuntimeError("boot protocol read failed: \(String(cString: strerror(err)))")
+        }
+        throw MSLRuntimeError("boot protocol read timed out")
+    }
+
+    private func writeAll(fd: Int32, data: Data) throws {
+        try data.withUnsafeBytes { rawBuffer in
+            guard let baseAddress = rawBuffer.bindMemory(to: UInt8.self).baseAddress else {
+                return
+            }
+            var written = 0
+            while written < data.count {
+                let rc = Darwin.write(fd, baseAddress.advanced(by: written), data.count - written)
+                if rc > 0 {
+                    written += rc
+                    continue
+                }
+                let err = errno
+                if err == EINTR {
+                    continue
+                }
+                throw MSLRuntimeError("boot protocol write failed: \(String(cString: strerror(err)))")
+            }
+        }
     }
 
     private func buildPlatform(machineIdentifierURL: URL) throws -> VZGenericPlatformConfiguration {
@@ -764,7 +891,7 @@ public final class VirtualMachineRunner {
         logger?.log("vm_daemon_started")
         applyInitialBalloonTarget(virtualMachine: virtualMachine, vmQueue: vmQueue)
 
-        // Wait for vsock connection from msl-init
+        // Wait for bootloader/init vsock connections from the guest.
         guard let vsockDevice = virtualMachine.socketDevices.compactMap({ $0 as? VZVirtioSocketDevice }).first else {
             throw MSLRuntimeError("no VZVirtioSocketDevice found on VM")
         }
@@ -794,6 +921,17 @@ public final class VirtualMachineRunner {
         }
 
         let timeoutSec = resolveInitAttachTimeoutSec()
+        let transferStartMs = monotonicMs()
+        try performBootloaderTransfer(
+            listenerDelegate: listenerDelegate,
+            timeoutSec: timeoutSec
+        )
+        logStartupPhase(
+            phase: "init_bootloader_transfer",
+            elapsedMs: monotonicMs() - transferStartMs,
+            instanceName: metadata.instanceName
+        )
+
         let handshakeStartMs = monotonicMs()
         let controlConnection = try waitForInitChannel(
             listenerDelegate: listenerDelegate,
@@ -1235,6 +1373,17 @@ public final class VirtualMachineRunner {
         }
 
         let timeoutSec = resolveInitAttachTimeoutSec()
+        let transferStartMs = monotonicMs()
+        try performBootloaderTransfer(
+            listenerDelegate: listenerDelegate,
+            timeoutSec: timeoutSec
+        )
+        logStartupPhase(
+            phase: "init_bootloader_transfer",
+            elapsedMs: monotonicMs() - transferStartMs,
+            instanceName: instanceName
+        )
+
         let handshakeStartMs = monotonicMs()
         let controlConnection = try waitForInitChannel(
             listenerDelegate: listenerDelegate,
@@ -1333,7 +1482,7 @@ public final class VirtualMachineRunner {
         let serviceManager = bootProfile?.serviceManager ?? "-"
         let checkCommand = initHandshakeCheckCommand()
 
-        fputs("msl: waiting for msl-init vsock connection (timeout \(timeoutSec)s)\n", stderr)
+        fputs("msl: waiting for guest init vsock connection (role \(role), timeout \(timeoutSec)s)\n", stderr)
         logger?.log("init_handshake_wait_started", fields: [
             "transport": "vsock_listener",
             "timeout_sec": String(timeoutSec),
@@ -1360,7 +1509,7 @@ public final class VirtualMachineRunner {
         if role == "control" {
             self.acceptedVsockConnection = connection
         }
-        fputs("msl: msl-init connected via vsock (fd=\(fd))\n", stderr)
+        fputs("msl: guest init connected via vsock (role \(role), fd=\(fd))\n", stderr)
         logger?.log("init_vsock_connection_assigned", fields: [
             "fd": String(fd),
             "role": role

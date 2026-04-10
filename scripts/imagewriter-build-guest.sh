@@ -249,8 +249,7 @@ Before=docker.service containerd.service
 [Service]
 Type=simple
 Environment=MSL_VSOCK_PORT=1024
-Environment=MSL_INIT_LOG_FILE=/var/log/msl-init.log
-ExecStart=/usr/local/bin/msl-init
+ExecStart=/usr/local/bin/msl-init-bootloader
 Restart=always
 RestartSec=1
 
@@ -283,7 +282,7 @@ install_openrc_contracts() {
 #!/sbin/openrc-run
 name="msl-init"
 description="msl init control server"
-command="/usr/local/bin/msl-init"
+command="/usr/local/bin/msl-init-bootloader"
 command_background="yes"
 pidfile="/run/msl-init.pid"
 output_log="/var/log/msl-init.log"
@@ -433,11 +432,9 @@ install_init_binary() {
     return
   fi
   mkdir -p "$ROOTFS_DIR/sbin" "$ROOTFS_DIR/usr/local/bin"
-  cp -f "$INIT_BINARY" "$ROOTFS_DIR/sbin/msl-init"
-  cp -f "$INIT_BINARY" "$ROOTFS_DIR/usr/local/bin/msl-init"
-  chmod 0755 "$ROOTFS_DIR/sbin/msl-init" "$ROOTFS_DIR/usr/local/bin/msl-init"
-  ln -snf msl-init "$ROOTFS_DIR/usr/local/bin/msl"
-  ln -snf msl-init "$ROOTFS_DIR/usr/local/bin/code"
+  cp -f "$INIT_BINARY" "$ROOTFS_DIR/sbin/msl-init-bootloader"
+  cp -f "$INIT_BINARY" "$ROOTFS_DIR/usr/local/bin/msl-init-bootloader"
+  chmod 0755 "$ROOTFS_DIR/sbin/msl-init-bootloader" "$ROOTFS_DIR/usr/local/bin/msl-init-bootloader"
 
   SERVICE_MANAGER="$(detect_service_manager)"
   case "$SERVICE_MANAGER" in
@@ -448,7 +445,7 @@ install_init_binary() {
       install_openrc_contracts
       ;;
     *)
-      echo "warning: could not detect service manager in rootfs; skipping msl-init service/NTP contract install" >&2
+      echo "warning: could not detect service manager in rootfs; skipping msl-init-bootloader service/NTP contract install" >&2
       ;;
   esac
 }

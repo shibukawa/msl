@@ -39,6 +39,7 @@ dependencies = [
 name = "msl-init"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "tokio",
 ]
 

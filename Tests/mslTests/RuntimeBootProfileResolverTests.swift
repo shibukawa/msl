@@ -23,7 +23,7 @@ final class RuntimeBootProfileResolverTests: XCTestCase {
         )
         XCTAssertEqual(profile.kernelID, "env-kernel")
         XCTAssertTrue(profile.kernelURL.path.hasSuffix("/env-kernel/vmlinuz"))
-        XCTAssertEqual(profile.commandLine, "root=/dev/vda rw console=hvc0 init=/sbin/msl-init")
+        XCTAssertEqual(profile.commandLine, "root=/dev/vda rw console=hvc0 init=/sbin/msl-init-bootloader")
     }
 
     func testResolvesKernelProfileFromMetadataBeforeConfig() throws {

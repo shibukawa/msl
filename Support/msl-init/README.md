@@ -1,7 +1,9 @@
 # msl-init (Rust scaffold)
 
 Minimal guest-side init/control server scaffold for Step3 init-first work.
-The scaffold uses only Rust standard library (no external crates), so it can build in offline/restricted environments.
+The crate now builds two guest binaries:
+- `msl-init-bootloader`: minimal vsock bootstrap loader
+- `msl-init`: main guest init/control server
 
 ## Build
 
@@ -18,6 +20,7 @@ rustup target add aarch64-unknown-linux-musl
 
 Output:
 - `target/aarch64-unknown-linux-musl/release/msl-init`
+- `target/aarch64-unknown-linux-musl/release/msl-init-bootloader`
 
 ## Run locally (host-side simulation)
 

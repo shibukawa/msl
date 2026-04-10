@@ -281,43 +281,42 @@ final class RuntimeControlTests: XCTestCase {
     func testProvisionStatusResponseWithMeta() throws {
         let resp = RuntimeControlResponse(
             ok: true,
-            meta: ["cloud_init": "done"]
+            meta: ["convergence": "done"]
         )
         let data = try JSONEncoder().encode(resp)
         let decoded = try JSONDecoder().decode(RuntimeControlResponse.self, from: data)
         XCTAssertTrue(decoded.ok)
-        XCTAssertEqual(decoded.meta?["cloud_init"], "done")
+        XCTAssertEqual(decoded.meta?["convergence"], "done")
     }
 
     func testProvisionStatusRunning() throws {
         let resp = RuntimeControlResponse(
             ok: true,
-            meta: ["cloud_init": "running"]
+            meta: ["convergence": "running"]
         )
         let data = try JSONEncoder().encode(resp)
         let decoded = try JSONDecoder().decode(RuntimeControlResponse.self, from: data)
-        XCTAssertEqual(decoded.meta?["cloud_init"], "running")
+        XCTAssertEqual(decoded.meta?["convergence"], "running")
     }
 
     func testProvisionStatusError() throws {
         let resp = RuntimeControlResponse(
             ok: true,
-            meta: ["cloud_init": "error", "cloud_init_detail": "E: apt-get failed"]
+            meta: ["convergence": "error"]
         )
         let data = try JSONEncoder().encode(resp)
         let decoded = try JSONDecoder().decode(RuntimeControlResponse.self, from: data)
-        XCTAssertEqual(decoded.meta?["cloud_init"], "error")
-        XCTAssertEqual(decoded.meta?["cloud_init_detail"], "E: apt-get failed")
+        XCTAssertEqual(decoded.meta?["convergence"], "error")
     }
 
     func testProvisionStatusNotStarted() throws {
         let resp = RuntimeControlResponse(
             ok: true,
-            meta: ["cloud_init": "not_started"]
+            meta: ["convergence": "not_started"]
         )
         let data = try JSONEncoder().encode(resp)
         let decoded = try JSONDecoder().decode(RuntimeControlResponse.self, from: data)
-        XCTAssertEqual(decoded.meta?["cloud_init"], "not_started")
+        XCTAssertEqual(decoded.meta?["convergence"], "not_started")
     }
 
     // MARK: - Error response

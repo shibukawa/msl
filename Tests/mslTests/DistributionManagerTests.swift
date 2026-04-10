@@ -59,14 +59,14 @@ final class DistributionManagerTests: XCTestCase {
         XCTAssertFalse(DistributionManager.isSafeTarEntryPath("var/../etc/passwd"))
     }
 
-    func testStageInitBinaryCreatesGuestMSLSymlink() throws {
+    func testStageInitBinaryStagesBootloaderOnly() throws {
         let ctx = try DistributionContext.make()
         defer { ctx.cleanup() }
 
-        let fakeInit = ctx.root.appendingPathComponent("msl-init-fake", isDirectory: false)
+        let fakeInit = ctx.root.appendingPathComponent("msl-init-bootloader-fake", isDirectory: false)
         try Data(repeating: 0x41, count: 64).write(to: fakeInit)
-        setenv("MSL_INIT_BINARY_PATH", fakeInit.path, 1)
-        defer { unsetenv("MSL_INIT_BINARY_PATH") }
+        setenv("MSL_INIT_BOOTLOADER_BINARY_PATH", fakeInit.path, 1)
+        defer { unsetenv("MSL_INIT_BOOTLOADER_BINARY_PATH") }
 
         let rootfs = ctx.root.appendingPathComponent("rootfs", isDirectory: true)
         try FileManager.default.createDirectory(at: rootfs, withIntermediateDirectories: true)
@@ -74,14 +74,12 @@ final class DistributionManagerTests: XCTestCase {
         let manager = ctx.makeManager()
         try manager.stageInitBinary(intoRootfs: rootfs)
 
+        let bootloaderInUsrLocal = rootfs.appendingPathComponent("usr/local/bin/msl-init-bootloader", isDirectory: false)
+        let bootloaderInSbin = rootfs.appendingPathComponent("sbin/msl-init-bootloader", isDirectory: false)
         let initInUsrLocal = rootfs.appendingPathComponent("usr/local/bin/msl-init", isDirectory: false)
-        let guestMSL = rootfs.appendingPathComponent("usr/local/bin/msl", isDirectory: false)
-        XCTAssertTrue(FileManager.default.fileExists(atPath: initInUsrLocal.path))
-        XCTAssertTrue(FileManager.default.fileExists(atPath: guestMSL.path))
-        XCTAssertEqual(
-            try FileManager.default.destinationOfSymbolicLink(atPath: guestMSL.path),
-            "msl-init"
-        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: bootloaderInUsrLocal.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: bootloaderInSbin.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: initInUsrLocal.path))
     }
 
     func testParseSHA256FromChecksumFile() throws {
@@ -374,6 +372,32 @@ final class DistributionManagerTests: XCTestCase {
         XCTAssertEqual(names, ["alpine"])
     }
 
+    func testInstalledInstancesExcludesReservedInternalInstanceByDefault() throws {
+        let ctx = try DistributionContext.make()
+        defer { ctx.cleanup() }
+
+        try ctx.makeInstance(name: "_imagewriter")
+        try ctx.makeInstance(name: "alpine")
+
+        let names = ctx.makeManager()
+            .installedInstances()
+            .map(\.name)
+        XCTAssertEqual(names, ["alpine"])
+    }
+
+    func testInstalledInstancesCanIncludeReservedInternalInstances() throws {
+        let ctx = try DistributionContext.make()
+        defer { ctx.cleanup() }
+
+        try ctx.makeInstance(name: "_imagewriter")
+        try ctx.makeInstance(name: "alpine")
+
+        let names = ctx.makeManager()
+            .installedInstances(includeReserved: true)
+            .map(\.name)
+        XCTAssertEqual(names, ["_imagewriter", "alpine"])
+    }
+
     func testRuntimeMetadataURLErrorsWhenNoBootableInstanceExists() throws {
         let ctx = try DistributionContext.make()
         defer { ctx.cleanup() }
@@ -432,10 +456,10 @@ final class DistributionManagerTests: XCTestCase {
         let localTarball = ctx.root.appendingPathComponent("rootfs.tar.gz", isDirectory: false)
         try Data("not-a-real-tarball".utf8).write(to: localTarball)
 
-        let fakeInit = ctx.root.appendingPathComponent("msl-init-fake", isDirectory: false)
+        let fakeInit = ctx.root.appendingPathComponent("msl-init-bootloader-fake", isDirectory: false)
         try Data(repeating: 0x42, count: 64).write(to: fakeInit)
-        setenv("MSL_INIT_BINARY_PATH", fakeInit.path, 1)
-        defer { unsetenv("MSL_INIT_BINARY_PATH") }
+        setenv("MSL_INIT_BOOTLOADER_BINARY_PATH", fakeInit.path, 1)
+        defer { unsetenv("MSL_INIT_BOOTLOADER_BINARY_PATH") }
 
         let fakeImagewriter = ctx.root.appendingPathComponent("imagewriter-fail.sh", isDirectory: false)
         try Data("#!/bin/sh\nexit 22\n".utf8).write(to: fakeImagewriter)
@@ -466,10 +490,10 @@ final class DistributionManagerTests: XCTestCase {
         let localTarball = ctx.root.appendingPathComponent("rootfs.tar.gz", isDirectory: false)
         try Data("not-a-real-tarball".utf8).write(to: localTarball)
 
-        let fakeInit = ctx.root.appendingPathComponent("msl-init-fake", isDirectory: false)
+        let fakeInit = ctx.root.appendingPathComponent("msl-init-bootloader-fake-default-size", isDirectory: false)
         try Data(repeating: 0x42, count: 64).write(to: fakeInit)
-        setenv("MSL_INIT_BINARY_PATH", fakeInit.path, 1)
-        defer { unsetenv("MSL_INIT_BINARY_PATH") }
+        setenv("MSL_INIT_BOOTLOADER_BINARY_PATH", fakeInit.path, 1)
+        defer { unsetenv("MSL_INIT_BOOTLOADER_BINARY_PATH") }
 
         let recordedSize = ctx.root.appendingPathComponent("imagewriter-size.txt", isDirectory: false)
         let fakeImagewriter = ctx.root.appendingPathComponent("imagewriter-success.sh", isDirectory: false)
@@ -506,10 +530,10 @@ final class DistributionManagerTests: XCTestCase {
         let localTarball = ctx.root.appendingPathComponent("rootfs.tar.gz", isDirectory: false)
         try Data("not-a-real-tarball".utf8).write(to: localTarball)
 
-        let fakeInit = ctx.root.appendingPathComponent("msl-init-fake", isDirectory: false)
+        let fakeInit = ctx.root.appendingPathComponent("msl-init-bootloader-fake-explicit-size", isDirectory: false)
         try Data(repeating: 0x43, count: 64).write(to: fakeInit)
-        setenv("MSL_INIT_BINARY_PATH", fakeInit.path, 1)
-        defer { unsetenv("MSL_INIT_BINARY_PATH") }
+        setenv("MSL_INIT_BOOTLOADER_BINARY_PATH", fakeInit.path, 1)
+        defer { unsetenv("MSL_INIT_BOOTLOADER_BINARY_PATH") }
 
         let recordedSize = ctx.root.appendingPathComponent("imagewriter-size-explicit.txt", isDirectory: false)
         let fakeImagewriter = ctx.root.appendingPathComponent("imagewriter-success-explicit.sh", isDirectory: false)
@@ -553,10 +577,10 @@ final class DistributionManagerTests: XCTestCase {
         let localTarball = ctx.root.appendingPathComponent("rootfs.tar.gz", isDirectory: false)
         try Data("not-a-real-tarball".utf8).write(to: localTarball)
 
-        let fakeInit = ctx.root.appendingPathComponent("msl-init-fake", isDirectory: false)
+        let fakeInit = ctx.root.appendingPathComponent("msl-init-bootloader-fake", isDirectory: false)
         try Data(repeating: 0x24, count: 64).write(to: fakeInit)
-        setenv("MSL_INIT_BINARY_PATH", fakeInit.path, 1)
-        defer { unsetenv("MSL_INIT_BINARY_PATH") }
+        setenv("MSL_INIT_BOOTLOADER_BINARY_PATH", fakeInit.path, 1)
+        defer { unsetenv("MSL_INIT_BOOTLOADER_BINARY_PATH") }
 
         let fakeImagewriter = ctx.root.appendingPathComponent("imagewriter-fail.sh", isDirectory: false)
         try Data("#!/bin/sh\nexit 22\n".utf8).write(to: fakeImagewriter)

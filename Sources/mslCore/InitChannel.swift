@@ -1019,7 +1019,7 @@ public final class InitChannelClient {
         }
 
         // Read with poll() timeout since setsockopt(SO_RCVTIMEO) doesn't work on VZ fds.
-        // Use 30s timeout to tolerate vsock latency spikes under heavy guest I/O (cloud-init).
+        // Use 30s timeout to tolerate temporary vsock latency spikes during early boot.
         let readTimeoutMs: Int32
         if effectiveTimeoutMs <= 0 {
             readTimeoutMs = -1
