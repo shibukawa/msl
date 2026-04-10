@@ -3,6 +3,8 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 BIN_PATH="$ROOT_DIR/.build/debug/msl"
+DESKTOP_BIN_PATH="$ROOT_DIR/.build/debug/MSLDesktop"
+APP_BUNDLE_PATH="$ROOT_DIR/.build/debug/MSLDesktop.app"
 FULL_ENTITLEMENTS_PATH="$ROOT_DIR/msl.entitlements"
 DEV_ENTITLEMENTS_PATH="$ROOT_DIR/msl.dev.entitlements"
 SWIFTPM_HOME="$ROOT_DIR/.build/swiftpm-home"
@@ -30,8 +32,12 @@ else
 fi
 
 codesign --force --sign "$SIGNING_IDENTITY" --entitlements "$ENTITLEMENTS_PATH" "$BIN_PATH"
+codesign --force --sign "$SIGNING_IDENTITY" "$DESKTOP_BIN_PATH"
+./scripts/build-desktop-app.sh
+codesign --force --sign "$SIGNING_IDENTITY" --entitlements "$ENTITLEMENTS_PATH" "$APP_BUNDLE_PATH"
 
 echo "Signed binary: $BIN_PATH"
+echo "Signed desktop app: $APP_BUNDLE_PATH"
 echo "Entitlements file: $ENTITLEMENTS_PATH"
 echo "Entitlements:"
 codesign -d --entitlements - "$BIN_PATH"
