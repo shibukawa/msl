@@ -20,10 +20,10 @@ usage() {
   cat >&2 <<'EOF_USAGE'
 usage:
   imagewriter-build-guest.sh --mode stage1 --rootfs <rootfs-archive> --output <output-image> --size-mb <n> [--init-binary <path>] [--packages "<apk packages>"]
-  imagewriter-build-guest.sh --mode stage2 --rootfs <rootfs-archive> --output <output-image> --size-mb <n> [--init-binary <path>] [--packages "<apk packages>"]
+  imagewriter-build-guest.sh --mode stage2 --fs-type <btrfs|erofs> --rootfs <rootfs-archive> --output <output-image> --size-mb <n> [--init-binary <path>] [--packages "<apk packages>"]
 
 legacy:
-  imagewriter-build-guest.sh <rootfs-archive> <output-image> [btrfs|ext4] <size-mb> [init-binary]
+  imagewriter-build-guest.sh <rootfs-archive> <output-image> [btrfs|erofs|ext4] <size-mb> [init-binary]
 EOF_USAGE
 }
 
@@ -53,6 +53,10 @@ if [ "$#" -gt 0 ] && [ "${1#--}" != "$1" ]; then
         ;;
       --output)
         OUTPUT_IMAGE="${2:-}"
+        shift 2
+        ;;
+      --fs-type)
+        FS_TYPE="${2:-}"
         shift 2
         ;;
       --size-mb)
@@ -119,12 +123,19 @@ case "$MODE" in
     fi
     ;;
   stage2)
-    FS_TYPE="btrfs"
+    FS_TYPE="${FS_TYPE:-erofs}"
     if [ -z "$ROOTFS_ARCHIVE" ] || [ -z "$OUTPUT_IMAGE" ]; then
       echo "error: stage2 requires --rootfs and --output" >&2
       usage
       exit 1
     fi
+    case "$FS_TYPE" in
+      btrfs|erofs) ;;
+      *)
+        echo "error: stage2 fs type must be btrfs or erofs" >&2
+        exit 1
+        ;;
+    esac
     ;;
   legacy)
     if [ -z "$ROOTFS_ARCHIVE" ] || [ -z "$OUTPUT_IMAGE" ]; then
@@ -132,9 +143,9 @@ case "$MODE" in
       exit 1
     fi
     case "$FS_TYPE" in
-      btrfs|ext4) ;;
+      btrfs|erofs|ext4) ;;
       *)
-        echo "error: unsupported fs type: $FS_TYPE (use btrfs|ext4)" >&2
+        echo "error: unsupported fs type: $FS_TYPE (use btrfs|erofs|ext4)" >&2
         exit 1
         ;;
     esac
@@ -177,6 +188,54 @@ progress_step() {
     i=$((i + 1))
   done
   echo "imagewriter guest progress: [${bar}] ${percent}% - $1"
+}
+
+detect_image_fs_type() {
+  image_path="$1"
+  if [ ! -f "$image_path" ]; then
+    echo ""
+    return 1
+  fi
+  if command -v blkid >/dev/null 2>&1; then
+    blkid_type="$(blkid -p -s TYPE -o value "$image_path" 2>/dev/null || true)"
+    if [ -n "$blkid_type" ]; then
+      printf '%s\n' "$blkid_type"
+      return 0
+    fi
+  fi
+  if command -v file >/dev/null 2>&1; then
+    file_desc="$(file -b "$image_path" 2>/dev/null || true)"
+    case "$file_desc" in
+      *BTRFS*|*btrfs*)
+        printf 'btrfs\n'
+        return 0
+        ;;
+      *EROFS*|*erofs*)
+        printf 'erofs\n'
+        return 0
+        ;;
+      *ext4*)
+        printf 'ext4\n'
+        return 0
+        ;;
+    esac
+  fi
+  echo ""
+  return 1
+}
+
+verify_output_fs_type() {
+  expected_fs="$1"
+  actual_fs="$(detect_image_fs_type "$OUTPUT_IMAGE" || true)"
+  if [ -z "$actual_fs" ]; then
+    echo "error: could not determine output filesystem type: $OUTPUT_IMAGE" >&2
+    exit 1
+  fi
+  if [ "$actual_fs" != "$expected_fs" ]; then
+    echo "error: built image filesystem mismatch: expected=$expected_fs actual=$actual_fs output=$OUTPUT_IMAGE" >&2
+    exit 1
+  fi
+  echo "imagewriter_guest_verified_fs mode=$MODE fs=$actual_fs output=$OUTPUT_IMAGE"
 }
 
 set_btrfs_compression() {
@@ -452,18 +511,42 @@ install_init_binary() {
 
 build_from_source_dir() {
   source_dir="$1"
-  truncate -s "${SIZE_MB}M" "$OUTPUT_IMAGE"
-  progress_step "allocated output image"
-
   case "$FS_TYPE" in
     btrfs)
+      truncate -s "${SIZE_MB}M" "$OUTPUT_IMAGE"
+      progress_step "allocated output image"
       mkfs.btrfs -f "$OUTPUT_IMAGE" >/dev/null
       mount -o loop "$OUTPUT_IMAGE" "$OUTPUT_MOUNT_DIR"
       prepare_btrfs_policy "$OUTPUT_MOUNT_DIR"
       ;;
     ext4)
+      truncate -s "${SIZE_MB}M" "$OUTPUT_IMAGE"
+      progress_step "allocated output image"
       mkfs.ext4 -q -F -E lazy_itable_init=1,lazy_journal_init=1 "$OUTPUT_IMAGE"
       mount -o loop "$OUTPUT_IMAGE" "$OUTPUT_MOUNT_DIR"
+      ;;
+    erofs)
+      rm -f "$OUTPUT_IMAGE"
+      progress_step "prepared erofs output path"
+      if ! command -v mkfs.erofs >/dev/null 2>&1; then
+        echo "error: mkfs.erofs command not found" >&2
+        exit 1
+      fi
+      mkfs.erofs "$OUTPUT_IMAGE" "$source_dir" >/dev/null
+      progress_step "built erofs image"
+      max_bytes=$((SIZE_MB * 1024 * 1024))
+      actual_bytes="$(stat -c %s "$OUTPUT_IMAGE" 2>/dev/null || stat -f %z "$OUTPUT_IMAGE" 2>/dev/null || echo 0)"
+      case "$actual_bytes" in
+        ''|*[!0-9]*)
+          actual_bytes=0
+          ;;
+      esac
+      if [ "$actual_bytes" -gt "$max_bytes" ]; then
+        echo "error: erofs image exceeds requested size-mb: actual_bytes=$actual_bytes limit_bytes=$max_bytes" >&2
+        exit 1
+      fi
+      verify_output_fs_type "erofs"
+      return
       ;;
   esac
   progress_step "formatted and mounted output filesystem"
@@ -474,6 +557,7 @@ build_from_source_dir() {
   if [ "$FS_TYPE" = "btrfs" ]; then
     apply_btrfs_policy "$OUTPUT_MOUNT_DIR"
   fi
+  verify_output_fs_type "$FS_TYPE"
 }
 
 cleanup() {

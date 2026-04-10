@@ -28,12 +28,12 @@ build-imagewriter-help:
 	@echo "  make imagewriter-setup"
 	@echo "    # distros は事前にクリーンされ、_imagewriter を再作成します"
 	@echo ""
-	@echo "Build _imagewriter disk (two-stage ext4 -> btrfs):"
+	@echo "Build _imagewriter disk (two-stage ext4 -> erofs):"
 	@echo "  make build-imagewriter"
-	@echo "    # setup 後に _imagewriter/disk.raw を two-stage で再生成します"
+	@echo "    # setup 後に _imagewriter/disk.raw を readonly EROFS として再生成します"
 	@echo ""
 	@echo "Optional env:"
-	@echo "  IMAGEWRITER_PACKAGES=\"btrfs-progs e2fsprogs util-linux tar zstd xz coreutils\""
+	@echo "  IMAGEWRITER_PACKAGES=\"btrfs-progs e2fsprogs erofs-utils util-linux tar zstd xz coreutils\""
 	@echo "  IMAGEWRITER_CLEAN_DISTROS=1   # default: 1 (cleanup before recreate)"
 	@echo "  IMAGEWRITER_FORCE_SETUP=1     # default for make build-imagewriter: 1"
 	@echo "  MSL_INIT_BOOTLOADER_BINARY_PATH=...  # default: $$HOME/.msl-system/msl-init-bootloader"
@@ -62,7 +62,7 @@ build-imagewriter:
 	IMAGEWRITER_FORCE_SETUP="$${IMAGEWRITER_FORCE_SETUP:-1}" \
 	IMAGEWRITER_INIT_BINARY="$$INIT_BIN_PATH" \
 	IMAGE_SIZE_MB="$$IMAGE_SIZE_MB_VALUE" \
-	IMAGE_FS="btrfs" \
+	IMAGE_FS="erofs" \
 	OUTPUT_RAW="$$OUTPUT_PATH" \
 	MSL_BIN="$(MSL)" \
 	./scripts/imagewriter-build.sh

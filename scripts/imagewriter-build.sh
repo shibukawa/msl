@@ -10,7 +10,7 @@ FORCE_SETUP="${IMAGEWRITER_FORCE_SETUP:-0}"
 ROOTFS_TARBALL="${ROOTFS_TARBALL:-}"
 INIT_BINARY_PATH="${IMAGEWRITER_INIT_BINARY:-}"
 RUN_TIMEOUT="${IMAGEWRITER_RUN_TIMEOUT:-900}"
-IMAGEWRITER_PACKAGES="${IMAGEWRITER_PACKAGES:-btrfs-progs e2fsprogs util-linux tar zstd xz coreutils}"
+IMAGEWRITER_PACKAGES="${IMAGEWRITER_PACKAGES:-btrfs-progs e2fsprogs erofs-utils util-linux tar zstd xz coreutils}"
 IMAGEWRITER_APK_CACHE_DIR="${IMAGEWRITER_APK_CACHE_DIR:-}"
 IMAGEWRITER_APK_RETRY_LIMIT="${IMAGEWRITER_APK_RETRY_LIMIT:-5}"
 
@@ -108,21 +108,40 @@ ensure_virtualization_entitlement() {
 
 ensure_virtualization_entitlement
 
-instance_exists() {
-  "$MSL_BIN" --list 2>/dev/null | sed -e 's/ \[default\]$//' | awk '{print $1}' | grep -Fx "$INSTANCE" >/dev/null 2>&1
+resolve_app_support() {
+  if [ -n "${MSL_HOME:-}" ]; then
+    printf '%s\n' "${MSL_HOME}/Library/Application Support/msl"
+  else
+    printf '%s\n' "${HOME}/Library/Application Support/msl"
+  fi
 }
 
-if [ "$FORCE_SETUP" = "1" ] || ! instance_exists; then
+APP_SUPPORT="$(resolve_app_support)"
+ALLOW_SETUP_WHEN_MISSING="${IMAGEWRITER_ALLOW_SETUP_WHEN_MISSING:-1}"
+REQUIRED_IMAGEWRITER_FS="${IMAGEWRITER_REQUIRED_FS:-}"
+
+instance_disk_path() {
+  printf '%s\n' "$APP_SUPPORT/distros/$INSTANCE/disk.raw"
+}
+
+instance_exists() {
+  [ -f "$(instance_disk_path)" ]
+}
+
+if [ "$FORCE_SETUP" = "1" ]; then
   echo "running imagewriter setup..."
   "$SCRIPT_DIR/imagewriter-setup.sh"
+elif ! instance_exists; then
+  if [ "$ALLOW_SETUP_WHEN_MISSING" = "1" ]; then
+    echo "running imagewriter setup..."
+    "$SCRIPT_DIR/imagewriter-setup.sh"
+  else
+    echo "error: required imagewriter instance is missing: $INSTANCE" >&2
+    echo "hint: run 'make build-imagewriter' or 'make imagewriter-setup && make build-imagewriter' first." >&2
+    exit 25
+  fi
 else
   echo "skipping imagewriter setup (instance exists): $INSTANCE"
-fi
-
-if [ -n "${MSL_HOME:-}" ]; then
-  APP_SUPPORT="${MSL_HOME}/Library/Application Support/msl"
-else
-  APP_SUPPORT="${HOME}/Library/Application Support/msl"
 fi
 
 resolve_share_root() {
@@ -156,6 +175,89 @@ host_to_guest_path() {
       return 1
       ;;
   esac
+}
+
+detect_image_fs_type() {
+  image_path="$1"
+  if [ ! -f "$image_path" ]; then
+    echo ""
+    return 1
+  fi
+  if command -v file >/dev/null 2>&1; then
+    file_desc="$(file -b "$image_path" 2>/dev/null || true)"
+    case "$file_desc" in
+      *BTRFS*|*btrfs*)
+        printf 'btrfs\n'
+        return 0
+        ;;
+      *EROFS*|*erofs*)
+        printf 'erofs\n'
+        return 0
+        ;;
+      *ext4*)
+        printf 'ext4\n'
+        return 0
+        ;;
+    esac
+  fi
+  echo ""
+  return 1
+}
+
+verify_expected_fs_type() {
+  image_path="$1"
+  expected_fs="$2"
+  verify_context="$3"
+
+  actual_fs="$(detect_image_fs_type "$image_path" || true)"
+  if [ -z "$actual_fs" ]; then
+    echo "error: could not determine filesystem type for $verify_context: $image_path" >&2
+    exit 24
+  fi
+  if [ "$actual_fs" != "$expected_fs" ]; then
+    echo "error: filesystem mismatch for $verify_context: expected=$expected_fs actual=$actual_fs path=$image_path" >&2
+    exit 24
+  fi
+  echo "imagewriter_verified_fs context=$verify_context fs=$actual_fs path=$image_path"
+}
+
+verify_guest_visible_fs_type() {
+  guest_path="$1"
+  expected_fs="$2"
+  verify_context="$3"
+
+  if [ -z "$guest_path" ]; then
+    echo "error: guest-visible path is required for $verify_context verification" >&2
+    exit 24
+  fi
+
+  MSL_RUNTIME_USER_ROOT=1 "$MSL_BIN" --instance "$INSTANCE" run --timeout "$RUN_TIMEOUT" -- sh -lc '
+set -eu
+path="$1"
+expected="$2"
+context="$3"
+actual=""
+if command -v blkid >/dev/null 2>&1; then
+  actual="$(blkid -p -s TYPE -o value "$path" 2>/dev/null || true)"
+fi
+if [ -z "$actual" ] && command -v file >/dev/null 2>&1; then
+  file_desc="$(file -b "$path" 2>/dev/null || true)"
+  case "$file_desc" in
+    *BTRFS*|*btrfs*) actual="btrfs" ;;
+    *EROFS*|*erofs*) actual="erofs" ;;
+    *ext4*) actual="ext4" ;;
+  esac
+fi
+if [ -z "$actual" ]; then
+  echo "error: could not determine guest-visible filesystem type for $context: $path" >&2
+  exit 24
+fi
+if [ "$actual" != "$expected" ]; then
+  echo "error: guest-visible filesystem mismatch for $context: expected=$expected actual=$actual path=$path" >&2
+  exit 24
+fi
+echo "imagewriter_verified_fs context=$context fs=$actual path=$path source=guest"
+' sh "$guest_path" "$expected_fs" "$verify_context"
 }
 
 resolve_default_alpine_tarball() {
@@ -215,26 +317,26 @@ if [ -n "$INIT_BINARY_PATH" ] && [ ! -f "$INIT_BINARY_PATH" ]; then
 fi
 
 case "$IMAGE_FS" in
-  btrfs|ext4) ;;
+  btrfs|ext4|erofs) ;;
   *)
-    echo "error: IMAGE_FS must be btrfs or ext4" >&2
+    echo "error: IMAGE_FS must be btrfs, erofs, or ext4" >&2
     exit 1
     ;;
 esac
 
 OUTPUT_RAW="${OUTPUT_RAW:-$APP_SUPPORT/images/imagewriter-${IMAGE_FS}.raw}"
 IMAGE_SIZE_MB="${IMAGE_SIZE_MB:-}"
-TWO_STAGE_BTRFS=0
+TWO_STAGE_IMAGEWRITER=0
 
-if [ "$IMAGE_FS" = "btrfs" ]; then
-  case "$OUTPUT_RAW" in
-    */distros/_imagewriter/disk.raw)
-      TWO_STAGE_BTRFS=1
-      ;;
-  esac
-fi
+case "$OUTPUT_RAW" in
+  */distros/_imagewriter/disk.raw)
+    if [ "$IMAGE_FS" != "ext4" ]; then
+      TWO_STAGE_IMAGEWRITER=1
+    fi
+    ;;
+esac
 
-if [ "$TWO_STAGE_BTRFS" -eq 1 ] && [ -z "$INIT_BINARY_PATH" ]; then
+if [ "$TWO_STAGE_IMAGEWRITER" -eq 1 ] && [ -z "$INIT_BINARY_PATH" ]; then
   echo "error: IMAGEWRITER_INIT_BINARY is required for _imagewriter disk builds (missing /sbin/msl-init-bootloader risk)." >&2
   echo "hint: export MSL_INIT_BOOTLOADER_BINARY_PATH or run ./scripts/build-msl-init.sh, then re-run make build-imagewriter." >&2
   exit 1
@@ -245,7 +347,7 @@ if [ -z "$IMAGE_SIZE_MB" ]; then
   exit 1
 fi
 
-if [ "$IMAGE_FS" = "ext4" ] || [ "$TWO_STAGE_BTRFS" -eq 0 ]; then
+if [ "$IMAGE_FS" = "ext4" ] || [ "$TWO_STAGE_IMAGEWRITER" -eq 0 ]; then
   TOTAL_STEPS=5
 else
   TOTAL_STEPS=7
@@ -259,6 +361,37 @@ case "$SHARE_ROOT" in
     exit 1
     ;;
 esac
+
+GUEST_FINAL_OUTPUT=""
+if GUEST_FINAL_OUTPUT_RESOLVED="$(host_to_guest_path "$OUTPUT_RAW" "$SHARE_ROOT" 2>/dev/null)"; then
+  GUEST_FINAL_OUTPUT="$GUEST_FINAL_OUTPUT_RESOLVED"
+fi
+
+if [ "$FORCE_SETUP" != "1" ] && [ -n "$REQUIRED_IMAGEWRITER_FS" ]; then
+  IMAGEWRITER_DISK="$(instance_disk_path)"
+  if [ ! -f "$IMAGEWRITER_DISK" ]; then
+    echo "error: required imagewriter disk is missing: $IMAGEWRITER_DISK" >&2
+    exit 25
+  fi
+  imagewriter_disk_fs="$(detect_image_fs_type "$IMAGEWRITER_DISK" || true)"
+  if [ -n "$imagewriter_disk_fs" ]; then
+    if [ "$imagewriter_disk_fs" != "$REQUIRED_IMAGEWRITER_FS" ]; then
+      echo "error: imagewriter instance filesystem mismatch: expected=$REQUIRED_IMAGEWRITER_FS actual=$imagewriter_disk_fs path=$IMAGEWRITER_DISK" >&2
+      exit 24
+    fi
+    echo "imagewriter_verified_fs context=imagewriter_instance fs=$imagewriter_disk_fs path=$IMAGEWRITER_DISK source=host"
+  else
+    GUEST_IMAGEWRITER_DISK=""
+    if GUEST_IMAGEWRITER_DISK_RESOLVED="$(host_to_guest_path "$IMAGEWRITER_DISK" "$SHARE_ROOT" 2>/dev/null)"; then
+      GUEST_IMAGEWRITER_DISK="$GUEST_IMAGEWRITER_DISK_RESOLVED"
+    fi
+    if [ -z "$GUEST_IMAGEWRITER_DISK" ]; then
+      echo "error: could not resolve guest-visible path for imagewriter disk: $IMAGEWRITER_DISK" >&2
+      exit 24
+    fi
+    verify_guest_visible_fs_type "$GUEST_IMAGEWRITER_DISK" "$REQUIRED_IMAGEWRITER_FS" "imagewriter_instance"
+  fi
+fi
 
 STAGE_ROOT="$SHARE_ROOT/.msl-imagewriter"
 STAGE_IN_DIR="$STAGE_ROOT/in"
@@ -286,7 +419,7 @@ fi
 STAGE_ROOTFS="$STAGE_IN_DIR/$(basename "$ROOTFS_TARBALL")"
 STAGE_OUTPUT="$STAGE_OUT_DIR/imagewriter-${IMAGE_FS}.raw"
 STAGE1_OUTPUT="$STAGE_OUT_DIR/stage1-ext4.raw"
-STAGE2_OUTPUT="$STAGE_OUT_DIR/stage2-btrfs.raw"
+STAGE2_OUTPUT="$STAGE_OUT_DIR/stage2-${IMAGE_FS}.raw"
 STAGE_TMP_IMAGE="$STAGE_TMP_DIR/guest-tmp-work.raw"
 STAGE_INIT=""
 progress_step "preparing staging area"
@@ -466,9 +599,9 @@ case "$mode" in
     ;;
   stage2)
     if [ -n "$init_bin" ]; then
-      MSL_IMAGEWRITER_WORK_DIR="$tmp_work_dir" sh "$worker" --mode stage2 --rootfs "$input_path" --output "$local_output" --size-mb "$size_mb" --init-binary "$init_bin" --packages "$packages" --apk-cache-dir "$apk_cache" --retry-limit "$apk_retry_limit"
+      MSL_IMAGEWRITER_WORK_DIR="$tmp_work_dir" sh "$worker" --mode stage2 --fs-type "$fs_type" --rootfs "$input_path" --output "$local_output" --size-mb "$size_mb" --init-binary "$init_bin" --packages "$packages" --apk-cache-dir "$apk_cache" --retry-limit "$apk_retry_limit"
     else
-      MSL_IMAGEWRITER_WORK_DIR="$tmp_work_dir" sh "$worker" --mode stage2 --rootfs "$input_path" --output "$local_output" --size-mb "$size_mb" --packages "$packages" --apk-cache-dir "$apk_cache" --retry-limit "$apk_retry_limit"
+      MSL_IMAGEWRITER_WORK_DIR="$tmp_work_dir" sh "$worker" --mode stage2 --fs-type "$fs_type" --rootfs "$input_path" --output "$local_output" --size-mb "$size_mb" --packages "$packages" --apk-cache-dir "$apk_cache" --retry-limit "$apk_retry_limit"
     fi
     ;;
   legacy)
@@ -488,6 +621,24 @@ else
   cp -f "$local_output" "$output"
 fi
 report_file_allocation "guest_shared_output" "$output"
+shared_output_fs="$(blkid -p -s TYPE -o value "$output" 2>/dev/null || true)"
+if [ -z "$shared_output_fs" ] && command -v file >/dev/null 2>&1; then
+  shared_output_desc="$(file -b "$output" 2>/dev/null || true)"
+  case "$shared_output_desc" in
+    *BTRFS*|*btrfs*) shared_output_fs="btrfs" ;;
+    *EROFS*|*erofs*) shared_output_fs="erofs" ;;
+    *ext4*) shared_output_fs="ext4" ;;
+  esac
+fi
+if [ -z "$shared_output_fs" ]; then
+  echo "error: could not determine shared output filesystem type: $output" >&2
+  exit 24
+fi
+if [ "$shared_output_fs" != "$fs_type" ]; then
+  echo "error: shared output filesystem mismatch: expected=$fs_type actual=$shared_output_fs output=$output" >&2
+  exit 24
+fi
+echo "imagewriter_guest_verified_shared_output mode=$mode fs=$shared_output_fs output=$output"
 sync
 cleanup_guest_artifacts
 trap - EXIT INT TERM
@@ -513,7 +664,7 @@ run_guest_worker_with_retry() {
   run_guest_worker "$mode" "$guest_input" "$guest_output" "$fs_type" "$size_mb" "$guest_init" "$packages" "$apk_cache" "$IMAGEWRITER_APK_RETRY_LIMIT" "$GUEST_TMP_IMAGE"
 }
 
-if [ "$IMAGE_FS" = "btrfs" ] && [ "$TWO_STAGE_BTRFS" -eq 1 ]; then
+if [ "$TWO_STAGE_IMAGEWRITER" -eq 1 ]; then
   echo "imagewriter_pipeline mode=two-stage target=$OUTPUT_RAW"
   if ! GUEST_STAGE1_OUTPUT="$(host_to_guest_path "$STAGE1_OUTPUT" "$SHARE_ROOT")"; then
     echo "error: stage1 output path is outside host share root: $STAGE1_OUTPUT (share_root=$SHARE_ROOT)" >&2
@@ -538,21 +689,30 @@ if [ "$IMAGE_FS" = "btrfs" ] && [ "$TWO_STAGE_BTRFS" -eq 1 ]; then
   fi
   progress_step "stage1 ext4 image build completed"
 
-  mark_stage_start "stage2_btrfs" "$GUEST_ROOTFS" "$GUEST_STAGE2_OUTPUT"
-  if run_guest_worker_with_retry stage2 "$GUEST_ROOTFS" "$GUEST_STAGE2_OUTPUT" "btrfs" "$IMAGE_SIZE_MB" "$GUEST_INIT" "$IMAGEWRITER_PACKAGES" "$GUEST_APK_CACHE"; then
-    mark_stage_complete "stage2_btrfs"
+  stage2_name="stage2_${IMAGE_FS}"
+  mark_stage_start "$stage2_name" "$GUEST_ROOTFS" "$GUEST_STAGE2_OUTPUT"
+  if run_guest_worker_with_retry stage2 "$GUEST_ROOTFS" "$GUEST_STAGE2_OUTPUT" "$IMAGE_FS" "$IMAGE_SIZE_MB" "$GUEST_INIT" "$IMAGEWRITER_PACKAGES" "$GUEST_APK_CACHE"; then
+    mark_stage_complete "$stage2_name"
   else
     stage_code=$?
-    mark_stage_failed "stage2_btrfs" "$stage_code"
+    mark_stage_failed "$stage2_name" "$stage_code"
     exit 22
   fi
-  progress_step "stage2 btrfs image build completed"
+  progress_step "stage2 ${IMAGE_FS} image build completed"
+  if [ "$IMAGE_FS" != "erofs" ]; then
+    verify_expected_fs_type "$STAGE2_OUTPUT" "$IMAGE_FS" "$stage2_name"
+  fi
 
   if ! mv -f "$STAGE2_OUTPUT" "$OUTPUT_RAW"; then
     echo "error: failed to move stage2 output into final path: $OUTPUT_RAW" >&2
     exit 23
   fi
   progress_step "moved stage2 output to final output path"
+  if [ -n "$GUEST_FINAL_OUTPUT" ]; then
+    verify_guest_visible_fs_type "$GUEST_FINAL_OUTPUT" "$IMAGE_FS" "final_output"
+  else
+    verify_expected_fs_type "$OUTPUT_RAW" "$IMAGE_FS" "final_output"
+  fi
 
   rm -f "$STAGE1_OUTPUT"
   if [ -e "$STAGE1_OUTPUT" ]; then
@@ -572,7 +732,7 @@ else
     exit 1
   fi
 
-  stage_name="single_pass_btrfs"
+  stage_name="single_pass_${IMAGE_FS}"
   stage_fail_exit=22
   if [ "$IMAGE_FS" = "ext4" ]; then
     stage_name="stage1_ext4"
@@ -588,12 +748,20 @@ else
     exit "$stage_fail_exit"
   fi
   progress_step "guest image build completed"
+  if [ "$IMAGE_FS" != "erofs" ]; then
+    verify_expected_fs_type "$STAGE_OUTPUT" "$IMAGE_FS" "$stage_name"
+  fi
 
   if ! mv -f "$STAGE_OUTPUT" "$OUTPUT_RAW"; then
     echo "error: failed to move built image to output path: $OUTPUT_RAW" >&2
     exit 23
   fi
   progress_step "moved built image to output path"
+  if [ -n "$GUEST_FINAL_OUTPUT" ]; then
+    verify_guest_visible_fs_type "$GUEST_FINAL_OUTPUT" "$IMAGE_FS" "final_output"
+  else
+    verify_expected_fs_type "$OUTPUT_RAW" "$IMAGE_FS" "final_output"
+  fi
 fi
 
 echo "imagewriter build completed"

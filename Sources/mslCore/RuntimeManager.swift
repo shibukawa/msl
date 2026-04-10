@@ -403,9 +403,9 @@ public final class RuntimeManager {
         Foundation.exit(0)
     }
 
-    public func listInstalledInstances() throws -> Never {
+    public func listInstalledInstances(includeReserved: Bool = false) throws -> Never {
         let instances = distributionManager
-            .installedInstances()
+            .installedInstances(includeReserved: includeReserved)
             .filter(\.hasDisk)
 
         if instances.isEmpty {

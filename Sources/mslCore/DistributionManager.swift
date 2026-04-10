@@ -107,7 +107,9 @@ struct ProcessExecutor {
 
 final class DistributionManager {
     static let reservedInternalInstanceNames: Set<String> = ["_imagewriter"]
-    static let defaultImagewriterDiskSizeGB = 64
+    static let defaultBootstrapDiskSizeGB = 8
+    static let defaultInternalImagewriterBootstrapDiskSizeGB = 1
+    static let defaultImagewriterDiskSizeGB = 16
 
     private let paths: MSLPaths
     private let logger: MSLLogger
@@ -221,6 +223,13 @@ final class DistributionManager {
 
     func isReservedInternalInstanceName(_ name: String) -> Bool {
         Self.reservedInternalInstanceNames.contains(name)
+    }
+
+    private func defaultBootstrapDiskSizeGB(for instanceName: String) -> Int {
+        if instanceName == "_imagewriter" {
+            return Self.defaultInternalImagewriterBootstrapDiskSizeGB
+        }
+        return Self.defaultBootstrapDiskSizeGB
     }
 
     @discardableResult
@@ -340,7 +349,7 @@ final class DistributionManager {
             from: rootfsDir,
             sourceArchive: tarballURL,
             outputDisk: diskFile,
-            diskSizeGB: diskSizeGB ?? 8
+            diskSizeGB: diskSizeGB ?? defaultBootstrapDiskSizeGB(for: name)
         )
 
         let sourceRecord: DistributionSourceRecord
@@ -1217,6 +1226,8 @@ final class DistributionManager {
             "MSL_BIN": mslExecutablePath,
             "IMAGEWRITER_CLEAN_DISTROS": "0",
             "IMAGEWRITER_FORCE_SETUP": "0",
+            "IMAGEWRITER_ALLOW_SETUP_WHEN_MISSING": "0",
+            "IMAGEWRITER_REQUIRED_FS": "erofs",
             "IMAGE_FS": "btrfs",
             "ROOTFS_TARBALL": rootfsTarballPath,
             "OUTPUT_RAW": outputDiskPath,
@@ -1244,6 +1255,10 @@ final class DistributionManager {
                 stageHint = "stage=btrfs_build"
             case 23:
                 stageHint = "stage=finalize"
+            case 24:
+                stageHint = "stage=imagewriter_verify"
+            case 25:
+                stageHint = "stage=imagewriter_missing"
             default:
                 stageHint = "stage=unknown"
             }
