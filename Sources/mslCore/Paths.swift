@@ -6,9 +6,14 @@ public struct MSLPaths {
     public let mslHome: URL
     public let mslSystemHome: URL
     public let appSupport: URL
+    public let appRuntime: URL
+    public let runtimeRoot: URL
     public let runtime: URL
     public let logs: URL
     public let appLogs: URL
+    public let appControl: URL
+    public let managerSocketFile: URL
+    public let managerStateFile: URL
     public let lockFile: URL
     public let stateFile: URL
     public let sessionsFile: URL
@@ -39,10 +44,10 @@ public struct MSLPaths {
     public let serialConsoleLogFile: URL
 
     public init(fileManager: FileManager = .default) {
-        self.init(homeDirectoryURL: fileManager.homeDirectoryForCurrentUser)
+        self.init(homeDirectoryURL: fileManager.homeDirectoryForCurrentUser, runtimeRootURL: nil)
     }
 
-    public init(homeDirectoryURL: URL) {
+    public init(homeDirectoryURL: URL, runtimeRootURL: URL? = nil) {
         self.home = homeDirectoryURL
         self.mslHome = homeDirectoryURL.appendingPathComponent("msl-home", isDirectory: true)
         self.mslSystemHome = homeDirectoryURL.appendingPathComponent(".msl-system", isDirectory: true)
@@ -50,9 +55,14 @@ public struct MSLPaths {
             .appendingPathComponent("Library", isDirectory: true)
             .appendingPathComponent("Application Support", isDirectory: true)
             .appendingPathComponent("msl", isDirectory: true)
-        self.runtime = appSupport.appendingPathComponent("runtime", isDirectory: true)
+        self.appRuntime = appSupport.appendingPathComponent("runtime", isDirectory: true)
+        self.runtimeRoot = runtimeRootURL ?? appRuntime
+        self.runtime = runtimeRoot
         self.logs = runtime.appendingPathComponent("logs", isDirectory: true)
         self.appLogs = appSupport.appendingPathComponent("logs", isDirectory: true)
+        self.appControl = appSupport.appendingPathComponent("app", isDirectory: true)
+        self.managerSocketFile = appControl.appendingPathComponent("manager.sock", isDirectory: false)
+        self.managerStateFile = appControl.appendingPathComponent("manager-state.json", isDirectory: false)
         self.lockFile = runtime.appendingPathComponent("lock", isDirectory: false)
         self.stateFile = runtime.appendingPathComponent("state.json", isDirectory: false)
         self.sessionsFile = runtime.appendingPathComponent("sessions.json", isDirectory: false)
@@ -112,6 +122,40 @@ public struct MSLPaths {
         appLogs
             .appendingPathComponent("instances", isDirectory: true)
             .appendingPathComponent(instanceName, isDirectory: true)
+    }
+
+    public func workerContainerDirectory(named instanceName: String) -> URL {
+        appControl
+            .appendingPathComponent("workers", isDirectory: true)
+            .appendingPathComponent(Self.safePathComponent(instanceName), isDirectory: true)
+    }
+
+    public func workerRuntimeDirectory(named instanceName: String) -> URL {
+        workerContainerDirectory(named: instanceName).appendingPathComponent("runtime", isDirectory: true)
+    }
+
+    public func workerControlSocketFile(named instanceName: String) -> URL {
+        workerRuntimeDirectory(named: instanceName).appendingPathComponent("control.sock", isDirectory: false)
+    }
+
+    public func workerEventSocketFile(named instanceName: String) -> URL {
+        workerRuntimeDirectory(named: instanceName).appendingPathComponent("events.sock", isDirectory: false)
+    }
+
+    private static func safePathComponent(_ raw: String) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return "default"
+        }
+        let scalars = trimmed.unicodeScalars.map { scalar -> Character in
+            switch scalar.value {
+            case 48...57, 65...90, 97...122, 45, 46, 95:
+                return Character(scalar)
+            default:
+                return "_"
+            }
+        }
+        return String(scalars)
     }
 
     public func instanceLogsDirectory(named instanceName: String) -> URL {

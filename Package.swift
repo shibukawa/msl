@@ -8,7 +8,8 @@ let package = Package(
     ],
     products: [
         .library(name: "mslCore", targets: ["mslCore"]),
-        .executable(name: "msl", targets: ["msl"])
+        .executable(name: "msl", targets: ["msl"]),
+        .executable(name: "MSLDesktop", targets: ["MSLDesktop"])
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.3.0")
@@ -25,6 +26,13 @@ let package = Package(
                 .product(name: "ArgumentParser", package: "swift-argument-parser")
             ],
             path: "Sources/msl"
+        ),
+        .executableTarget(
+            name: "MSLDesktop",
+            dependencies: [
+                "mslCore"
+            ],
+            path: "Sources/MSLDesktop"
         ),
         .testTarget(
             name: "mslTests",

@@ -1156,6 +1156,11 @@ public final class DaemonServer {
             try bus.start()
             logger.log("daemon_event_socket_started", fields: ["path": eventSocketPath])
             updateStateStepCompleted(step: .eventSocketStart, instanceName: instanceName)
+            registerWorkerWithManagerIfNeeded(
+                instanceName: instanceName,
+                controlSocketPath: controlSocketPath,
+                eventSocketPath: eventSocketPath
+            )
         } catch {
             updateStateBootFailed(
                 step: .eventSocketStart,
@@ -5686,6 +5691,7 @@ public final class DaemonServer {
     }
 
     private func shutdown() {
+        unregisterWorkerWithManagerIfNeeded(instanceName: currentRuntimeInstanceName())
         stopDNSMonitorLoop()
         stopAutoPortForwardLoop()
         stopMemoryReclaimLoop()
@@ -5713,6 +5719,49 @@ public final class DaemonServer {
         reconcileHostManagedHostnames(reason: "daemon_shutdown")
         updateStateStopped()
         logger.log("daemon_stopped")
+    }
+
+    private func registerWorkerWithManagerIfNeeded(
+        instanceName: String,
+        controlSocketPath: String,
+        eventSocketPath: String
+    ) {
+        guard let managerSocketPath = ProcessInfo.processInfo.environment["MSL_MANAGER_SOCKET"],
+              !managerSocketPath.isEmpty else {
+            return
+        }
+        let client = ManagerControlClient(socketPath: managerSocketPath)
+        let response = try? client.send(
+            ManagerControlRequest(
+                op: "worker_register",
+                instance: instanceName,
+                pid: Int32(getpid()),
+                runtimeRoot: paths.runtimeRoot.path,
+                controlSocketPath: controlSocketPath,
+                eventSocketPath: eventSocketPath,
+                lifecycleState: .running
+            )
+        )
+        if response?.ok != true {
+            logger.log("worker_register_failed", fields: [
+                "instance": instanceName,
+                "error": response?.error ?? "unknown"
+            ])
+        }
+    }
+
+    private func unregisterWorkerWithManagerIfNeeded(instanceName: String) {
+        guard let managerSocketPath = ProcessInfo.processInfo.environment["MSL_MANAGER_SOCKET"],
+              !managerSocketPath.isEmpty else {
+            return
+        }
+        let client = ManagerControlClient(socketPath: managerSocketPath)
+        _ = try? client.send(
+            ManagerControlRequest(
+                op: "worker_unregister",
+                instance: instanceName
+            )
+        )
     }
 
     private func updateStateStopped(lastError: String? = nil, clearError: Bool? = nil) {

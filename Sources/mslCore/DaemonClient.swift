@@ -14,6 +14,7 @@ public final class DaemonClient {
 
     private var client: RuntimeControlClient?
     private var connectedInstanceName: String?
+    private var connectedSocketPath: String?
 
     public init(
         paths: MSLPaths,
@@ -73,85 +74,28 @@ public final class DaemonClient {
         if client != nil {
             return
         }
-
-        try cleanupStaleDaemonsIfNeeded(expectedInstanceName: expectedInstanceName)
-
-        // Check if daemon is already running
-        let initialState = try? lock.withExclusiveLock(timeoutSec: 2, { try store.loadState() })
-        if let state = initialState,
-           (state.daemonHostPid ?? state.runtimeHostPid) != nil {
-            let daemonPid = state.daemonHostPid ?? state.runtimeHostPid ?? 0
-            if isDaemonAlive(pid: daemonPid) {
-                // Daemon is running, connect
-                let socketPath = state.runtimeControlSocket ?? paths.runtimeControlSocketFile.path
-                let c = RuntimeControlClient(socketPath: socketPath)
-                do {
-                    try c.connect()
-                    self.client = c
-                    self.connectedInstanceName = expectedInstanceName ?? state.distro
-                    logger.log("daemon_client_connected_warm")
-                    return
-                } catch {
-                    // Socket exists but connection failed — only treat stopped/error state as stale.
-                    logger.log("daemon_client_stale_socket", fields: ["error": String(describing: error)])
-                    if state.lifecycleState == .stopped || state.lifecycleState == .error {
-                        try cleanupStaleDaemonState(
-                            expectedInstanceName: expectedInstanceName,
-                            additionalPIDs: daemonPid > 0 ? [daemonPid] : []
-                        )
-                    } else {
-                        logger.log("daemon_client_existing_daemon_wait", fields: [
-                            "pid": String(daemonPid),
-                            "instance": expectedInstanceName ?? state.distro,
-                            "lifecycle_state": state.lifecycleState.rawValue
-                        ])
-                        try waitForDaemonReady(
-                            socketPath: socketPath,
-                            daemonPID: daemonPid,
-                            expectedInstanceName: expectedInstanceName ?? state.distro,
-                            launchedAfterEpochMs: state.startupEpochMs ?? nowEpochMs(),
-                            printReadyBanner: false
-                        )
-                        return
-                    }
-                }
-            }
-        }
-
-        if let existingDaemon = existingDaemonProcess(expectedInstanceName: expectedInstanceName) {
-            let instanceName = expectedInstanceName ?? initialState?.distro ?? existingDaemon.instanceName ?? "default"
-            let socketPath = initialState?.runtimeControlSocket ?? paths.runtimeControlSocketFile.path
-            logger.log("daemon_client_reusing_existing_daemon", fields: [
-                "pid": String(existingDaemon.pid),
-                "instance": instanceName,
-                "socket_path": socketPath
-            ])
-            try waitForDaemonReady(
-                socketPath: socketPath,
-                daemonPID: existingDaemon.pid,
-                expectedInstanceName: instanceName,
-                launchedAfterEpochMs: initialState?.startupEpochMs ?? 0,
-                printReadyBanner: false
+        let targetInstance = try resolveTargetInstanceName(explicit: expectedInstanceName)
+        let managerClient = try connectManager()
+        let response = try managerClient.send(
+            ManagerControlRequest(
+                op: "ensure_instance",
+                instance: targetInstance,
+                callerCwd: callerCwd,
+                hostShareRoot: hostShareRoot
             )
-            return
+        )
+        guard response.ok, let worker = response.worker else {
+            throw MSLRuntimeError(response.error ?? "failed to resolve worker for instance '\(targetInstance)'")
         }
-
-        // Daemon not running — start it
-        fputs("msl: starting VM...\n", stderr)
-        let launchStartMs = nowEpochMs()
-        let launchedDaemonPID = try startDaemon(
-            instanceName: expectedInstanceName,
-            hostShareRoot: hostShareRoot,
-            callerCwd: callerCwd
-        )
-
-        try waitForDaemonReady(
-            socketPath: paths.runtimeControlSocketFile.path,
-            daemonPID: launchedDaemonPID,
-            expectedInstanceName: expectedInstanceName,
-            launchedAfterEpochMs: launchStartMs,
-            printReadyBanner: true
-        )
+        let c = RuntimeControlClient(socketPath: worker.controlSocketPath)
+        try c.connect()
+        client = c
+        connectedInstanceName = targetInstance
+        connectedSocketPath = worker.controlSocketPath
+        logger.log("daemon_client_connected_via_manager", fields: [
+            "instance": targetInstance,
+            "socket_path": worker.controlSocketPath
+        ])
     }
 
     /// Send a request to the daemon. Auto-connects if needed.
@@ -170,7 +114,7 @@ public final class DaemonClient {
         defer { rpcLock.unlock() }
         try ensureConnectedLocked()
         let socketPath = paths.runtimeControlSocketFile.path
-        let c = RuntimeControlClient(socketPath: socketPath)
+        let c = RuntimeControlClient(socketPath: connectedSocketPath ?? socketPath)
         try c.connect()
         defer { c.disconnect() }
         try c.sendPersistentNoReply(request)
@@ -182,7 +126,7 @@ public final class DaemonClient {
         rpcLock.lock()
         defer { rpcLock.unlock() }
         try ensureConnectedLocked()
-        let socketPath = paths.runtimeControlSocketFile.path
+        let socketPath = connectedSocketPath ?? paths.runtimeControlSocketFile.path
         let c = RuntimeControlClient(socketPath: socketPath)
         return try c.send(request)
     }
@@ -196,7 +140,7 @@ public final class DaemonClient {
         rpcLock.lock()
         do {
             try ensureConnectedLocked()
-            socketPath = paths.runtimeControlSocketFile.path
+            socketPath = connectedSocketPath ?? paths.runtimeControlSocketFile.path
         } catch {
             rpcLock.unlock()
             throw error
@@ -212,7 +156,7 @@ public final class DaemonClient {
         rpcLock.lock()
         do {
             try ensureConnectedLocked()
-            socketPath = paths.runtimeControlSocketFile.path
+            socketPath = connectedSocketPath ?? paths.runtimeControlSocketFile.path
         } catch {
             rpcLock.unlock()
             throw error
@@ -229,7 +173,7 @@ public final class DaemonClient {
         rpcLock.lock()
         do {
             try ensureConnectedLocked()
-            socketPath = paths.runtimeControlSocketFile.path
+            socketPath = connectedSocketPath ?? paths.runtimeControlSocketFile.path
         } catch {
             rpcLock.unlock()
             throw error
@@ -244,7 +188,7 @@ public final class DaemonClient {
         rpcLock.lock()
         do {
             try ensureConnectedLocked()
-            socketPath = paths.runtimeControlSocketFile.path
+            socketPath = connectedSocketPath ?? paths.runtimeControlSocketFile.path
         } catch {
             rpcLock.unlock()
             throw error
@@ -261,6 +205,66 @@ public final class DaemonClient {
         client?.disconnect()
         client = nil
         connectedInstanceName = nil
+        connectedSocketPath = nil
+    }
+
+    private func resolveTargetInstanceName(explicit instanceName: String?) throws -> String {
+        if let instanceName, !instanceName.isEmpty {
+            return instanceName
+        }
+        let state = try lock.withExclusiveLock(timeoutSec: 2) { try store.loadState() }
+        return state.distro
+    }
+
+    private func connectManager() throws -> ManagerControlClient {
+        let socketPath = paths.managerSocketFile.path
+        let client = ManagerControlClient(socketPath: socketPath)
+        let appManagerStateStore = AppManagerStateStore(paths: paths, fileManager: .default)
+        _ = try? appManagerStateStore.reconcile(pingManager: {
+            guard let response = try? client.send(ManagerControlRequest(op: "app_ping")) else {
+                return false
+            }
+            return response.ok
+        })
+        if (try? client.send(ManagerControlRequest(op: "app_ping")).ok) == true {
+            return client
+        }
+        try launchDesktopApp()
+        let deadline = Date().addingTimeInterval(15)
+        while Date() < deadline {
+            if let response = try? client.send(ManagerControlRequest(op: "app_ping")), response.ok {
+                return client
+            }
+            Thread.sleep(forTimeInterval: 0.2)
+        }
+        throw MSLRuntimeError("GUI manager did not become ready")
+    }
+
+    private func launchDesktopApp() throws {
+        let appBundlePath = resolveDesktopAppBundlePath()
+        guard FileManager.default.fileExists(atPath: appBundlePath) else {
+            throw MSLRuntimeError("MSLDesktop.app was not found at \(appBundlePath). Build the desktop app first.")
+        }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        process.arguments = ["-gj", appBundlePath]
+        try process.run()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else {
+            throw MSLRuntimeError("failed to launch GUI manager (requires a logged-in macOS GUI session)")
+        }
+    }
+
+    private func resolveDesktopAppBundlePath() -> String {
+        if let override = ProcessInfo.processInfo.environment["MSL_DESKTOP_APP"], !override.isEmpty {
+            return override
+        }
+        let executableURL = URL(fileURLWithPath: executablePath).resolvingSymlinksInPath()
+        let executableDir = executableURL.deletingLastPathComponent()
+        if executableDir.lastPathComponent == "MacOS" {
+            return executableDir.deletingLastPathComponent().deletingLastPathComponent().path
+        }
+        return executableDir.appendingPathComponent("MSLDesktop.app", isDirectory: true).path
     }
 
     // MARK: - Daemon Startup

@@ -55,9 +55,9 @@ func handleInternalRuntimeFlags(_ parsed: MSLGlobalRuntimeOptions) -> Bool {
     let instanceName = parsed.instanceName
     let args = parsed.remainingArguments
 
-    if args.count == 1, args[0] == "--_daemon" {
+    if args.count == 1, args[0] == "--_worker" {
         withRuntimeManager { manager in
-            try manager.runDaemon(instanceName: instanceName)
+            try manager.runWorker(instanceName: instanceName)
         }
         return true
     }

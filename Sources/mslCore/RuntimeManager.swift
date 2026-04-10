@@ -28,6 +28,7 @@ public final class RuntimeManager {
     private let logger: MSLLogger
     private let executablePath: String
     private let defaultInstanceStore: DefaultInstanceStore
+    private let appManagerStateStore: AppManagerStateStore
 
     private lazy var daemonClient: DaemonClient = {
         DaemonClient(
@@ -45,16 +46,25 @@ public final class RuntimeManager {
 
     public init(executablePath: String, fileManager: FileManager = .default) throws {
         self.fileManager = fileManager
+        let runtimeRootOverride = ProcessInfo.processInfo.environment["MSL_RUNTIME_ROOT"]
+            .flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0, isDirectory: true) }
         if let homeOverride = ProcessInfo.processInfo.environment["MSL_HOME"], !homeOverride.isEmpty {
-            self.paths = MSLPaths(homeDirectoryURL: URL(fileURLWithPath: homeOverride))
+            self.paths = MSLPaths(
+                homeDirectoryURL: URL(fileURLWithPath: homeOverride),
+                runtimeRootURL: runtimeRootOverride
+            )
         } else {
-            self.paths = MSLPaths(fileManager: fileManager)
+            self.paths = MSLPaths(
+                homeDirectoryURL: fileManager.homeDirectoryForCurrentUser,
+                runtimeRootURL: runtimeRootOverride
+            )
         }
 
         try fileManager.createDirectory(at: paths.runtime, withIntermediateDirectories: true)
         try fileManager.createDirectory(at: paths.logs, withIntermediateDirectories: true)
         try fileManager.createDirectory(at: paths.appLogs, withIntermediateDirectories: true)
         try fileManager.createDirectory(at: paths.appSupport, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: paths.appControl, withIntermediateDirectories: true)
         try fileManager.createDirectory(at: paths.distrosDir, withIntermediateDirectories: true)
         try fileManager.createDirectory(at: paths.cacheDir, withIntermediateDirectories: true)
         try fileManager.createDirectory(at: paths.cacheDownloadsDir, withIntermediateDirectories: true)
@@ -68,6 +78,7 @@ public final class RuntimeManager {
         self.sessions = SessionManager(store: store)
         self.executablePath = RuntimeManager.resolveExecutablePath(executablePath, fileManager: fileManager)
         self.defaultInstanceStore = DefaultInstanceStore(paths: paths, fileManager: fileManager)
+        self.appManagerStateStore = AppManagerStateStore(paths: paths, fileManager: fileManager)
 
         do {
             try distributionManager.migrateLegacyRootfsCacheIfNeeded()
@@ -632,8 +643,8 @@ public final class RuntimeManager {
         Foundation.exit(exitCode)
     }
 
-    /// Run the daemon process (entry point for `msl --_daemon`).
-    public func runDaemon(instanceName: String? = nil) throws -> Never {
+    /// Run the VM worker process (entry point for `msl --_worker`).
+    public func runWorker(instanceName: String? = nil) throws -> Never {
         let daemon = try DaemonServer(executablePath: executablePath, explicitInstanceName: instanceName)
         try daemon.run()
     }
@@ -891,6 +902,7 @@ public final class RuntimeManager {
     }
 
     public func printStatus(instanceName: String? = nil, all: Bool = false) throws {
+        let managerSnapshot = appManagerSnapshot()
         let state: RuntimeState = try lock.withExclusiveLock {
             try bootstrap.ensureBootstrapped(context: .runtime)
             var s = try store.loadState()
@@ -929,10 +941,32 @@ public final class RuntimeManager {
         let instances = (state.instances?.isEmpty == false ? state.instances! : [fallbackInstance]).sorted {
             $0.instance < $1.instance
         }
+        let managerMapped = managerSnapshot.workers.map { worker in
+            RuntimeInstanceState(
+                instance: worker.instanceName,
+                vmState: worker.lifecycleState == .running ? .running : .stopped,
+                lifecycleState: worker.lifecycleState,
+                activeSessionCount: 0,
+                idleTimer: IdleTimerState(),
+                runtimeUser: nil,
+                initChannel: nil,
+                runtimeHostPid: worker.pid,
+                runtimeControlSocket: worker.controlSocketPath,
+                lastError: worker.lastErrorMessage,
+                lastErrorCode: nil,
+                lastErrorMessage: worker.lastErrorMessage,
+                startupEpochMs: nil,
+                startupStep: worker.startupStep,
+                startupStepName: worker.startupStepName,
+                startupStepStatus: nil,
+                lastTransitionEpochMs: worker.lastTransitionEpochMs
+            )
+        }
+        let statusEntries = managerMapped.isEmpty ? instances : managerMapped.sorted { $0.instance < $1.instance }
 
         if all {
             print("INSTANCE\tSTATE\tLIFECYCLE\tSTEP\tSESSIONS\tIDLE\tPID\tLAST_ERROR")
-            for entry in instances {
+            for entry in statusEntries {
                 let idle = entry.idleTimer.armed ? "armed" : "not-armed"
                 let pid = entry.runtimeHostPid.map(String.init) ?? "-"
                 let lastError = (entry.lastErrorMessage ?? entry.lastError)?.replacingOccurrences(of: "\n", with: " ") ?? "-"
@@ -943,7 +977,7 @@ public final class RuntimeManager {
         }
 
         let targetInstance = instanceName ?? state.distro
-        guard let selected = instances.first(where: { $0.instance == targetInstance }) else {
+        guard let selected = statusEntries.first(where: { $0.instance == targetInstance }) else {
             throw MSLRuntimeError("instance '\(targetInstance)' not found")
         }
         print("instance: \(selected.instance)")
@@ -1117,44 +1151,49 @@ public final class RuntimeManager {
     }
 
     public func stopVM(instanceName: String? = nil, all: Bool = false) throws {
-        // Try sending stop via daemon control socket first
-        var attemptedDaemonStop = false
-        do {
-            let state = try lock.withExclusiveLock(timeoutSec: 2) { try store.loadState() }
-            let daemonPid = state.daemonHostPid ?? state.runtimeHostPid
-            if let daemonPid, isDaemonAlive(pid: daemonPid) {
-                attemptedDaemonStop = true
-                let socketPath = state.daemonControlSocket ?? state.runtimeControlSocket ?? paths.runtimeControlSocketFile.path
-                let client = RuntimeControlClient(socketPath: socketPath)
-                let resp = try client.send(RuntimeControlRequest(
-                    op: "instance_stop",
-                    instance: instanceName,
-                    all: all,
-                    callerCwd: currentCallerCwd()
-                ))
-                if resp.ok {
-                    if all || (instanceName == nil || instanceName == state.distro) {
-                        for _ in 0..<30 {
-                            if !isDaemonAlive(pid: daemonPid) { break }
-                            Thread.sleep(forTimeInterval: 0.1)
+        let client = ManagerControlClient(socketPath: paths.managerSocketFile.path)
+        let staleSnapshot = appManagerSnapshot()
+        let target = resolveStopTargetName(explicitInstanceName: instanceName)
+        if FileManager.default.fileExists(atPath: paths.managerSocketFile.path) {
+            do {
+                if all {
+                    for worker in staleSnapshot.workers {
+                        let response = try client.send(ManagerControlRequest(op: "stop_instance", instance: worker.instanceName))
+                        if !response.ok {
+                            throw MSLRuntimeError(response.error ?? "stop failed for \(worker.instanceName)")
                         }
                     }
-                    if all {
-                        print("stopped all")
-                    } else if let instanceName, !instanceName.isEmpty {
-                        print("stopped \(instanceName)")
-                    } else {
-                        print("stopped")
-                    }
+                    print("stopped all")
                     return
                 }
-                throw MSLRuntimeError(resp.error ?? "stop failed")
-            }
-        } catch {
-            if attemptedDaemonStop {
+                if let target {
+                    let response = try client.send(ManagerControlRequest(op: "stop_instance", instance: target))
+                    if response.ok {
+                        print("stopped \(target)")
+                        return
+                    }
+                    throw MSLRuntimeError(response.error ?? "stop failed")
+                }
+            } catch {
+                if isManagerUnavailable(error) {
+                    try handleStopWithUnavailableManager(
+                        explicitInstanceName: instanceName,
+                        targetInstanceName: target,
+                        all: all,
+                        staleSnapshot: staleSnapshot
+                    )
+                    return
+                }
                 throw error
             }
-            // Fall through to legacy stop
+        } else {
+            try handleStopWithUnavailableManager(
+                explicitInstanceName: instanceName,
+                targetInstanceName: target,
+                all: all,
+                staleSnapshot: staleSnapshot
+            )
+            return
         }
 
         if all {
@@ -1199,9 +1238,8 @@ public final class RuntimeManager {
         var instanceRunning = false
         try lock.withExclusiveLock {
             try bootstrap.ensureBootstrapped(context: .runtime)
-            let runtime = try store.loadState()
-            instanceRunning = isInstanceRunning(runtime, instanceName: target.instanceName)
-            runtimeSocket = runtime.runtimeControlSocket
+            instanceRunning = appManagerSnapshot().workers.contains(where: { $0.instanceName == target.instanceName })
+            runtimeSocket = try? runtimeSocketPath(forInstance: target.instanceName)
             var state = try store.loadPortMappings()
             if let existing = state.mappings.first(where: { $0.hostPort == mapping.hostPort }) {
                 if existing.instance == target.instanceName {
@@ -1250,8 +1288,13 @@ public final class RuntimeManager {
         }
         let manualHostPorts = Set(mappings.map { $0.hostPort })
 
-        let runtimeStatus: [RuntimePortStatusItem] = (try? RuntimeControlClient(socketPath: paths.runtimeControlSocketFile.path)
-            .send(RuntimeControlRequest(op: "port_ls", instance: target.instanceName, hostPort: nil, guestPort: nil)).items) ?? []
+        let runtimeStatus: [RuntimePortStatusItem]
+        if let runtimeSocketPath = try? runtimeSocketPath(forInstance: target.instanceName) {
+            runtimeStatus = (try? RuntimeControlClient(socketPath: runtimeSocketPath)
+                .send(RuntimeControlRequest(op: "port_ls", instance: target.instanceName, hostPort: nil, guestPort: nil)).items) ?? []
+        } else {
+            runtimeStatus = []
+        }
 
         if mappings.isEmpty, runtimeStatus.isEmpty {
             print("no port mappings")
@@ -1311,9 +1354,8 @@ public final class RuntimeManager {
         var runtimeSocket: String?
         let removed = try lock.withExclusiveLock { () throws -> Bool in
             try bootstrap.ensureBootstrapped(context: .runtime)
-            let runtime = try store.loadState()
-            instanceRunning = isInstanceRunning(runtime, instanceName: target.instanceName)
-            runtimeSocket = runtime.runtimeControlSocket
+            instanceRunning = appManagerSnapshot().workers.contains(where: { $0.instanceName == target.instanceName })
+            runtimeSocket = try? runtimeSocketPath(forInstance: target.instanceName)
             var state = try store.loadPortMappings()
             let originalCount = state.mappings.count
             state.mappings.removeAll { $0.hostPort == hostPort && $0.instance == target.instanceName }
@@ -1469,6 +1511,96 @@ public final class RuntimeManager {
         return kill(pid, 0) == 0 || errno == EPERM
     }
 
+    private func appManagerSnapshot() -> AppManagerState {
+        (try? appManagerStateStore.load()) ?? .initial(nowMs: nowEpochMs())
+    }
+
+    @discardableResult
+    private func reconcileAppManagerState() throws -> AppManagerStateReconciliationResult {
+        try appManagerStateStore.reconcile(pingManager: { [paths] in
+            let client = ManagerControlClient(socketPath: paths.managerSocketFile.path)
+            guard let response = try? client.send(ManagerControlRequest(op: "app_ping")) else {
+                return false
+            }
+            return response.ok
+        })
+    }
+
+    private func runtimeSocketPath(forInstance instanceName: String) throws -> String {
+        if let worker = appManagerSnapshot().workers.first(where: { $0.instanceName == instanceName }) {
+            return worker.controlSocketPath
+        }
+        throw MSLRuntimeError("instance '\(instanceName)' is not running")
+    }
+
+    private func resolveStopTargetName(explicitInstanceName: String?) -> String? {
+        if let explicitInstanceName,
+           !explicitInstanceName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return explicitInstanceName.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        if let configured = (try? defaultInstanceStore.loadDefaultInstanceName()) ?? nil,
+           !configured.isEmpty {
+            return configured
+        }
+        return nil
+    }
+
+    private func handleStopWithUnavailableManager(
+        explicitInstanceName: String?,
+        targetInstanceName: String?,
+        all: Bool,
+        staleSnapshot: AppManagerState
+    ) throws {
+        let reconciliation = try reconcileAppManagerState()
+        if all {
+            if staleSnapshot.workers.isEmpty && !reconciliation.hadTrackedWorkers {
+                print("already stopped")
+            } else {
+                print("stopped all")
+            }
+            return
+        }
+
+        if let explicitInstanceName,
+           !explicitInstanceName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let explicit = explicitInstanceName.trimmingCharacters(in: .whitespacesAndNewlines)
+            if reconciliation.trackedWorker(instanceName: explicit)
+                || staleSnapshot.workers.contains(where: { $0.instanceName == explicit }) {
+                print("stopped \(explicit)")
+                return
+            }
+            if distributionManager.instanceExists(named: explicit) {
+                throw MSLRuntimeError("instance '\(explicit)' is not running")
+            }
+            throw MSLRuntimeError("instance '\(explicit)' not found")
+        }
+
+        if let targetInstanceName,
+           (reconciliation.trackedWorker(instanceName: targetInstanceName)
+                || staleSnapshot.workers.contains(where: { $0.instanceName == targetInstanceName })) {
+            print("stopped \(targetInstanceName)")
+            return
+        }
+
+        print("already stopped")
+    }
+
+    private func isManagerUnavailable(_ error: Error) -> Bool {
+        if let posix = error as? POSIXError {
+            switch posix.code {
+            case .ECONNREFUSED, .ENOENT, .ENOTSOCK, .ECONNABORTED, .ECONNRESET:
+                return true
+            default:
+                break
+            }
+        }
+        let description = String(describing: error).lowercased()
+        return description.contains("connection refused")
+            || description.contains("no such file or directory")
+            || description.contains("not a socket")
+            || description.contains("socket is not connected")
+    }
+
     func shouldTerminateInteractiveShellAttach(for error: Error?) -> Bool {
         if hasInteractiveShellAttachStateEnded() {
             return true
@@ -1480,8 +1612,19 @@ public final class RuntimeManager {
     }
 
     func hasInteractiveShellAttachStateEnded() -> Bool {
-        guard let state = try? lock.withExclusiveLock(timeoutSec: 1, { try store.loadState() }) else {
+        let snapshot = appManagerSnapshot()
+        if let worker = snapshot.workers.first {
+            if !isDaemonAlive(pid: worker.pid) {
+                return true
+            }
+            let socketPath = worker.controlSocketPath
+            if !socketPath.isEmpty, !fileManager.fileExists(atPath: socketPath) {
+                return true
+            }
             return false
+        }
+        guard let state = try? lock.withExclusiveLock(timeoutSec: 1, { try store.loadState() }) else {
+            return true
         }
         let daemonPid = state.daemonHostPid ?? state.runtimeHostPid
         guard let daemonPid else {
@@ -1490,8 +1633,8 @@ public final class RuntimeManager {
         if !isDaemonAlive(pid: daemonPid) {
             return true
         }
-        let socketPath = state.daemonControlSocket ?? state.runtimeControlSocket
-        if let socketPath, !socketPath.isEmpty, !fileManager.fileExists(atPath: socketPath) {
+        let socketPath = state.daemonControlSocket ?? state.runtimeControlSocket ?? ""
+        if !socketPath.isEmpty, !fileManager.fileExists(atPath: socketPath) {
             return true
         }
         return false

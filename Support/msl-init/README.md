@@ -18,6 +18,12 @@ If target is missing:
 rustup target add aarch64-unknown-linux-musl
 ```
 
+Host linker requirements on macOS:
+- `clang`
+- `lld` (`brew install llvm`)
+
+This repo pins the musl target linker via `Support/msl-init/.cargo/config.toml` and uses [`scripts/link-msl-init.sh`](/Users/shibukawayoshiki/.codex/worktrees/0aae/msl/scripts/link-msl-init.sh) so Cargo does not fall back to macOS `ld64`.
+
 Output:
 - `target/aarch64-unknown-linux-musl/release/msl-init`
 - `target/aarch64-unknown-linux-musl/release/msl-init-bootloader`
