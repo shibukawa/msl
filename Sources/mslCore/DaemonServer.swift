@@ -225,6 +225,7 @@ public final class DaemonServer {
     }
 
     private let paths: MSLPaths
+    private let fileManager: FileManager
     private let lock: FileLock
     private let store: StateStore
     private let bootstrap: BootstrapManager
@@ -248,6 +249,8 @@ public final class DaemonServer {
     private var vmRunner: VirtualMachineRunner?
     private var controlServer: RuntimeControlServer?
     private var eventBus: DaemonEventBus?
+    private var sshListener: LocalhostSSHServer?
+    private var sshInfo: LocalhostSSHInfo?
     private var attachedContainerDaemons: [String: AttachedContainerDaemon] = [:]
     private var forwarder: PortForwardingManager?
     private var runtimeMetadataURL: URL?
@@ -753,10 +756,19 @@ public final class DaemonServer {
         explicitInstanceName: String? = nil,
         fileManager: FileManager = .default
     ) throws {
+        self.fileManager = fileManager
+        let runtimeRootOverride = ProcessInfo.processInfo.environment["MSL_RUNTIME_ROOT"]
+            .flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0, isDirectory: true) }
         if let homeOverride = ProcessInfo.processInfo.environment["MSL_HOME"], !homeOverride.isEmpty {
-            self.paths = MSLPaths(homeDirectoryURL: URL(fileURLWithPath: homeOverride))
+            self.paths = MSLPaths(
+                homeDirectoryURL: URL(fileURLWithPath: homeOverride),
+                runtimeRootURL: runtimeRootOverride
+            )
         } else {
-            self.paths = MSLPaths(fileManager: fileManager)
+            self.paths = MSLPaths(
+                homeDirectoryURL: fileManager.homeDirectoryForCurrentUser,
+                runtimeRootURL: runtimeRootOverride
+            )
         }
 
         try fileManager.createDirectory(at: paths.runtime, withIntermediateDirectories: true)
@@ -1182,10 +1194,27 @@ public final class DaemonServer {
             try bus.start()
             logger.log("daemon_event_socket_started", fields: ["path": eventSocketPath])
             updateStateStepCompleted(step: .eventSocketStart, instanceName: instanceName)
+            let runtimeUser = instanceContext.runtimeUser?.name ?? "root"
+            let sshManager = LocalhostSSHManager(
+                paths: paths,
+                lock: lock,
+                store: store,
+                logger: logger,
+                executablePath: executablePath,
+                fileManager: fileManager
+            )
+            let listener = try sshManager.start(
+                instanceName: instanceName,
+                requestedPort: nil,
+                runtimeUser: runtimeUser
+            )
+            sshListener = listener.server
+            sshInfo = listener.info
             registerWorkerWithManagerIfNeeded(
                 instanceName: instanceName,
                 controlSocketPath: controlSocketPath,
-                eventSocketPath: eventSocketPath
+                eventSocketPath: eventSocketPath,
+                sshInfo: listener.info
             )
         } catch {
             updateStateBootFailed(
@@ -5732,6 +5761,9 @@ public final class DaemonServer {
         stopAutoPortForwardLoop()
         stopMemoryReclaimLoop()
         disarmAllIdleTimers()
+        sshListener?.stop()
+        sshListener = nil
+        sshInfo = nil
         controlServer?.stop()
         eventBus?.stop()
         for daemon in attachedContainerDaemons.values {
@@ -5760,7 +5792,8 @@ public final class DaemonServer {
     private func registerWorkerWithManagerIfNeeded(
         instanceName: String,
         controlSocketPath: String,
-        eventSocketPath: String
+        eventSocketPath: String,
+        sshInfo: LocalhostSSHInfo?
     ) {
         guard let managerSocketPath = ProcessInfo.processInfo.environment["MSL_MANAGER_SOCKET"],
               !managerSocketPath.isEmpty else {
@@ -5775,6 +5808,9 @@ public final class DaemonServer {
                 runtimeRoot: paths.runtimeRoot.path,
                 controlSocketPath: controlSocketPath,
                 eventSocketPath: eventSocketPath,
+                sshInfo: sshInfo,
+                sshListenerState: sshInfo == nil ? "error" : "running",
+                sshLastErrorMessage: sshInfo == nil ? "ssh listener did not start" : nil,
                 lifecycleState: .running
             )
         )

@@ -141,6 +141,19 @@ public final class AppManager {
                     hostShareRoot: request.hostShareRoot
                 )
                 return ManagerControlResponse(ok: true, worker: worker)
+            case "ssh_info":
+                guard let instance = request.instance?.trimmingCharacters(in: .whitespacesAndNewlines), !instance.isEmpty else {
+                    return ManagerControlResponse(ok: false, error: "missing instance")
+                }
+                let worker = try ensureWorker(
+                    instanceName: instance,
+                    callerCwd: request.callerCwd,
+                    hostShareRoot: request.hostShareRoot
+                )
+                guard let sshInfo = worker.sshInfo else {
+                    return ManagerControlResponse(ok: false, error: "ssh listener is not ready for instance '\(instance)'")
+                }
+                return ManagerControlResponse(ok: true, sshInfo: sshInfo, worker: worker)
             case "stop_instance":
                 guard let instance = request.instance?.trimmingCharacters(in: .whitespacesAndNewlines), !instance.isEmpty else {
                     return ManagerControlResponse(ok: false, error: "missing instance")
@@ -164,6 +177,9 @@ public final class AppManager {
                     runtimeRoot: runtimeRoot,
                     controlSocketPath: controlSocketPath,
                     eventSocketPath: eventSocketPath,
+                    sshInfo: request.sshInfo,
+                    sshListenerState: request.sshListenerState,
+                    sshLastErrorMessage: request.sshLastErrorMessage,
                     lifecycleState: lifecycleState,
                     startupStep: request.startupStep,
                     startupStepName: request.startupStepName,

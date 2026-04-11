@@ -289,6 +289,12 @@ struct DashboardView: View {
                         Text("Socket: \(worker?.controlSocketPath ?? "-")")
                             .lineLimit(1)
                             .truncationMode(.middle)
+                        Text("SSH: \(worker.flatMap { sshSummary(for: $0) } ?? "-")")
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Text("SSH config: \(worker?.sshInfo?.configPath ?? "-")")
+                            .lineLimit(1)
+                            .truncationMode(.middle)
                         Text("Last error: \(worker?.lastErrorMessage ?? "-")")
                             .lineLimit(1)
                             .truncationMode(.tail)
@@ -306,5 +312,15 @@ struct DashboardView: View {
             }
         }
         .padding(20)
+    }
+
+    private func sshSummary(for worker: AppManagerWorkerRecord) -> String {
+        guard let sshInfo = worker.sshInfo else {
+            if let state = worker.sshListenerState {
+                return "listener \(state)"
+            }
+            return "unavailable"
+        }
+        return "\(sshInfo.alias) -> \(sshInfo.host):\(sshInfo.port)"
     }
 }

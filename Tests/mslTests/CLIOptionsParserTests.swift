@@ -54,6 +54,14 @@ final class CLIOptionsParserTests: XCTestCase {
         XCTAssertEqual(parsed.remainingArguments, ["stop", "--all"])
     }
 
+    func testStopsParsingAtSSHInfoSubcommand() throws {
+        let parsed = try MSLCLIOptionsParser.parseGlobalRuntimeOptions([
+            "--instance", "dev", "ssh-info", "--format", "json"
+        ])
+        XCTAssertEqual(parsed.instanceName, "dev")
+        XCTAssertEqual(parsed.remainingArguments, ["ssh-info", "--format", "json"])
+    }
+
     func testRejectsDuplicateInstanceOption() {
         XCTAssertThrowsError(
             try MSLCLIOptionsParser.parseGlobalRuntimeOptions([
