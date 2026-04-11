@@ -35,6 +35,16 @@ public struct MSLPaths {
     public let legacyCacheDownloadsDir: URL
     public let legacyCacheStagingDir: URL
     public let kernelsDir: URL
+    public let sshDir: URL
+    public let sshSharedConfigFile: URL
+    public let sshInstancesDir: URL
+    public let sshHostKeyFile: URL
+    public let sshHostKnownHostsFile: URL
+    public let bootstrapArtifactsDir: URL
+    public let bootstrapCloudInitDir: URL
+    public let bootstrapCloudInitUserDataFile: URL
+    public let bootstrapCloudInitMetaDataFile: URL
+    public let bootstrapCloudInitSeedISOFile: URL
     public let mslHostToolsDir: URL
     public let mslHostExt4MkfsHelperBinaryFile: URL
     public let mslHostInitBinaryFile: URL
@@ -92,6 +102,16 @@ public struct MSLPaths {
         self.legacyCacheDownloadsDir = legacyCacheDir.appendingPathComponent("downloads", isDirectory: true)
         self.legacyCacheStagingDir = legacyCacheDir.appendingPathComponent("staging", isDirectory: true)
         self.kernelsDir = appSupport.appendingPathComponent("kernels", isDirectory: true)
+        self.sshDir = appSupport.appendingPathComponent("ssh", isDirectory: true)
+        self.sshSharedConfigFile = sshDir.appendingPathComponent("config", isDirectory: false)
+        self.sshInstancesDir = sshDir.appendingPathComponent("instances", isDirectory: true)
+        self.sshHostKeyFile = sshDir.appendingPathComponent("host-ed25519.key", isDirectory: false)
+        self.sshHostKnownHostsFile = sshDir.appendingPathComponent("host-known_hosts", isDirectory: false)
+        self.bootstrapArtifactsDir = appSupport.appendingPathComponent("bootstrap", isDirectory: true)
+        self.bootstrapCloudInitDir = bootstrapArtifactsDir.appendingPathComponent("cloud-init", isDirectory: true)
+        self.bootstrapCloudInitUserDataFile = bootstrapCloudInitDir.appendingPathComponent("user-data", isDirectory: false)
+        self.bootstrapCloudInitMetaDataFile = bootstrapCloudInitDir.appendingPathComponent("meta-data", isDirectory: false)
+        self.bootstrapCloudInitSeedISOFile = bootstrapArtifactsDir.appendingPathComponent("seed.iso", isDirectory: false)
     }
 
     public func distroDirectory(named name: String) -> URL {
@@ -142,6 +162,29 @@ public struct MSLPaths {
         workerRuntimeDirectory(named: instanceName).appendingPathComponent("events.sock", isDirectory: false)
     }
 
+    public func sshInstanceDirectory(named instanceName: String) -> URL {
+        sshInstancesDir.appendingPathComponent(instanceName, isDirectory: true)
+    }
+
+    public func sshInstanceClientPrivateKeyFile(named instanceName: String) -> URL {
+        sshInstanceDirectory(named: instanceName).appendingPathComponent("client-ed25519", isDirectory: false)
+    }
+
+    public func sshInstanceClientPublicKeyFile(named instanceName: String) -> URL {
+        sshInstanceDirectory(named: instanceName).appendingPathComponent("client-ed25519.pub", isDirectory: false)
+    }
+
+    public func sshInstanceKnownHostsFile(named instanceName: String) -> URL {
+        sshInstanceDirectory(named: instanceName).appendingPathComponent("known_hosts", isDirectory: false)
+    }
+
+    public func sshInstanceConfigFile(named instanceName: String) -> URL {
+        sshInstanceDirectory(named: instanceName).appendingPathComponent("ssh_config", isDirectory: false)
+    }
+
+    public func sshInstanceStateFile(named instanceName: String) -> URL {
+        sshInstanceDirectory(named: instanceName).appendingPathComponent("state.json", isDirectory: false)
+    }
     private static func safePathComponent(_ raw: String) -> String {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {

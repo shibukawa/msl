@@ -62,6 +62,13 @@ func handleInternalRuntimeFlags(_ parsed: MSLGlobalRuntimeOptions) -> Bool {
         return true
     }
 
+    if args.count == 1, args[0] == "--_daemon" {
+        withRuntimeManager { manager in
+            try manager.runWorker(instanceName: instanceName)
+        }
+        return true
+    }
+
     if args.count == 2, args[0] == "--_idle-expire", let deadline = Int64(args[1]) {
         withRuntimeManager { manager in
             try manager.handleIdleExpiry(deadlineEpochMs: deadline)
@@ -156,6 +163,7 @@ struct MSLCommand: ParsableCommand {
             MemoryCommand.self,
             NetworkCommand.self,
             PortCommand.self,
+            SSHInfoCommand.self,
             BootstrapInstallCommand.self
         ]
     )
@@ -533,7 +541,7 @@ struct InitWorkspaceCommand: ParsableCommand {
 
     mutating func run() throws {
         withRuntimeManager { manager in
-            try manager.runInitWorkspace(force: force)
+            try manager.runInitWorkspace(force: force, instanceName: CLIInvocationContext.instanceName)
         }
     }
 }
@@ -627,6 +635,33 @@ struct PortRmCommand: ParsableCommand {
     mutating func run() throws {
         withRuntimeManager { manager in
             try manager.removePortMapping(hostPort, instanceName: CLIInvocationContext.instanceName)
+        }
+    }
+}
+
+struct SSHInfoCommand: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "ssh-info",
+        abstract: "Print SSH connection details for the localhost facade."
+    )
+
+    @Option(name: [.customLong("format")], help: "Output format: text or json.")
+    var format = "text"
+
+    mutating func validate() throws {
+        let normalized = format.lowercased()
+        if normalized != "text" && normalized != "json" {
+            throw ValidationError("--format must be 'text' or 'json'")
+        }
+        format = normalized
+    }
+
+    mutating func run() throws {
+        withRuntimeManager { manager in
+            try manager.runSSHInfo(
+                instanceName: CLIInvocationContext.instanceName,
+                format: format
+            )
         }
     }
 }

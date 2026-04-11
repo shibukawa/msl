@@ -6,6 +6,9 @@ public struct AppManagerWorkerRecord: Codable, Equatable {
     public var runtimeRoot: String
     public var controlSocketPath: String
     public var eventSocketPath: String
+    public var sshInfo: LocalhostSSHInfo?
+    public var sshListenerState: String?
+    public var sshLastErrorMessage: String?
     public var lifecycleState: RuntimeLifecycleState
     public var startupStep: Int?
     public var startupStepName: String?
@@ -18,6 +21,9 @@ public struct AppManagerWorkerRecord: Codable, Equatable {
         runtimeRoot: String,
         controlSocketPath: String,
         eventSocketPath: String,
+        sshInfo: LocalhostSSHInfo? = nil,
+        sshListenerState: String? = nil,
+        sshLastErrorMessage: String? = nil,
         lifecycleState: RuntimeLifecycleState,
         startupStep: Int? = nil,
         startupStepName: String? = nil,
@@ -29,6 +35,9 @@ public struct AppManagerWorkerRecord: Codable, Equatable {
         self.runtimeRoot = runtimeRoot
         self.controlSocketPath = controlSocketPath
         self.eventSocketPath = eventSocketPath
+        self.sshInfo = sshInfo
+        self.sshListenerState = sshListenerState
+        self.sshLastErrorMessage = sshLastErrorMessage
         self.lifecycleState = lifecycleState
         self.startupStep = startupStep
         self.startupStepName = startupStepName
@@ -65,4 +74,3 @@ public struct AppManagerState: Codable, Equatable {
         AppManagerState(lastUpdatedEpochMs: nowMs)
     }
 }
-

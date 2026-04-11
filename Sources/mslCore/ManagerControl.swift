@@ -10,6 +10,9 @@ public struct ManagerControlRequest: Codable, Equatable {
     public var runtimeRoot: String?
     public var controlSocketPath: String?
     public var eventSocketPath: String?
+    public var sshInfo: LocalhostSSHInfo?
+    public var sshListenerState: String?
+    public var sshLastErrorMessage: String?
     public var lifecycleState: RuntimeLifecycleState?
     public var startupStep: Int?
     public var startupStepName: String?
@@ -24,6 +27,9 @@ public struct ManagerControlRequest: Codable, Equatable {
         runtimeRoot: String? = nil,
         controlSocketPath: String? = nil,
         eventSocketPath: String? = nil,
+        sshInfo: LocalhostSSHInfo? = nil,
+        sshListenerState: String? = nil,
+        sshLastErrorMessage: String? = nil,
         lifecycleState: RuntimeLifecycleState? = nil,
         startupStep: Int? = nil,
         startupStepName: String? = nil,
@@ -37,6 +43,9 @@ public struct ManagerControlRequest: Codable, Equatable {
         self.runtimeRoot = runtimeRoot
         self.controlSocketPath = controlSocketPath
         self.eventSocketPath = eventSocketPath
+        self.sshInfo = sshInfo
+        self.sshListenerState = sshListenerState
+        self.sshLastErrorMessage = sshLastErrorMessage
         self.lifecycleState = lifecycleState
         self.startupStep = startupStep
         self.startupStepName = startupStepName
@@ -47,17 +56,20 @@ public struct ManagerControlRequest: Codable, Equatable {
 public struct ManagerControlResponse: Codable, Equatable {
     public var ok: Bool
     public var error: String?
+    public var sshInfo: LocalhostSSHInfo?
     public var worker: AppManagerWorkerRecord?
     public var workers: [AppManagerWorkerRecord]?
 
     public init(
         ok: Bool,
         error: String? = nil,
+        sshInfo: LocalhostSSHInfo? = nil,
         worker: AppManagerWorkerRecord? = nil,
         workers: [AppManagerWorkerRecord]? = nil
     ) {
         self.ok = ok
         self.error = error
+        self.sshInfo = sshInfo
         self.worker = worker
         self.workers = workers
     }

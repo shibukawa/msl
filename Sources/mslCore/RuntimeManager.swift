@@ -70,6 +70,8 @@ public final class RuntimeManager {
         try fileManager.createDirectory(at: paths.cacheDownloadsDir, withIntermediateDirectories: true)
         try fileManager.createDirectory(at: paths.cacheStagingDir, withIntermediateDirectories: true)
         try fileManager.createDirectory(at: paths.kernelsDir, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: paths.sshDir, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: paths.sshInstancesDir, withIntermediateDirectories: true)
 
         self.logger = MSLLogger(logFile: paths.logs.appendingPathComponent("msl.log", isDirectory: false), fileManager: fileManager)
         self.lock = try FileLock(path: paths.lockFile.path)
@@ -89,20 +91,73 @@ public final class RuntimeManager {
         }
     }
 
-    public func runInitWorkspace(force: Bool) throws -> Never {
+    public func runInitWorkspace(
+        force: Bool,
+        instanceName: String? = nil
+    ) throws -> Never {
         let cwd = URL(fileURLWithPath: fileManager.currentDirectoryPath, isDirectory: true)
             .resolvingSymlinksInPath()
-        let result = try WorkspaceConfigInitializer(fileManager: fileManager).createConfig(in: cwd, force: force)
         let sharedRoot = resolveWorkspaceHostShareRoot()
+
+        let result = try WorkspaceConfigInitializer(fileManager: fileManager).createConfig(
+            in: cwd,
+            force: force
+        )
         if result.overwritten {
             print("workspace config updated: \(result.configFile.path)")
         } else {
             print("workspace config created: \(result.configFile.path)")
         }
+        for note in result.notes {
+            print(note)
+        }
         if !WorkspaceHostSharePolicy.isPathAllowed(cwd.path, withinRoot: sharedRoot) {
             print("warning: \(cwd.path) is outside workspace host share root (\(sharedRoot)).")
             print("workspace mirror will fallback to home until you update: \(paths.configFile.path)")
             print("add/adjust `workspaceHostShareRoot` to include this folder (example: \"\(cwd.deletingLastPathComponent().path)\").")
+        }
+        Foundation.exit(0)
+    }
+
+    public func runSSHInfo(instanceName: String? = nil, requestedPort: Int? = nil, format: String = "text") throws -> Never {
+        if requestedPort != nil {
+            throw MSLRuntimeError("ssh-info no longer accepts runtime port overrides; the desktop manager owns listener ports")
+        }
+        let target = try resolveRuntimeTarget(explicitInstanceName: instanceName)
+        guard fileManager.fileExists(atPath: paths.managerSocketFile.path) else {
+            throw MSLRuntimeError("MSLDesktop is not running. Start MSLDesktop and retry `msl ssh-info`.")
+        }
+        let client = ManagerControlClient(socketPath: paths.managerSocketFile.path)
+        let response = try client.send(
+            ManagerControlRequest(
+                op: "ssh_info",
+                instance: target.instanceName,
+                callerCwd: fileManager.currentDirectoryPath,
+                hostShareRoot: resolveWorkspaceHostShareRoot()
+            )
+        )
+        guard response.ok, let info = response.sshInfo ?? response.worker?.sshInfo else {
+            throw MSLRuntimeError(response.error ?? "failed to fetch ssh info from MSLDesktop manager")
+        }
+        switch format.lowercased() {
+        case "json":
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            let data = try encoder.encode(info)
+            if let text = String(data: data, encoding: .utf8) {
+                print(text)
+            }
+        case "text":
+            print("alias: \(info.alias)")
+            print("host: \(info.host)")
+            print("port: \(info.port)")
+            print("user: \(info.user)")
+            print("shared_config: \(info.sharedConfigPath)")
+            print("config: \(info.configPath)")
+            print("identity: \(info.identityFile)")
+            print("known_hosts: \(info.knownHostsFile)")
+        default:
+            throw MSLRuntimeError("unsupported ssh-info format '\(format)'. use text or json")
         }
         Foundation.exit(0)
     }
