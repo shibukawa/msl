@@ -86,6 +86,8 @@ if [ ! -x "$MSL_BIN" ]; then
   (cd "$ROOT_DIR" && swift build)
 fi
 
+"$MSL_BIN" stop --app >/dev/null 2>&1 || true
+
 ensure_virtualization_entitlement() {
   if [ "$(uname -s)" != "Darwin" ]; then
     return 0

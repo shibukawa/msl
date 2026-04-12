@@ -81,6 +81,41 @@ final class RuntimeManagerStopTests: XCTestCase {
         }
     }
 
+    func testStopAppManagerSucceedsWhenManagerSocketExistsButRefusesConnection() throws {
+        let ctx = try RuntimeManagerStopContext.make()
+        defer { ctx.cleanup() }
+
+        let paths = MSLPaths(homeDirectoryURL: ctx.root)
+        try FileManager.default.createDirectory(at: paths.appControl, withIntermediateDirectories: true)
+        try createStaleUnixSocket(at: paths.managerSocketFile.path)
+
+        let appStore = AppManagerStateStore(paths: paths, fileManager: .default)
+        try appStore.save(
+            AppManagerState(
+                managerPID: 999_999,
+                managerSocketPath: paths.managerSocketFile.path,
+                managerStartedEpochMs: 10,
+                lastUpdatedEpochMs: 11
+            )
+        )
+
+        let manager = try ctx.makeManager()
+        XCTAssertNoThrow(try manager.stopAppManager())
+
+        let state = try appStore.load()
+        XCTAssertNil(state.managerPID)
+        XCTAssertNil(state.managerSocketPath)
+        XCTAssertNil(state.managerStartedEpochMs)
+    }
+
+    func testStopAppManagerSucceedsWhenNoManagerIsRunning() throws {
+        let ctx = try RuntimeManagerStopContext.make()
+        defer { ctx.cleanup() }
+
+        let manager = try ctx.makeManager()
+        XCTAssertNoThrow(try manager.stopAppManager())
+    }
+
     private func createStaleUnixSocket(at path: String) throws {
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         XCTAssertGreaterThanOrEqual(fd, 0)

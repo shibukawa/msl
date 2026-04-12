@@ -1286,6 +1286,32 @@ public final class RuntimeManager {
         }
     }
 
+    public func stopAppManager() throws {
+        _ = try reconcileAppManagerState()
+
+        let client = ManagerControlClient(socketPath: paths.managerSocketFile.path)
+        if FileManager.default.fileExists(atPath: paths.managerSocketFile.path) {
+            do {
+                let response = try client.send(ManagerControlRequest(op: "stop_manager"))
+                guard response.ok else {
+                    throw MSLRuntimeError(response.error ?? "failed to stop app manager")
+                }
+                print("stopped app manager")
+                return
+            } catch {
+                if isManagerUnavailable(error) {
+                    _ = try reconcileAppManagerState()
+                    print("app manager already stopped")
+                    return
+                }
+                throw error
+            }
+        }
+
+        _ = try reconcileAppManagerState()
+        print("app manager already stopped")
+    }
+
     public func addPortMapping(_ raw: String, instanceName: String? = nil) throws {
         let target = try resolveRuntimeTarget(explicitInstanceName: instanceName)
         let mapping = try parsePortMapping(raw, instanceName: target.instanceName)
