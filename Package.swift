@@ -48,7 +48,7 @@ let package = Package(
         ),
         .testTarget(
             name: "mslTests",
-            dependencies: ["mslCore"],
+            dependencies: ["mslCore", "MSLDesktop"],
             path: "Tests/mslTests"
         )
     ]
