@@ -224,6 +224,27 @@ public final class DaemonServer {
         var adminGroup: String
     }
 
+    private struct GuestMetricsRawSample {
+        var sampledAtEpochMs: Int64
+        var memInfo: GuestMemInfo
+        var cpuTotalTicks: UInt64
+        var cpuIdleTicks: UInt64
+        var primaryInterface: String?
+        var rxBytes: UInt64
+        var txBytes: UInt64
+        var logicalCPUCount: Int?
+    }
+
+    private struct GuestMemInfo {
+        var memTotalBytes: UInt64
+        var memAvailableBytes: UInt64
+        var buffersBytes: UInt64
+        var cachedBytes: UInt64
+        var sReclaimableBytes: UInt64
+        var shmemBytes: UInt64
+        var slabBytes: UInt64
+    }
+
     private let paths: MSLPaths
     private let fileManager: FileManager
     private let lock: FileLock
@@ -243,6 +264,8 @@ public final class DaemonServer {
     private var ptyEventBuffers: [String: HostPtyEventBuffer] = [:]
     private var procSubscriptionSources: [String: DispatchSourceRead] = [:]
     private var ptySubscriptionSources: [String: DispatchSourceRead] = [:]
+    private let metricsSampleLock = NSLock()
+    private var previousMetricsSamples: [String: GuestMetricsRawSample] = [:]
     private var activeInstanceName: String?
 
     private var initClient: InitChannelClient?
@@ -1979,6 +2002,14 @@ public final class DaemonServer {
             return handleInstanceList()
         case "instance_status":
             return handleInstanceStatus(request)
+        case "instance_detail":
+            return handleInstanceDetail(request)
+        case "instance_metrics":
+            return handleInstanceMetrics(request)
+        case "instance_storage":
+            return handleInstanceStorage(request)
+        case "instance_processes":
+            return handleInstanceProcesses(request)
         case "instance_stop":
             return handleInstanceStop(request)
 
@@ -5473,6 +5504,459 @@ public final class DaemonServer {
             return RuntimeControlResponse(ok: false, error: "instance_not_found: \(instance)")
         }
         return RuntimeControlResponse(ok: true, instances: matched)
+    }
+
+    private func handleInstanceDetail(_ request: RuntimeControlRequest) -> RuntimeControlResponse {
+        let instanceName = resolveTargetInstanceName(request)
+        guard let state = loadInstanceRuntimeState(named: instanceName) else {
+            return RuntimeControlResponse(ok: false, error: "instance_not_found: \(instanceName)")
+        }
+
+        let portForwardCount = currentPortForwardCount(instanceName: instanceName)
+        let context = instanceRegistry.context(for: instanceName)
+        let uptimeSeconds = state.startupEpochMs.map { max(0, (nowEpochMs() - $0) / 1_000) }
+        let detail = RuntimeInstanceDetail(
+            instance: instanceName,
+            vmState: state.vmState.rawValue,
+            lifecycleState: state.lifecycleState.rawValue,
+            activeSessionCount: state.activeSessionCount,
+            uptimeSeconds: uptimeSeconds,
+            guestIPv4: guestIPv4ForInstance(instanceName: instanceName, context: context),
+            portForwardCount: portForwardCount,
+            lastError: state.lastErrorMessage ?? state.lastError,
+            lastTransitionEpochMs: state.lastTransitionEpochMs
+        )
+        return RuntimeControlResponse(ok: true, detail: detail)
+    }
+
+    private func handleInstanceMetrics(_ request: RuntimeControlRequest) -> RuntimeControlResponse {
+        guard let context = resolveContext(for: request),
+              let client = context.initClient ?? initClient else {
+            return RuntimeControlResponse(ok: false, error: "instance_not_running")
+        }
+        guard let balloon = context.vmRunner?.memoryBalloonRuntimeStats() else {
+            return RuntimeControlResponse(ok: false, error: "balloon stats unavailable")
+        }
+
+        let instanceName = resolveTargetInstanceName(request)
+        do {
+            let sample = try sampleGuestMetrics(client: client)
+            let previous = metricsSampleLock.withLock { () -> GuestMetricsRawSample? in
+                let previous = previousMetricsSamples[instanceName]
+                previousMetricsSamples[instanceName] = sample
+                return previous
+            }
+            let metrics = RuntimeInstanceMetrics(
+                sampledAtEpochMs: sample.sampledAtEpochMs,
+                memory: buildMemoryBreakdown(sample: sample, balloon: balloon, hostPID: loadInstanceRuntimeState(named: instanceName)?.runtimeHostPid),
+                cpu: buildCPUSnapshot(current: sample, previous: previous),
+                network: buildNetworkSnapshot(current: sample, previous: previous)
+            )
+            return RuntimeControlResponse(ok: true, metrics: metrics)
+        } catch {
+            return RuntimeControlResponse(ok: false, error: String(describing: error))
+        }
+    }
+
+    private func handleInstanceStorage(_ request: RuntimeControlRequest) -> RuntimeControlResponse {
+        let instanceName = resolveTargetInstanceName(request)
+        guard let context = resolveContext(for: request),
+              let client = context.initClient ?? initClient else {
+            return RuntimeControlResponse(ok: false, error: "instance_not_running")
+        }
+
+        do {
+            let guestStorage = try readGuestStorageSnapshot(client: client)
+            let metadataURL = try context.metadataURL ?? distributionManager.runtimeMetadataURL(defaultInstanceName: instanceName)
+            let metadata = try distributionManager.readOrRebuildInstanceMetadata(at: metadataURL)
+            let diskURL = URL(fileURLWithPath: metadata.diskPath)
+
+            let hostLogical = logicalBytes(of: diskURL).flatMap(UInt64.init)
+            let hostAllocated = allocatedBytes(of: diskURL).flatMap(UInt64.init)
+            let hostApparent = hostLogical
+            let spaceSavingBytes: UInt64? = {
+                guard let logical = hostLogical, let allocated = hostAllocated, logical >= allocated else {
+                    return nil
+                }
+                return logical - allocated
+            }()
+            let spaceSavingRatio: Double? = {
+                guard let logical = hostLogical, logical > 0, let saved = spaceSavingBytes else {
+                    return nil
+                }
+                return Double(saved) / Double(logical)
+            }()
+            let compressionCacheBytes = totalAllocatedBytes(in: paths.cacheDir)
+
+            let storage = RuntimeInstanceStorage(
+                filesystem: guestStorage.filesystem,
+                mountPoint: guestStorage.mountPoint,
+                totalBytes: guestStorage.totalBytes,
+                usedBytes: guestStorage.usedBytes,
+                availableBytes: guestStorage.availableBytes,
+                hostAllocatedBytes: hostAllocated,
+                hostLogicalBytes: hostLogical,
+                hostApparentBytes: hostApparent,
+                compression: RuntimeStorageCompressionStats(
+                    hostLogicalBytes: hostLogical,
+                    hostAllocatedBytes: hostAllocated,
+                    hostApparentBytes: hostApparent,
+                    spaceSavingBytes: spaceSavingBytes,
+                    spaceSavingRatio: spaceSavingRatio,
+                    compressionCacheBytes: compressionCacheBytes
+                )
+            )
+            return RuntimeControlResponse(ok: true, storage: storage)
+        } catch {
+            return RuntimeControlResponse(ok: false, error: String(describing: error))
+        }
+    }
+
+    private func handleInstanceProcesses(_ request: RuntimeControlRequest) -> RuntimeControlResponse {
+        guard let context = resolveContext(for: request),
+              let client = context.initClient ?? initClient else {
+            return RuntimeControlResponse(ok: false, error: "instance_not_running")
+        }
+
+        do {
+            let processes = try readGuestProcesses(client: client)
+            return RuntimeControlResponse(ok: true, processes: processes)
+        } catch {
+            return RuntimeControlResponse(ok: false, error: String(describing: error))
+        }
+    }
+
+    private func loadInstanceRuntimeState(named instanceName: String) -> RuntimeInstanceState? {
+        do {
+            let state = try lock.withExclusiveLock(timeoutSec: 2) { try store.loadState() }
+            if let match = state.instances?.first(where: { $0.instance == instanceName }) {
+                return match
+            }
+            if state.distro == instanceName {
+                return RuntimeInstanceState(
+                    instance: state.distro,
+                    vmState: state.vmState,
+                    lifecycleState: state.lifecycleState,
+                    activeSessionCount: state.activeSessionCount,
+                    idleTimer: state.idleTimer,
+                    runtimeUser: state.runtimeUser,
+                    initChannel: state.initChannel,
+                    runtimeHostPid: state.runtimeHostPid,
+                    runtimeControlSocket: state.runtimeControlSocket,
+                    lastError: state.lastErrorMessage,
+                    lastErrorCode: state.lastErrorCode,
+                    lastErrorMessage: state.lastErrorMessage,
+                    startupEpochMs: state.startupEpochMs,
+                    startupStep: state.startupStep,
+                    startupStepName: state.startupStepName,
+                    startupStepStatus: state.startupStepStatus,
+                    lastTransitionEpochMs: state.lastTransitionEpochMs
+                )
+            }
+            return nil
+        } catch {
+            return nil
+        }
+    }
+
+    private func currentPortForwardCount(instanceName: String) -> Int {
+        if instanceName == currentRuntimeInstanceName() {
+            return currentEffectivePortMappingsSnapshot().mappings.count
+        }
+        do {
+            return try lock.withExclusiveLock(timeoutSec: 1) {
+                try store.loadPortMappings().mappings.filter { $0.instance == instanceName }.count
+            }
+        } catch {
+            return 0
+        }
+    }
+
+    private func guestIPv4ForInstance(instanceName: String, context: InstanceRuntimeContext) -> String? {
+        if let guestIPv4 = context.networkTopology?.guestIPv4, !guestIPv4.isEmpty {
+            return guestIPv4
+        }
+        if let guestIPv4 = context.runtimeDNSMeta["guest_ipv4"], !guestIPv4.isEmpty, guestIPv4 != "-" {
+            return guestIPv4
+        }
+        return nil
+    }
+
+    private func sampleGuestMetrics(client: InitChannelClient) throws -> GuestMetricsRawSample {
+        let response = try client.send(InitChannelRequest(
+            op: "exec",
+            argv: ["/bin/sh", "-lc", "cat /proc/meminfo && printf '\\n__MSL_CPU__\\n' && cat /proc/stat && printf '\\n__MSL_NET__\\n' && cat /proc/net/dev"],
+            timeoutMs: 2_000
+        ))
+        guard response.ok, (response.exitCode ?? 0) == 0, let stdout = response.stdout else {
+            throw MSLRuntimeError(response.error?.message ?? "failed to sample guest metrics")
+        }
+
+        let cpuMarker = "\n__MSL_CPU__\n"
+        let netMarker = "\n__MSL_NET__\n"
+        guard let cpuRange = stdout.range(of: cpuMarker),
+              let netRange = stdout.range(of: netMarker) else {
+            throw MSLRuntimeError("invalid guest metrics snapshot")
+        }
+        let memInfoText = String(stdout[..<cpuRange.lowerBound])
+        let cpuText = String(stdout[cpuRange.upperBound..<netRange.lowerBound])
+        let netText = String(stdout[netRange.upperBound...])
+
+        guard let memInfo = parseGuestMemInfo(memInfoText) else {
+            throw MSLRuntimeError("failed to parse /proc/meminfo")
+        }
+        let cpu = parseGuestCPU(cpuText)
+        let network = parseGuestNetwork(netText)
+
+        return GuestMetricsRawSample(
+            sampledAtEpochMs: nowEpochMs(),
+            memInfo: memInfo,
+            cpuTotalTicks: cpu.totalTicks,
+            cpuIdleTicks: cpu.idleTicks,
+            primaryInterface: network.primaryInterface,
+            rxBytes: network.rxBytes,
+            txBytes: network.txBytes,
+            logicalCPUCount: cpu.logicalCPUCount
+        )
+    }
+
+    private func buildMemoryBreakdown(
+        sample: GuestMetricsRawSample,
+        balloon: MemoryBalloonRuntimeStats,
+        hostPID: Int32?
+    ) -> RuntimeMemoryBreakdown {
+        let memInfo = sample.memInfo
+        let guestUsed = memInfo.memTotalBytes >= memInfo.memAvailableBytes
+            ? (memInfo.memTotalBytes - memInfo.memAvailableBytes)
+            : 0
+        let bufferCache = max(0, Int64(memInfo.buffersBytes) + Int64(memInfo.cachedBytes) + Int64(memInfo.sReclaimableBytes) - Int64(memInfo.shmemBytes))
+        let kernelOther = memInfo.slabBytes >= UInt64(max(bufferCache, 0))
+            ? (memInfo.slabBytes - UInt64(max(bufferCache, 0)))
+            : memInfo.slabBytes
+
+        return RuntimeMemoryBreakdown(
+            guestVisibleMemoryBytes: memInfo.memTotalBytes,
+            guestUsedBytes: guestUsed,
+            guestAvailableBytes: memInfo.memAvailableBytes,
+            kernelBufferCacheBytes: UInt64(max(bufferCache, 0)),
+            kernelOtherBytes: kernelOther,
+            balloonTargetBytes: balloon.allocatedBytes,
+            balloonMaxBytes: balloon.maxBytes,
+            balloonReturnedTotalBytes: balloon.returnedTotalBytes,
+            hostResidentMemoryBytes: hostResidentMemoryBytes(pid: hostPID)
+        )
+    }
+
+    private func buildCPUSnapshot(current: GuestMetricsRawSample, previous: GuestMetricsRawSample?) -> RuntimeCPUSnapshot {
+        guard let previous, current.sampledAtEpochMs > previous.sampledAtEpochMs,
+              current.cpuTotalTicks >= previous.cpuTotalTicks,
+              current.cpuIdleTicks >= previous.cpuIdleTicks else {
+            return RuntimeCPUSnapshot(usagePercent: nil, logicalCPUCount: current.logicalCPUCount)
+        }
+        let totalDelta = current.cpuTotalTicks - previous.cpuTotalTicks
+        let idleDelta = current.cpuIdleTicks - previous.cpuIdleTicks
+        guard totalDelta > 0 else {
+            return RuntimeCPUSnapshot(usagePercent: nil, logicalCPUCount: current.logicalCPUCount)
+        }
+        let busy = min(totalDelta, totalDelta - min(totalDelta, idleDelta))
+        return RuntimeCPUSnapshot(
+            usagePercent: (Double(busy) / Double(totalDelta)) * 100.0,
+            logicalCPUCount: current.logicalCPUCount
+        )
+    }
+
+    private func buildNetworkSnapshot(current: GuestMetricsRawSample, previous: GuestMetricsRawSample?) -> RuntimeNetworkSnapshot {
+        guard let previous,
+              current.sampledAtEpochMs > previous.sampledAtEpochMs,
+              current.rxBytes >= previous.rxBytes,
+              current.txBytes >= previous.txBytes else {
+            return RuntimeNetworkSnapshot(
+                primaryInterface: current.primaryInterface,
+                rxBytes: current.rxBytes,
+                txBytes: current.txBytes,
+                rxBytesPerSecond: nil,
+                txBytesPerSecond: nil
+            )
+        }
+        let elapsedSeconds = Double(current.sampledAtEpochMs - previous.sampledAtEpochMs) / 1000.0
+        guard elapsedSeconds > 0 else {
+            return RuntimeNetworkSnapshot(
+                primaryInterface: current.primaryInterface,
+                rxBytes: current.rxBytes,
+                txBytes: current.txBytes,
+                rxBytesPerSecond: nil,
+                txBytesPerSecond: nil
+            )
+        }
+        return RuntimeNetworkSnapshot(
+            primaryInterface: current.primaryInterface,
+            rxBytes: current.rxBytes,
+            txBytes: current.txBytes,
+            rxBytesPerSecond: Double(current.rxBytes - previous.rxBytes) / elapsedSeconds,
+            txBytesPerSecond: Double(current.txBytes - previous.txBytes) / elapsedSeconds
+        )
+    }
+
+    private func parseGuestMemInfo(_ text: String) -> GuestMemInfo? {
+        var values: [String: UInt64] = [:]
+        for rawLine in text.split(separator: "\n") {
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            guard let colon = line.firstIndex(of: ":") else { continue }
+            let key = String(line[..<colon])
+            let rest = line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)
+            guard let number = rest.split(separator: " ").first.flatMap({ UInt64($0) }) else { continue }
+            values[key] = number * 1024
+        }
+        guard let memTotalBytes = values["MemTotal"], let memAvailableBytes = values["MemAvailable"] else {
+            return nil
+        }
+        return GuestMemInfo(
+            memTotalBytes: memTotalBytes,
+            memAvailableBytes: memAvailableBytes,
+            buffersBytes: values["Buffers"] ?? 0,
+            cachedBytes: values["Cached"] ?? 0,
+            sReclaimableBytes: values["SReclaimable"] ?? 0,
+            shmemBytes: values["Shmem"] ?? 0,
+            slabBytes: values["Slab"] ?? 0
+        )
+    }
+
+    private func parseGuestCPU(_ text: String) -> (totalTicks: UInt64, idleTicks: UInt64, logicalCPUCount: Int?) {
+        var totalTicks: UInt64 = 0
+        var idleTicks: UInt64 = 0
+        var logicalCPUCount = 0
+        for rawLine in text.split(separator: "\n") {
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            if line.hasPrefix("cpu ") {
+                let values = line.split(separator: " ").dropFirst().compactMap { UInt64($0) }
+                totalTicks = values.reduce(0, +)
+                if values.count > 4 {
+                    idleTicks = values[3] + values[4]
+                } else if values.count > 3 {
+                    idleTicks = values[3]
+                }
+            } else if line.hasPrefix("cpu"), line.dropFirst(3).first?.isNumber == true {
+                logicalCPUCount += 1
+            }
+        }
+        return (totalTicks, idleTicks, logicalCPUCount > 0 ? logicalCPUCount : nil)
+    }
+
+    private func parseGuestNetwork(_ text: String) -> (primaryInterface: String?, rxBytes: UInt64, txBytes: UInt64) {
+        var selectedInterface: String?
+        var selectedRX: UInt64 = 0
+        var selectedTX: UInt64 = 0
+        var bestTotal: UInt64 = 0
+
+        for rawLine in text.split(separator: "\n").dropFirst(2) {
+            guard let colon = rawLine.firstIndex(of: ":") else { continue }
+            let iface = rawLine[..<colon].trimmingCharacters(in: .whitespaces)
+            guard iface != "lo" else { continue }
+            let values = rawLine[rawLine.index(after: colon)...].split(whereSeparator: \.isWhitespace)
+            guard values.count >= 16,
+                  let rx = UInt64(values[0]),
+                  let tx = UInt64(values[8]) else { continue }
+            let total = rx + tx
+            if total >= bestTotal {
+                bestTotal = total
+                selectedInterface = iface
+                selectedRX = rx
+                selectedTX = tx
+            }
+        }
+        return (selectedInterface, selectedRX, selectedTX)
+    }
+
+    private func readGuestStorageSnapshot(client: InitChannelClient) throws -> (filesystem: String?, mountPoint: String?, totalBytes: UInt64?, usedBytes: UInt64?, availableBytes: UInt64?) {
+        let response = try client.send(InitChannelRequest(
+            op: "exec",
+            argv: ["/bin/sh", "-lc", "df -B1 / | tail -n 1"],
+            timeoutMs: 2_000
+        ))
+        guard response.ok, (response.exitCode ?? 0) == 0, let stdout = response.stdout else {
+            throw MSLRuntimeError(response.error?.message ?? "failed to read guest storage snapshot")
+        }
+        let fields = stdout.trimmingCharacters(in: .whitespacesAndNewlines).split(whereSeparator: \.isWhitespace)
+        guard fields.count >= 6 else {
+            throw MSLRuntimeError("invalid df output")
+        }
+        return (
+            filesystem: String(fields[0]),
+            mountPoint: String(fields[5]),
+            totalBytes: UInt64(fields[1]),
+            usedBytes: UInt64(fields[2]),
+            availableBytes: UInt64(fields[3])
+        )
+    }
+
+    private func readGuestProcesses(client: InitChannelClient) throws -> [RuntimeProcessSnapshotItem] {
+        let response = try client.send(InitChannelRequest(
+            op: "exec",
+            argv: ["/bin/sh", "-lc", "ps -eo pid,user,%cpu,rss,args --sort=-%cpu | sed -n '2,31p'"],
+            timeoutMs: 2_000
+        ))
+        guard response.ok, (response.exitCode ?? 0) == 0, let stdout = response.stdout else {
+            throw MSLRuntimeError(response.error?.message ?? "failed to read guest processes")
+        }
+
+        return stdout
+            .split(separator: "\n")
+            .compactMap { rawLine -> RuntimeProcessSnapshotItem? in
+                let line = rawLine.trimmingCharacters(in: .whitespaces)
+                guard !line.isEmpty else { return nil }
+                let parts = line.split(maxSplits: 4, whereSeparator: \.isWhitespace)
+                guard parts.count >= 5,
+                      let pid = Int(parts[0]),
+                      let cpuPercent = Double(parts[2]),
+                      let rssKB = UInt64(parts[3]) else {
+                    return nil
+                }
+                return RuntimeProcessSnapshotItem(
+                    pid: pid,
+                    user: String(parts[1]),
+                    cpuPercent: cpuPercent,
+                    memoryResidentBytes: rssKB * 1024,
+                    command: String(parts[4])
+                )
+            }
+    }
+
+    private func hostResidentMemoryBytes(pid: Int32?) -> UInt64? {
+        guard let pid, pid > 0 else { return nil }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/ps")
+        process.arguments = ["-o", "rss=", "-p", String(pid)]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = Pipe()
+        do {
+            try process.run()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0 else { return nil }
+            let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            guard let rssKB = UInt64(output) else { return nil }
+            return rssKB * 1024
+        } catch {
+            return nil
+        }
+    }
+
+    private func totalAllocatedBytes(in directory: URL) -> UInt64? {
+        guard let enumerator = FileManager.default.enumerator(at: directory, includingPropertiesForKeys: [.isRegularFileKey], options: [.skipsHiddenFiles]) else {
+            return nil
+        }
+        var total: UInt64 = 0
+        for case let url as URL in enumerator {
+            guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey]),
+                  values.isRegularFile == true,
+                  let allocated = allocatedBytes(of: url),
+                  allocated > 0 else {
+                continue
+            }
+            total += UInt64(allocated)
+        }
+        return total
     }
 
     private func handleInstanceStop(_ request: RuntimeControlRequest) -> RuntimeControlResponse {

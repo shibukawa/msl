@@ -353,6 +353,50 @@ public struct RuntimeControlRequest: Codable {
         case hostShareRoot
         case dnsSource
     }
+
+    public init(
+        op: String,
+        instance: String? = nil,
+        all: Bool? = nil,
+        callerCwd: String? = nil,
+        hostPort: Int? = nil,
+        guestPort: Int? = nil,
+        argv: [String]? = nil,
+        timeoutMs: Int? = nil,
+        runAsRoot: Bool? = nil,
+        ptyId: String? = nil,
+        procId: String? = nil,
+        dataBase64: String? = nil,
+        rawData: Data? = nil,
+        rows: Int? = nil,
+        cols: Int? = nil,
+        sessionId: String? = nil,
+        cwd: String? = nil,
+        envAdditions: [String: String]? = nil,
+        hostShareRoot: String? = nil,
+        dnsSource: String? = nil
+    ) {
+        self.op = op
+        self.instance = instance
+        self.all = all
+        self.callerCwd = callerCwd
+        self.hostPort = hostPort
+        self.guestPort = guestPort
+        self.argv = argv
+        self.timeoutMs = timeoutMs
+        self.runAsRoot = runAsRoot
+        self.ptyId = ptyId
+        self.procId = procId
+        self.dataBase64 = dataBase64
+        self.rawData = rawData
+        self.rows = rows
+        self.cols = cols
+        self.sessionId = sessionId
+        self.cwd = cwd
+        self.envAdditions = envAdditions
+        self.hostShareRoot = hostShareRoot
+        self.dnsSource = dnsSource
+    }
 }
 
 public struct RuntimePortStatusItem: Codable {
@@ -409,11 +453,112 @@ public struct RuntimeInstanceStatusItem: Codable {
     public var lastTransitionEpochMs: Int64
 }
 
+public struct RuntimeInstanceDetail: Codable {
+    public var instance: String
+    public var vmState: String
+    public var lifecycleState: String
+    public var activeSessionCount: Int
+    public var uptimeSeconds: Int64?
+    public var guestIPv4: String?
+    public var portForwardCount: Int
+    public var lastError: String?
+    public var lastTransitionEpochMs: Int64
+
+    public init(
+        instance: String,
+        vmState: String,
+        lifecycleState: String,
+        activeSessionCount: Int,
+        uptimeSeconds: Int64?,
+        guestIPv4: String?,
+        portForwardCount: Int,
+        lastError: String?,
+        lastTransitionEpochMs: Int64
+    ) {
+        self.instance = instance
+        self.vmState = vmState
+        self.lifecycleState = lifecycleState
+        self.activeSessionCount = activeSessionCount
+        self.uptimeSeconds = uptimeSeconds
+        self.guestIPv4 = guestIPv4
+        self.portForwardCount = portForwardCount
+        self.lastError = lastError
+        self.lastTransitionEpochMs = lastTransitionEpochMs
+    }
+}
+
+public struct RuntimeMemoryBreakdown: Codable {
+    public var guestVisibleMemoryBytes: UInt64
+    public var guestUsedBytes: UInt64
+    public var guestAvailableBytes: UInt64
+    public var kernelBufferCacheBytes: UInt64
+    public var kernelOtherBytes: UInt64
+    public var balloonTargetBytes: UInt64
+    public var balloonMaxBytes: UInt64
+    public var balloonReturnedTotalBytes: UInt64
+    public var hostResidentMemoryBytes: UInt64?
+}
+
+public struct RuntimeCPUSnapshot: Codable {
+    public var usagePercent: Double?
+    public var logicalCPUCount: Int?
+}
+
+public struct RuntimeNetworkSnapshot: Codable {
+    public var primaryInterface: String?
+    public var rxBytes: UInt64
+    public var txBytes: UInt64
+    public var rxBytesPerSecond: Double?
+    public var txBytesPerSecond: Double?
+}
+
+public struct RuntimeInstanceMetrics: Codable {
+    public var sampledAtEpochMs: Int64
+    public var memory: RuntimeMemoryBreakdown
+    public var cpu: RuntimeCPUSnapshot
+    public var network: RuntimeNetworkSnapshot
+}
+
+public struct RuntimeStorageCompressionStats: Codable {
+    public var hostLogicalBytes: UInt64?
+    public var hostAllocatedBytes: UInt64?
+    public var hostApparentBytes: UInt64?
+    public var spaceSavingBytes: UInt64?
+    public var spaceSavingRatio: Double?
+    public var compressionCacheBytes: UInt64?
+}
+
+public struct RuntimeInstanceStorage: Codable {
+    public var filesystem: String?
+    public var mountPoint: String?
+    public var totalBytes: UInt64?
+    public var usedBytes: UInt64?
+    public var availableBytes: UInt64?
+    public var hostAllocatedBytes: UInt64?
+    public var hostLogicalBytes: UInt64?
+    public var hostApparentBytes: UInt64?
+    public var compression: RuntimeStorageCompressionStats
+}
+
+public struct RuntimeProcessSnapshotItem: Codable, Identifiable {
+    public var pid: Int
+    public var user: String
+    public var cpuPercent: Double
+    public var memoryResidentBytes: UInt64
+    public var command: String
+
+    public var id: Int { pid }
+}
+
 public struct RuntimeControlResponse: Codable {
     public var ok: Bool
     public var error: String?
     public var items: [RuntimePortStatusItem]?
     public var instances: [RuntimeInstanceStatusItem]?
+    public var detail: RuntimeInstanceDetail?
+    public var metrics: RuntimeInstanceMetrics?
+    public var storage: RuntimeInstanceStorage?
+    public var processes: [RuntimeProcessSnapshotItem]?
     // exec / pty / session responses
     public var stdout: String?
     public var stderr: String?
@@ -435,6 +580,10 @@ public struct RuntimeControlResponse: Codable {
         case error
         case items
         case instances
+        case detail
+        case metrics
+        case storage
+        case processes
         case stdout
         case stderr
         case exitCode
@@ -847,12 +996,12 @@ final class RuntimeControlServer {
     }
 }
 
-final class RuntimeControlClient {
+public final class RuntimeControlClient {
     private let socketPath: String
     private var persistentFD: Int32 = -1
     private let connectTimeoutMs: Int32 = 250
 
-    init(socketPath: String) {
+    public init(socketPath: String) {
         self.socketPath = socketPath
     }
 
@@ -861,7 +1010,7 @@ final class RuntimeControlClient {
     }
 
     /// Single-shot send: connect, send, receive, disconnect.
-    func send(_ request: RuntimeControlRequest) throws -> RuntimeControlResponse {
+    public func send(_ request: RuntimeControlRequest) throws -> RuntimeControlResponse {
         let fd = try connectOnce()
         defer { _ = close(fd) }
         return try sendOnFD(request, fd: fd)
