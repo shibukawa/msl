@@ -160,6 +160,11 @@ public final class AppManager {
                 }
                 try stopWorker(instanceName: instance)
                 return ManagerControlResponse(ok: true, worker: snapshot().workers.first(where: { $0.instanceName == instance }))
+            case "stop_manager":
+                DispatchQueue.global().async { [weak self] in
+                    self?.stop()
+                }
+                return ManagerControlResponse(ok: true)
             case "worker_register":
                 guard
                     let instance = request.instance,

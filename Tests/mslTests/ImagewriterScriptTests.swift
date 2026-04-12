@@ -19,6 +19,7 @@ final class ImagewriterScriptTests: XCTestCase {
         let script = try String(contentsOf: root.appendingPathComponent("scripts/imagewriter-build.sh"), encoding: .utf8)
 
         XCTAssertFalse(script.contains("--instance \"$INSTANCE\" --stop"))
+        XCTAssertTrue(script.contains("\"$MSL_BIN\" stop --app >/dev/null 2>&1 || true"))
         XCTAssertTrue(script.contains("\"$MSL_BIN\" --instance \"$INSTANCE\" stop"))
         XCTAssertTrue(script.contains("IMAGE_SIZE_MB is required; msl install must pass an explicit size"))
         XCTAssertFalse(script.contains("IMAGE_SIZE_MB=\"${IMAGE_SIZE_MB:-65536}\""))

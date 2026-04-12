@@ -285,6 +285,9 @@ struct StopCommand: ParsableCommand {
         abstract: "Stop runtime."
     )
 
+    @Flag(name: [.customLong("app")], help: "Stop the desktop app manager.")
+    var app = false
+
     @Flag(name: [.short, .long], help: "Stop all running instances.")
     var all = false
 
@@ -298,12 +301,23 @@ struct StopCommand: ParsableCommand {
         if instance != nil, CLIInvocationContext.instanceName != nil {
             throw ValidationError("Specify target instance with either global `--instance`/`-i` or `stop <instance>`, not both")
         }
+        let targetInstance = instance ?? CLIInvocationContext.instanceName
+        if app, targetInstance != nil {
+            throw ValidationError("`stop --app` cannot be combined with an instance argument")
+        }
     }
 
     mutating func run() throws {
         let targetInstance = instance ?? CLIInvocationContext.instanceName
         withRuntimeManager { manager in
+            if app {
+                try manager.stopAppManager()
+                return
+            }
             try manager.stopVM(instanceName: targetInstance, all: all)
+            if all {
+                try manager.stopAppManager()
+            }
         }
     }
 }
