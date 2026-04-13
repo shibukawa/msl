@@ -170,6 +170,7 @@ struct MSLCommand: ParsableCommand {
         version: "dev",
         subcommands: [
             RunCommand.self,
+            CpCommand.self,
             ListCommand.self,
             StatusCommand.self,
             StopCommand.self,
@@ -246,6 +247,49 @@ struct RunCommand: ParsableCommand {
             try manager.runCommand(
                 argv: command,
                 timeoutSec: timeout ?? 0,
+                instanceName: CLIInvocationContext.instanceName
+            )
+        }
+    }
+}
+
+struct CpCommand: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "cp",
+        abstract: "Copy files between the host and an MSL instance.",
+        discussion: """
+        Use @:/path to reference the VM side.
+
+        Examples:
+          msl --instance dev cp local.txt @:/tmp/local.txt
+          msl --instance dev cp @:/var/log/syslog ./syslog
+          msl --instance dev cp -r ./dir @:/tmp/dir
+        """
+    )
+
+    @Flag(name: [.short, .long], help: "Copy directories recursively.")
+    var recursive = false
+
+    @Argument(help: "Source path. Use @:/path for a VM path.")
+    var src: String
+
+    @Argument(help: "Destination path. Use @:/path for a VM path.")
+    var dest: String
+
+    mutating func validate() throws {
+        do {
+            _ = try MSLCopyPathParser.parseTransfer(src: src, dest: dest, recursive: recursive)
+        } catch let error as MSLRuntimeError {
+            throw ValidationError(error.message)
+        }
+    }
+
+    mutating func run() throws {
+        withRuntimeManager { manager in
+            try manager.runCopy(
+                src: src,
+                dest: dest,
+                recursive: recursive,
                 instanceName: CLIInvocationContext.instanceName
             )
         }

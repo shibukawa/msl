@@ -162,6 +162,56 @@ public final class RuntimeManager {
         Foundation.exit(0)
     }
 
+    public func runCopy(
+        src: String,
+        dest: String,
+        recursive: Bool,
+        instanceName: String? = nil
+    ) throws -> Never {
+        try runCopyProcess(src: src, dest: dest, recursive: recursive, instanceName: instanceName)
+        Foundation.exit(0)
+    }
+
+    func runCopyProcess(
+        src: String,
+        dest: String,
+        recursive: Bool,
+        instanceName: String? = nil
+    ) throws {
+        let target = try resolveRuntimeTarget(explicitInstanceName: instanceName)
+        let transfer = try MSLCopyPathParser.parseTransfer(
+            src: src,
+            dest: dest,
+            recursive: recursive,
+            fileManager: fileManager
+        )
+        switch (transfer.src, transfer.dest) {
+        case (.local(let localPath), .remote(let remotePath)):
+            let expandedLocalPath = try expandLocalCopyPath(localPath)
+            let localURL = URL(fileURLWithPath: expandedLocalPath)
+            var isDirectory: ObjCBool = false
+            guard fileManager.fileExists(atPath: localURL.path, isDirectory: &isDirectory) else {
+                throw MSLRuntimeError("source '\(localPath)' not found")
+            }
+            if isDirectory.boolValue {
+                guard recursive else {
+                    throw MSLRuntimeError("omitting directory '\(localPath)'; use -r to copy directories")
+                }
+                try copyLocalDirectoryToRemote(localURL: localURL, remotePath: remotePath, instanceName: target.instanceName)
+            } else {
+                try copyLocalFileToRemote(localURL: localURL, remotePath: remotePath, instanceName: target.instanceName)
+            }
+        case (.remote(let remotePath), .local(let localPath)):
+            if recursive {
+                try copyRemoteDirectoryToLocal(remotePath: remotePath, localPath: localPath, instanceName: target.instanceName)
+            } else {
+                try copyRemoteFileToLocal(remotePath: remotePath, localPath: localPath, instanceName: target.instanceName)
+            }
+        case (.local, .local), (.remote, .remote):
+            throw MSLRuntimeError("msl cp requires exactly one VM path using @:/path")
+        }
+    }
+
     public func runSetConfig(path rawPath: String, value rawValue: String) throws -> Never {
         let path = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
         let value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -2436,6 +2486,383 @@ public final class RuntimeManager {
             return nil
         }
         return kib * 1024
+    }
+
+    private func copyLocalFileToRemote(localURL: URL, remotePath: String, instanceName: String) throws {
+        let inputHandle = try FileHandle(forReadingFrom: localURL)
+        defer { try? inputHandle.close() }
+        let command = makeRemoteFileUploadCommand(
+            localBaseName: localURL.lastPathComponent,
+            remotePath: remotePath
+        )
+        _ = try runRemoteProc(
+            instanceName: instanceName,
+            argv: ["/bin/sh", "-lc", command],
+            inputFD: inputHandle.fileDescriptor,
+            attachInput: true
+        )
+    }
+
+    private func copyRemoteFileToLocal(remotePath: String, localPath: String, instanceName: String) throws {
+        let targetURL = try resolveLocalFileDownloadTarget(remotePath: remotePath, localPath: localPath)
+        let tempURL = makeTemporarySiblingURL(for: targetURL)
+        fileManager.createFile(atPath: tempURL.path, contents: nil)
+        let outputHandle = try FileHandle(forWritingTo: tempURL)
+        var outputError: Error?
+        do {
+            let result = try runRemoteProc(
+                instanceName: instanceName,
+                argv: ["/bin/sh", "-lc", makeRemoteFileDownloadCommand(remotePath: remotePath)],
+                inputFD: nil,
+                attachInput: false,
+                onOutput: { event in
+                    switch event.kind {
+                    case .stdout:
+                        do {
+                            try outputHandle.write(contentsOf: event.data)
+                        } catch {
+                            outputError = error
+                            return false
+                        }
+                    case .stderr:
+                        break
+                    }
+                    return true
+                }
+            )
+            try outputHandle.close()
+            if let outputError {
+                throw outputError
+            }
+            try replaceItem(at: targetURL, with: tempURL)
+            if result.exitCode != 0 {
+                throw MSLRuntimeError(result.stderr.isEmpty ? "copy failed" : result.stderr, exitCode: result.exitCode)
+            }
+        } catch {
+            try? outputHandle.close()
+            try? fileManager.removeItem(at: tempURL)
+            throw error
+        }
+    }
+
+    private func copyLocalDirectoryToRemote(localURL: URL, remotePath: String, instanceName: String) throws {
+        let tar = try hostTarExecutable()
+        let process = Process()
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+        process.executableURL = URL(fileURLWithPath: tar)
+        process.arguments = ["-C", localURL.deletingLastPathComponent().path, "-cf", "-", localURL.lastPathComponent]
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
+        try process.run()
+        defer {
+            stdoutPipe.fileHandleForReading.closeFile()
+            stderrPipe.fileHandleForReading.closeFile()
+        }
+
+        do {
+            _ = try runRemoteProc(
+                instanceName: instanceName,
+                argv: ["/bin/sh", "-lc", makeRemoteDirectoryUploadCommand(localBaseName: localURL.lastPathComponent, remotePath: remotePath)],
+                inputFD: stdoutPipe.fileHandleForReading.fileDescriptor,
+                attachInput: true
+            )
+            process.waitUntilExit()
+            let stderr = String(data: stderrPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            guard process.terminationStatus == 0 else {
+                throw MSLRuntimeError(stderr.isEmpty ? "host tar failed" : stderr, exitCode: process.terminationStatus)
+            }
+        } catch {
+            if process.isRunning {
+                process.terminate()
+                process.waitUntilExit()
+            }
+            throw error
+        }
+    }
+
+    private func copyRemoteDirectoryToLocal(remotePath: String, localPath: String, instanceName: String) throws {
+        let tar = try hostTarExecutable()
+        let extraction = try prepareLocalDirectoryExtraction(remotePath: remotePath, localPath: localPath)
+        let process = Process()
+        let stdinPipe = Pipe()
+        let stderrPipe = Pipe()
+        process.executableURL = URL(fileURLWithPath: tar)
+        process.arguments = ["-xf", "-", "-C", extraction.extractRoot.path]
+        process.standardInput = stdinPipe
+        process.standardError = stderrPipe
+        try process.run()
+
+        do {
+            _ = try runRemoteProc(
+                instanceName: instanceName,
+                argv: ["/bin/sh", "-lc", makeRemoteDirectoryDownloadCommand(remotePath: remotePath)],
+                inputFD: nil,
+                attachInput: false,
+                onOutput: { event in
+                    switch event.kind {
+                    case .stdout:
+                        do {
+                            try stdinPipe.fileHandleForWriting.write(contentsOf: event.data)
+                        } catch {
+                            return false
+                        }
+                    case .stderr:
+                        break
+                    }
+                    return true
+                }
+            )
+            try stdinPipe.fileHandleForWriting.close()
+            process.waitUntilExit()
+            let stderr = String(data: stderrPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            guard process.terminationStatus == 0 else {
+                throw MSLRuntimeError(stderr.isEmpty ? "host tar extract failed" : stderr, exitCode: process.terminationStatus)
+            }
+            try finalizeLocalDirectoryExtraction(extraction)
+        } catch {
+            try? stdinPipe.fileHandleForWriting.close()
+            if process.isRunning {
+                process.terminate()
+                process.waitUntilExit()
+            }
+            try? cleanupLocalDirectoryExtraction(extraction)
+            throw error
+        }
+    }
+
+    private struct RemoteProcResult {
+        var exitCode: Int32
+        var stdout: String
+        var stderr: String
+    }
+
+    private func runRemoteProc(
+        instanceName: String,
+        argv: [String],
+        inputFD: Int32?,
+        attachInput: Bool,
+        onOutput: ((ProcOutputEvent) -> Bool)? = nil
+    ) throws -> RemoteProcResult {
+        try lock.withExclusiveLock {
+            try bootstrap.ensureBootstrapped(context: .runtime)
+        }
+
+        try daemonClient.ensureConnected(
+            expectedInstanceName: instanceName,
+            hostShareRoot: resolveWorkspaceHostShareRoot(),
+            callerCwd: currentCallerCwd()
+        )
+
+        let regResp = try daemonClient.send(RuntimeControlRequest(
+            op: "session_register",
+            instance: instanceName,
+            callerCwd: currentCallerCwd()
+        ))
+        guard regResp.ok, let sessionID = regResp.sessionId else {
+            throw MSLRuntimeError("failed to register session: \(regResp.error ?? "unknown")")
+        }
+        defer {
+            _ = try? daemonClient.send(RuntimeControlRequest(op: "session_unregister", sessionId: sessionID))
+            daemonClient.disconnect()
+        }
+
+        let openResp = try daemonClient.send(RuntimeControlRequest(
+            op: "proc_open",
+            argv: argv,
+            runAsRoot: shouldForceRootRuntimeUser(),
+            sessionId: sessionID
+        ))
+        guard openResp.ok, let procId = openResp.procId else {
+            throw MSLRuntimeError(openResp.error ?? "proc_open failed")
+        }
+        defer {
+            _ = try? daemonClient.send(RuntimeControlRequest(op: "proc_close", procId: procId, sessionId: sessionID))
+        }
+
+        var stdout = Data()
+        var stderr = Data()
+        let result = try SessionStreamBridge.runProc(
+            daemonClient: daemonClient,
+            procID: procId,
+            sessionID: sessionID,
+            inputFD: inputFD,
+            attachInput: attachInput,
+            onOutput: { event in
+                if let onOutput {
+                    return onOutput(event)
+                }
+                switch event.kind {
+                case .stdout:
+                    stdout.append(event.data)
+                case .stderr:
+                    stderr.append(event.data)
+                }
+                return true
+            }
+        )
+        let stdoutText = String(data: stdout, encoding: .utf8) ?? ""
+        let stderrText = String(data: stderr, encoding: .utf8) ?? ""
+        if result.exitCode != 0 {
+            let message = stderrText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? stdoutText.trimmingCharacters(in: .whitespacesAndNewlines)
+                : stderrText.trimmingCharacters(in: .whitespacesAndNewlines)
+            throw MSLRuntimeError(message.isEmpty ? "remote copy command failed" : message, exitCode: result.exitCode)
+        }
+        return RemoteProcResult(exitCode: result.exitCode, stdout: stdoutText, stderr: stderrText)
+    }
+
+    private func hostTarExecutable() throws -> String {
+        if FileManager.default.isExecutableFile(atPath: "/usr/bin/tar") {
+            return "/usr/bin/tar"
+        }
+        let process = ProcessExecutor()
+        if let found = process.findExecutable(["tar"]) {
+            return found
+        }
+        throw MSLRuntimeError("tar not found")
+    }
+
+    func makeRemoteFileUploadCommand(localBaseName: String, remotePath: String) -> String {
+        let remote = remotePathShellExpression(remotePath)
+        let base = shellQuote(localBaseName)
+        return "dest=\(remote); base=\(base); if [ -d \"$dest\" ]; then dest=\"$dest/$base\"; fi; exec cat > \"$dest\""
+    }
+
+    func makeRemoteFileDownloadCommand(remotePath: String) -> String {
+        let remote = remotePathShellExpression(remotePath)
+        return "src=\(remote); if [ -d \"$src\" ]; then echo \"omitting directory '$src'; use -r to copy directories\" >&2; exit 1; fi; exec cat < \"$src\""
+    }
+
+    func makeRemoteDirectoryUploadCommand(localBaseName: String, remotePath: String) -> String {
+        let remote = remotePathShellExpression(remotePath)
+        let base = shellQuote(localBaseName)
+        return """
+        dest=\(remote); src_base=\(base); \
+        if [ -d "$dest" ]; then exec tar -xf - -C "$dest"; fi; \
+        if [ -e "$dest" ]; then echo "destination exists and is not a directory: $dest" >&2; exit 1; fi; \
+        tmp=$(mktemp -d "${TMPDIR:-/tmp}/msl-cp.XXXXXX"); trap 'rm -rf "$tmp"' EXIT INT TERM; \
+        tar -xf - -C "$tmp" || exit $?; \
+        if [ ! -e "$tmp/$src_base" ]; then echo "archive missing expected root: $src_base" >&2; exit 1; fi; \
+        mv "$tmp/$src_base" "$dest"
+        """
+    }
+
+    func makeRemoteDirectoryDownloadCommand(remotePath: String) -> String {
+        let remote = remotePathShellExpression(remotePath)
+        return "src=\(remote); if [ ! -d \"$src\" ]; then echo \"not a directory: $src\" >&2; exit 1; fi; parent=$(dirname \"$src\"); base=$(basename \"$src\"); exec tar -cf - -C \"$parent\" \"$base\""
+    }
+
+    func resolveLocalFileDownloadTarget(remotePath: String, localPath: String) throws -> URL {
+        let expandedLocalPath = try expandLocalCopyPath(localPath)
+        let localURL = URL(fileURLWithPath: expandedLocalPath)
+        var isDirectory: ObjCBool = false
+        if fileManager.fileExists(atPath: localURL.path, isDirectory: &isDirectory), isDirectory.boolValue {
+            return localURL.appendingPathComponent(URL(fileURLWithPath: remotePath).lastPathComponent, isDirectory: false)
+        }
+        return localURL
+    }
+
+    private struct LocalDirectoryExtractionPlan {
+        var extractRoot: URL
+        var tempRoot: URL?
+        var finalTarget: URL
+        var expectedExtractedName: String
+        var replaceDirectly: Bool
+    }
+
+    private func prepareLocalDirectoryExtraction(remotePath: String, localPath: String) throws -> LocalDirectoryExtractionPlan {
+        let remoteBase = URL(fileURLWithPath: remotePath).lastPathComponent
+        let expandedLocalPath = try expandLocalCopyPath(localPath)
+        let localURL = URL(fileURLWithPath: expandedLocalPath)
+        var isDirectory: ObjCBool = false
+        if fileManager.fileExists(atPath: localURL.path, isDirectory: &isDirectory) {
+            if isDirectory.boolValue {
+                return .init(
+                    extractRoot: localURL,
+                    tempRoot: nil,
+                    finalTarget: localURL.appendingPathComponent(remoteBase, isDirectory: true),
+                    expectedExtractedName: remoteBase,
+                    replaceDirectly: false
+                )
+            }
+            throw MSLRuntimeError("destination exists and is not a directory: \(localPath)")
+        }
+
+        let parent = localURL.deletingLastPathComponent()
+        var parentIsDirectory: ObjCBool = false
+        guard fileManager.fileExists(atPath: parent.path, isDirectory: &parentIsDirectory), parentIsDirectory.boolValue else {
+            throw MSLRuntimeError("destination parent does not exist: \(parent.path)")
+        }
+        let tempRoot = parent.appendingPathComponent(".msl-cp-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: tempRoot, withIntermediateDirectories: false)
+        return .init(
+            extractRoot: tempRoot,
+            tempRoot: tempRoot,
+            finalTarget: localURL,
+            expectedExtractedName: remoteBase,
+            replaceDirectly: true
+        )
+    }
+
+    private func finalizeLocalDirectoryExtraction(_ plan: LocalDirectoryExtractionPlan) throws {
+        guard plan.replaceDirectly, let tempRoot = plan.tempRoot else {
+            return
+        }
+        let extracted = tempRoot.appendingPathComponent(plan.expectedExtractedName, isDirectory: true)
+        let sourceURL: URL
+        if fileManager.fileExists(atPath: extracted.path) {
+            sourceURL = extracted
+        } else {
+            let children = try fileManager.contentsOfDirectory(at: tempRoot, includingPropertiesForKeys: nil)
+            guard children.count == 1 else {
+                throw MSLRuntimeError("archive missing expected root: \(plan.expectedExtractedName)")
+            }
+            sourceURL = children[0]
+        }
+        try replaceItem(at: plan.finalTarget, with: sourceURL)
+        try? fileManager.removeItem(at: tempRoot)
+    }
+
+    private func cleanupLocalDirectoryExtraction(_ plan: LocalDirectoryExtractionPlan) throws {
+        if let tempRoot = plan.tempRoot {
+            try? fileManager.removeItem(at: tempRoot)
+        }
+    }
+
+    private func replaceItem(at destination: URL, with source: URL) throws {
+        if fileManager.fileExists(atPath: destination.path) {
+            try fileManager.removeItem(at: destination)
+        }
+        try fileManager.moveItem(at: source, to: destination)
+    }
+
+    private func makeTemporarySiblingURL(for target: URL) -> URL {
+        let parent = target.deletingLastPathComponent()
+        return parent.appendingPathComponent(".msl-cp-\(UUID().uuidString).tmp", isDirectory: false)
+    }
+
+    func expandLocalCopyPath(_ raw: String) throws -> String {
+        try MSLCopyPathParser.expandLocalPath(raw)
+    }
+
+    func remotePathShellExpression(_ raw: String) -> String {
+        if raw == "~" {
+            return "\"$HOME\""
+        }
+        if raw.hasPrefix("~/") {
+            let suffix = String(raw.dropFirst(2))
+            if suffix.isEmpty {
+                return "\"$HOME\""
+            }
+            return "\"$HOME\"/\(shellQuote(suffix))"
+        }
+        if !raw.hasPrefix("/") {
+            return "\"$HOME\"/\(shellQuote(raw))"
+        }
+        return shellQuote(raw)
     }
 
     private func formatMegaBytesTenths(_ bytes: Int64) -> String {
