@@ -11,3 +11,7 @@ run_test_expect_fail_output "explicit missing instance" "instance 'missing-step7
 # --- subcommand-side --instance is passed through command argv, not parsed globally ---
 run_test_expect_fail_output "subcommand instance passthrough" "instance 'global-step7' not found" \
   "$MSL" --instance global-step7 run echo --instance inner-step7
+
+# --- cp is recognized as a subcommand boundary for global --instance parsing ---
+run_test_expect_fail_output "cp subcommand parsing" "instance 'global-step7' not found" \
+  "$MSL" --instance global-step7 cp local.txt @:/tmp/local.txt
