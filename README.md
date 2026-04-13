@@ -25,20 +25,20 @@ This repository currently contains a Swift prototype for bootstrap/lifecycle + S
 - macOS (Apple Silicon expected)
 - Xcode Command Line Tools
 - Swift toolchain (SwiftPM)
-- Docker Desktop (or compatible Docker Engine)
 - Ubuntu RAW image file prepared locally
 - Host environment where Virtualization is available to the binary
 
-Install kernel-build dependencies:
+Developer-only helper staging for release-bundled container-image installs:
 
 ```bash
-brew install --cask docker
+make stage-container-tools
 ```
 
-If you start from Ubuntu cloud image (`*.img`, qcow2), convert it:
+Install Docker Desktop before using kernel-build scripts.
+
+If you start from Ubuntu cloud image (`*.img`, qcow2), install `qemu-img` and convert it:
 
 ```bash
-brew install qemu
 qemu-img info ubuntu-24.04-server-cloudimg-arm64.img
 qemu-img convert -f qcow2 -O raw ubuntu-24.04-server-cloudimg-arm64.img ubuntu-24.04-server-cloudimg-arm64.raw
 ```
@@ -62,6 +62,7 @@ make build
 
 Other build helpers:
 - `make build-ext4-helper`: build ext4 image helpers only
+- `make stage-container-tools`: stage `regctl` / `umoci` into `~/Library/Application Support/msl/tools/bundled/darwin-arm64` for developer/release packaging
 - `make build-image`: run `scripts/build-msl-image.sh` (Step18 storage image build entrypoint)
 - `make reset`: legacy cleanup for old `distros/default/disk.raw` path (typically no-op on current instance-based installs)
 - `make clean-alpine`: uninstall all instances with `--keep-cache`, install fresh `alpine` (kernel selection is delegated to `msl install`), clear host logs, then launch `msl`
@@ -115,6 +116,28 @@ Install from catalog:
 ./.build/debug/msl install ubuntu-latest --name test-next
 ./.build/debug/msl install ubuntu-questing --name test-questing
 ```
+
+Install from local rootfs archive through the btrfs/imagewriter pipeline:
+
+```bash
+./.build/debug/msl install --rootfs /path/to/rootfs.tar.gz --name local-rootfs
+```
+
+Install from public remote container registry without Docker daemon:
+
+```bash
+./.build/debug/msl install --from-container debian:slim --name debian-slim
+./.build/debug/msl install --from-container ghcr.io/example/app:latest --name app
+```
+
+Notes:
+- regular `msl install` paths now build a `btrfs` disk through imagewriter
+- `_bootstrap-install` keeps the internal ext4 bootstrap path only for `_imagewriter`
+- `--from-container` currently supports public remote images only
+- platform is currently limited to `linux/arm64`
+- images without `/bin/sh`, `/bin/bash`, or `/bin/ash` are rejected
+- release builds bundle `regctl` and `umoci`; end users do not need a separate install step
+- runtime prefers bundled helpers, extracts them into `~/.msl-system/tools/<bundle-version>/`, and only falls back to `PATH` for developer setups
 
 List installed instances:
 

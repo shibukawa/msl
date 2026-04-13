@@ -8,6 +8,29 @@ final class DistributionModelsTests: XCTestCase {
         XCTAssertEqual(policy.startupMountEnabled, true)
     }
 
+    func testBundledToolManifestDecodesBundleVersion() throws {
+        let raw = """
+        {
+          "bundleVersion": "darwin-arm64-regctl-v0.11.2_umoci-v0.6.0",
+          "platform": "darwin-arm64",
+          "generatedAtEpochMs": 100,
+          "tools": [
+            {
+              "name": "regctl",
+              "version": "v0.11.2",
+              "checksum": "abc",
+              "relativePath": "regctl"
+            }
+          ]
+        }
+        """
+
+        let decoded = try JSONDecoder().decode(BundledToolManifest.self, from: Data(raw.utf8))
+        XCTAssertEqual(decoded.bundleVersion, "darwin-arm64-regctl-v0.11.2_umoci-v0.6.0")
+        XCTAssertEqual(decoded.record(named: "regctl")?.version, "v0.11.2")
+        XCTAssertNil(decoded.record(named: "umoci"))
+    }
+
     func testDistributionInstanceMetadataDecodesWithoutWorkspacePolicy() throws {
         let raw = """
         {

@@ -20,6 +20,17 @@ SWIFTPM_MODULECACHE_OVERRIDE="$MODULE_CACHE" \
 CLANG_MODULE_CACHE_PATH="$MODULE_CACHE" \
 swift build --disable-sandbox
 
+DEFAULT_CONTAINER_TOOLS_STAGE_DIR="${CONTAINER_TOOLS_STAGE_DIR:-$HOME/Library/Application Support/msl/tools/bundled/darwin-arm64}"
+
+if [[ -f "$DEFAULT_CONTAINER_TOOLS_STAGE_DIR/manifest.json" ]]; then
+  CONTAINER_TOOLS_STAGE_DIR="$DEFAULT_CONTAINER_TOOLS_STAGE_DIR" \
+    CONTAINER_TOOLS_OUTPUT_DIR="$ROOT_DIR/.build/debug/tools" \
+    ./scripts/package-container-tools.sh
+else
+  rm -rf "$ROOT_DIR/.build/debug/tools"
+  echo "Container helper bundle not staged; skipping helper packaging."
+fi
+
 if [[ -n "$SIGNING_IDENTITY" ]]; then
   ENTITLEMENTS_PATH="$FULL_ENTITLEMENTS_PATH"
   echo "Using signing identity: $SIGNING_IDENTITY"

@@ -35,6 +35,10 @@ final class ImagewriterScriptTests: XCTestCase {
         XCTAssertTrue(script.contains("verify_guest_visible_fs_type \"$GUEST_IMAGEWRITER_DISK\" \"$REQUIRED_IMAGEWRITER_FS\" \"imagewriter_instance\""))
         XCTAssertTrue(script.contains("imagewriter_verified_fs context=$verify_context fs=$actual_fs path=$image_path"))
         XCTAssertTrue(script.contains("imagewriter_guest_verified_shared_output mode=$mode fs=$shared_output_fs output=$output"))
+        XCTAssertTrue(script.contains("ROOTFS_DIR"))
+        XCTAssertTrue(script.contains("--rootfs-dir \"$input_path\""))
+        XCTAssertTrue(script.contains("single_pass_mode=\"stage2\""))
+        XCTAssertTrue(script.contains("single_pass_packages=\"$IMAGEWRITER_PACKAGES\""))
     }
 
     func testImagewriterGuestBuilderRequiresExplicitSize() throws {
@@ -45,6 +49,7 @@ final class ImagewriterScriptTests: XCTestCase {
         XCTAssertFalse(script.contains("DEFAULT_SIZE_MB"))
         XCTAssertTrue(script.contains("--size-mb <n>"))
         XCTAssertTrue(script.contains("--fs-type <btrfs|erofs>"))
+        XCTAssertTrue(script.contains("--rootfs-dir <rootfs-dir>"))
         XCTAssertTrue(script.contains("mkfs.erofs"))
         XCTAssertTrue(script.contains("blkid -p -s TYPE -o value"))
         XCTAssertTrue(script.contains("imagewriter_guest_verified_fs mode=$MODE fs=$actual_fs output=$OUTPUT_IMAGE"))
@@ -57,5 +62,25 @@ final class ImagewriterScriptTests: XCTestCase {
         XCTAssertTrue(makefile.contains("two-stage ext4 -> erofs"))
         XCTAssertTrue(makefile.contains("readonly EROFS"))
         XCTAssertTrue(makefile.contains("IMAGE_FS=\"erofs\""))
+        XCTAssertTrue(makefile.contains("stage-container-tools"))
+        XCTAssertTrue(makefile.contains("package-container-tools"))
+    }
+
+    func testBuildSignedScriptPackagesBundledContainerHelpersWhenStaged() throws {
+        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+        let script = try String(contentsOf: root.appendingPathComponent("scripts/build-signed.sh"), encoding: .utf8)
+
+        XCTAssertTrue(script.contains("package-container-tools.sh"))
+        XCTAssertTrue(script.contains("Container helper bundle not staged; skipping helper packaging."))
+    }
+
+    func testBuildDesktopAppCopiesContainerHelpersIntoResources() throws {
+        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+        let script = try String(contentsOf: root.appendingPathComponent("scripts/build-desktop-app.sh"), encoding: .utf8)
+
+        XCTAssertTrue(script.contains("CONTAINER_TOOLS_DEST_DIR"))
+        XCTAssertTrue(script.contains("container-tools"))
+        XCTAssertTrue(script.contains("manifest.json"))
+        XCTAssertTrue(script.contains("cp \"$CONTAINER_TOOLS_SOURCE_DIR/regctl\""))
     }
 }

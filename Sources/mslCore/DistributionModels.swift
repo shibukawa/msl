@@ -191,6 +191,49 @@ public struct DistributionSourceRecord: Codable, Equatable {
     public var tarballFileName: String
     public var sha256: String
     public var verifiedAtEpochMs: Int64
+    public var imageRef: String?
+    public var resolvedReference: String?
+    public var registry: String?
+    public var repository: String?
+    public var tag: String?
+    public var digest: String?
+    public var platform: String?
+
+    public init(
+        sourceType: String,
+        distro: String? = nil,
+        version: String? = nil,
+        arch: String? = nil,
+        manifestId: String? = nil,
+        localPath: String? = nil,
+        tarballFileName: String,
+        sha256: String,
+        verifiedAtEpochMs: Int64,
+        imageRef: String? = nil,
+        resolvedReference: String? = nil,
+        registry: String? = nil,
+        repository: String? = nil,
+        tag: String? = nil,
+        digest: String? = nil,
+        platform: String? = nil
+    ) {
+        self.sourceType = sourceType
+        self.distro = distro
+        self.version = version
+        self.arch = arch
+        self.manifestId = manifestId
+        self.localPath = localPath
+        self.tarballFileName = tarballFileName
+        self.sha256 = sha256
+        self.verifiedAtEpochMs = verifiedAtEpochMs
+        self.imageRef = imageRef
+        self.resolvedReference = resolvedReference
+        self.registry = registry
+        self.repository = repository
+        self.tag = tag
+        self.digest = digest
+        self.platform = platform
+    }
 }
 
 public struct WorkspacePolicy: Codable, Equatable {
@@ -468,7 +511,55 @@ public struct DistributionVerifiedRecord: Codable, Equatable {
     public var manifestId: String?
 }
 
+public struct ContainerImageReference: Codable, Equatable {
+    public var original: String
+    public var registry: String
+    public var repository: String
+    public var tag: String?
+    public var digest: String?
+    public var normalizedName: String
+
+    public init(
+        original: String,
+        registry: String,
+        repository: String,
+        tag: String?,
+        digest: String?,
+        normalizedName: String
+    ) {
+        self.original = original
+        self.registry = registry
+        self.repository = repository
+        self.tag = tag
+        self.digest = digest
+        self.normalizedName = normalizedName
+    }
+}
+
+public struct ResolvedContainerImage: Codable, Equatable {
+    public var reference: ContainerImageReference
+    public var resolvedReference: String
+    public var digest: String
+    public var platform: String
+    public var manifestDigest: String?
+
+    public init(
+        reference: ContainerImageReference,
+        resolvedReference: String,
+        digest: String,
+        platform: String,
+        manifestDigest: String? = nil
+    ) {
+        self.reference = reference
+        self.resolvedReference = resolvedReference
+        self.digest = digest
+        self.platform = platform
+        self.manifestDigest = manifestDigest
+    }
+}
+
 enum DistributionSourceSelection {
     case manifest(DistributionManifestEntry)
     case localFile(URL)
+    case containerRemote(ContainerImageReference)
 }

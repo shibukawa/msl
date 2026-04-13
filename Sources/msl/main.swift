@@ -16,11 +16,12 @@ struct InstallInvocation {
     let targetAlias: String?
     let localFilePath: String?
     let rawDiskPath: String?
+    let containerImageRef: String?
     let rebuild: Bool
     let diskSizeGB: Int?
 }
 
-func defaultInstallName(targetAlias: String?, localFilePath: String?, rawDiskPath: String?) -> String {
+func defaultInstallName(targetAlias: String?, localFilePath: String?, rawDiskPath: String?, containerImageRef: String?) -> String {
     if let targetAlias, !targetAlias.isEmpty {
         return targetAlias
     }
@@ -36,6 +37,18 @@ func defaultInstallName(targetAlias: String?, localFilePath: String?, rawDiskPat
     }
     if let rawDiskPath, !rawDiskPath.isEmpty {
         return URL(fileURLWithPath: rawDiskPath).deletingPathExtension().lastPathComponent
+    }
+    if let containerImageRef, !containerImageRef.isEmpty {
+        let suffix = containerImageRef
+            .replacingOccurrences(of: "://", with: "-")
+            .replacingOccurrences(of: "/", with: "-")
+            .replacingOccurrences(of: ":", with: "-")
+            .replacingOccurrences(of: "@", with: "-")
+        let compact = suffix
+            .split(separator: "-")
+            .filter { !$0.isEmpty }
+            .joined(separator: "-")
+        return compact.isEmpty ? "container" : compact
     }
     return "default"
 }
@@ -100,6 +113,9 @@ struct InstallOptions: ParsableArguments {
     @Option(name: [.customLong("raw")], help: "Local raw disk image path.")
     var rawDiskPath: String?
 
+    @Option(name: [.customLong("from-container")], help: "Remote container image reference.")
+    var containerImageRef: String?
+
     @Flag(name: [.customLong("rebuild")], help: "Force rebuild even if cached image exists.")
     var rebuild = false
 
@@ -118,12 +134,12 @@ struct InstallOptions: ParsableArguments {
         if targetAlias != nil, distroAlias != nil {
             throw ValidationError("Use either positional <distribution-name> or --distro, not both")
         }
-        let sourceCount = [resolvedTarget, localFilePath, rawDiskPath].compactMap { $0 }.count
+        let sourceCount = [resolvedTarget, localFilePath, rawDiskPath, containerImageRef].compactMap { $0 }.count
         if sourceCount == 0 {
-            throw ValidationError("install requires <distribution-name>, --rootfs <path>, or --raw <path>")
+            throw ValidationError("install requires <distribution-name>, --rootfs <path>, --raw <path>, or --from-container <image-ref>")
         }
         if sourceCount > 1 {
-            throw ValidationError("Use only one of <distribution-name>, --rootfs/--file, or --raw")
+            throw ValidationError("Use only one of <distribution-name>, --rootfs/--file, --raw, or --from-container")
         }
         if rawDiskPath != nil, diskSizeGB != nil {
             throw ValidationError("--disk-size-gb cannot be used with --raw")
@@ -133,11 +149,13 @@ struct InstallOptions: ParsableArguments {
             name: name ?? defaultInstallName(
                 targetAlias: resolvedTarget,
                 localFilePath: localFilePath,
-                rawDiskPath: rawDiskPath
+                rawDiskPath: rawDiskPath,
+                containerImageRef: containerImageRef
             ),
             targetAlias: resolvedTarget,
             localFilePath: localFilePath,
             rawDiskPath: rawDiskPath,
+            containerImageRef: containerImageRef,
             rebuild: rebuild,
             diskSizeGB: diskSizeGB
         )
@@ -360,6 +378,7 @@ struct InstallCommand: ParsableCommand {
                 targetAlias: invocation.targetAlias,
                 localFilePath: invocation.localFilePath,
                 rawDiskPath: invocation.rawDiskPath,
+                containerImageRef: invocation.containerImageRef,
                 rebuild: invocation.rebuild,
                 diskSizeGB: invocation.diskSizeGB
             )
