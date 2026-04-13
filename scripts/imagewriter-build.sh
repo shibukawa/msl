@@ -8,6 +8,7 @@ INSTANCE="${IMAGEWRITER_INSTANCE:-_imagewriter}"
 IMAGE_FS="${IMAGE_FS:-btrfs}"
 FORCE_SETUP="${IMAGEWRITER_FORCE_SETUP:-0}"
 ROOTFS_TARBALL="${ROOTFS_TARBALL:-}"
+ROOTFS_DIR="${ROOTFS_DIR:-}"
 INIT_BINARY_PATH="${IMAGEWRITER_INIT_BINARY:-}"
 RUN_TIMEOUT="${IMAGEWRITER_RUN_TIMEOUT:-900}"
 IMAGEWRITER_PACKAGES="${IMAGEWRITER_PACKAGES:-btrfs-progs e2fsprogs erofs-utils util-linux tar zstd xz coreutils}"
@@ -289,7 +290,14 @@ EOF_CANDIDATES
   return 1
 }
 
-if [ -n "$ROOTFS_TARBALL" ]; then
+if [ -n "$ROOTFS_TARBALL" ] && [ -n "$ROOTFS_DIR" ]; then
+  echo "error: specify only one of ROOTFS_TARBALL or ROOTFS_DIR" >&2
+  exit 1
+fi
+
+if [ -n "$ROOTFS_DIR" ]; then
+  echo "using provided rootfs directory: $ROOTFS_DIR"
+elif [ -n "$ROOTFS_TARBALL" ]; then
   echo "using provided rootfs: $ROOTFS_TARBALL"
 else
   if ROOTFS_TARBALL="$(resolve_default_alpine_tarball)"; then
@@ -307,8 +315,12 @@ else
   fi
 fi
 
-if [ ! -f "$ROOTFS_TARBALL" ]; then
+if [ -n "$ROOTFS_TARBALL" ] && [ ! -f "$ROOTFS_TARBALL" ]; then
   echo "error: ROOTFS_TARBALL not found: $ROOTFS_TARBALL" >&2
+  exit 1
+fi
+if [ -n "$ROOTFS_DIR" ] && [ ! -d "$ROOTFS_DIR" ]; then
+  echo "error: ROOTFS_DIR not found: $ROOTFS_DIR" >&2
   exit 1
 fi
 if [ -n "$INIT_BINARY_PATH" ] && [ ! -f "$INIT_BINARY_PATH" ]; then
@@ -416,7 +428,13 @@ if ! GUEST_APK_CACHE="$(host_to_guest_path "$HOST_APK_CACHE" "$SHARE_ROOT")"; th
   fi
 fi
 
-STAGE_ROOTFS="$STAGE_IN_DIR/$(basename "$ROOTFS_TARBALL")"
+STAGE_ROOTFS=""
+STAGE_ROOTFS_DIR=""
+if [ -n "$ROOTFS_TARBALL" ]; then
+  STAGE_ROOTFS="$STAGE_IN_DIR/$(basename "$ROOTFS_TARBALL")"
+else
+  STAGE_ROOTFS_DIR="$STAGE_IN_DIR/rootfs-dir"
+fi
 STAGE_OUTPUT="$STAGE_OUT_DIR/imagewriter-${IMAGE_FS}.raw"
 STAGE1_OUTPUT="$STAGE_OUT_DIR/stage1-ext4.raw"
 STAGE2_OUTPUT="$STAGE_OUT_DIR/stage2-${IMAGE_FS}.raw"
@@ -441,7 +459,13 @@ copy_if_needed() {
   fi
 }
 
-copy_if_needed "$ROOTFS_TARBALL" "$STAGE_ROOTFS"
+if [ -n "$ROOTFS_TARBALL" ]; then
+  copy_if_needed "$ROOTFS_TARBALL" "$STAGE_ROOTFS"
+else
+  rm -rf "$STAGE_ROOTFS_DIR"
+  mkdir -p "$STAGE_ROOTFS_DIR"
+  cp -R "$ROOTFS_DIR"/. "$STAGE_ROOTFS_DIR"/
+fi
 rm -f "$STAGE_OUTPUT" "$STAGE1_OUTPUT" "$STAGE2_OUTPUT" "$STAGE_TMP_IMAGE"
 if [ -n "$INIT_BINARY_PATH" ]; then
   STAGE_INIT="$STAGE_IN_DIR/$(basename "$INIT_BINARY_PATH")"
@@ -449,8 +473,12 @@ if [ -n "$INIT_BINARY_PATH" ]; then
 fi
 progress_step "staged rootfs/init artifacts"
 
-if ! GUEST_ROOTFS="$(host_to_guest_path "$STAGE_ROOTFS" "$SHARE_ROOT")"; then
-  echo "error: staging rootfs path is outside host share root: $STAGE_ROOTFS (share_root=$SHARE_ROOT)" >&2
+ROOTFS_INPUT_PATH="$STAGE_ROOTFS"
+if [ -n "$STAGE_ROOTFS_DIR" ]; then
+  ROOTFS_INPUT_PATH="$STAGE_ROOTFS_DIR"
+fi
+if ! GUEST_ROOTFS="$(host_to_guest_path "$ROOTFS_INPUT_PATH" "$SHARE_ROOT")"; then
+  echo "error: staging rootfs path is outside host share root: $ROOTFS_INPUT_PATH (share_root=$SHARE_ROOT)" >&2
   exit 1
 fi
 GUEST_INIT=""
@@ -592,16 +620,32 @@ rm -f "$local_output"
 case "$mode" in
   stage1)
     if [ -n "$init_bin" ]; then
-      MSL_IMAGEWRITER_WORK_DIR="$tmp_work_dir" sh "$worker" --mode stage1 --rootfs "$input_path" --output "$local_output" --size-mb "$size_mb" --init-binary "$init_bin" --packages "$packages" --apk-cache-dir "$apk_cache" --retry-limit "$apk_retry_limit"
+      if [ -d "$input_path" ]; then
+        MSL_IMAGEWRITER_WORK_DIR="$tmp_work_dir" sh "$worker" --mode stage1 --rootfs-dir "$input_path" --output "$local_output" --size-mb "$size_mb" --init-binary "$init_bin" --packages "$packages" --apk-cache-dir "$apk_cache" --retry-limit "$apk_retry_limit"
+      else
+        MSL_IMAGEWRITER_WORK_DIR="$tmp_work_dir" sh "$worker" --mode stage1 --rootfs "$input_path" --output "$local_output" --size-mb "$size_mb" --init-binary "$init_bin" --packages "$packages" --apk-cache-dir "$apk_cache" --retry-limit "$apk_retry_limit"
+      fi
     else
-      MSL_IMAGEWRITER_WORK_DIR="$tmp_work_dir" sh "$worker" --mode stage1 --rootfs "$input_path" --output "$local_output" --size-mb "$size_mb" --packages "$packages" --apk-cache-dir "$apk_cache" --retry-limit "$apk_retry_limit"
+      if [ -d "$input_path" ]; then
+        MSL_IMAGEWRITER_WORK_DIR="$tmp_work_dir" sh "$worker" --mode stage1 --rootfs-dir "$input_path" --output "$local_output" --size-mb "$size_mb" --packages "$packages" --apk-cache-dir "$apk_cache" --retry-limit "$apk_retry_limit"
+      else
+        MSL_IMAGEWRITER_WORK_DIR="$tmp_work_dir" sh "$worker" --mode stage1 --rootfs "$input_path" --output "$local_output" --size-mb "$size_mb" --packages "$packages" --apk-cache-dir "$apk_cache" --retry-limit "$apk_retry_limit"
+      fi
     fi
     ;;
   stage2)
     if [ -n "$init_bin" ]; then
-      MSL_IMAGEWRITER_WORK_DIR="$tmp_work_dir" sh "$worker" --mode stage2 --fs-type "$fs_type" --rootfs "$input_path" --output "$local_output" --size-mb "$size_mb" --init-binary "$init_bin" --packages "$packages" --apk-cache-dir "$apk_cache" --retry-limit "$apk_retry_limit"
+      if [ -d "$input_path" ]; then
+        MSL_IMAGEWRITER_WORK_DIR="$tmp_work_dir" sh "$worker" --mode stage2 --fs-type "$fs_type" --rootfs-dir "$input_path" --output "$local_output" --size-mb "$size_mb" --init-binary "$init_bin" --packages "$packages" --apk-cache-dir "$apk_cache" --retry-limit "$apk_retry_limit"
+      else
+        MSL_IMAGEWRITER_WORK_DIR="$tmp_work_dir" sh "$worker" --mode stage2 --fs-type "$fs_type" --rootfs "$input_path" --output "$local_output" --size-mb "$size_mb" --init-binary "$init_bin" --packages "$packages" --apk-cache-dir "$apk_cache" --retry-limit "$apk_retry_limit"
+      fi
     else
-      MSL_IMAGEWRITER_WORK_DIR="$tmp_work_dir" sh "$worker" --mode stage2 --fs-type "$fs_type" --rootfs "$input_path" --output "$local_output" --size-mb "$size_mb" --packages "$packages" --apk-cache-dir "$apk_cache" --retry-limit "$apk_retry_limit"
+      if [ -d "$input_path" ]; then
+        MSL_IMAGEWRITER_WORK_DIR="$tmp_work_dir" sh "$worker" --mode stage2 --fs-type "$fs_type" --rootfs-dir "$input_path" --output "$local_output" --size-mb "$size_mb" --packages "$packages" --apk-cache-dir "$apk_cache" --retry-limit "$apk_retry_limit"
+      else
+        MSL_IMAGEWRITER_WORK_DIR="$tmp_work_dir" sh "$worker" --mode stage2 --fs-type "$fs_type" --rootfs "$input_path" --output "$local_output" --size-mb "$size_mb" --packages "$packages" --apk-cache-dir "$apk_cache" --retry-limit "$apk_retry_limit"
+      fi
     fi
     ;;
   legacy)
@@ -734,13 +778,18 @@ else
 
   stage_name="single_pass_${IMAGE_FS}"
   stage_fail_exit=22
+  single_pass_mode="legacy"
+  single_pass_packages=""
   if [ "$IMAGE_FS" = "ext4" ]; then
     stage_name="stage1_ext4"
     stage_fail_exit=21
+  else
+    single_pass_mode="stage2"
+    single_pass_packages="$IMAGEWRITER_PACKAGES"
   fi
 
   mark_stage_start "$stage_name" "$GUEST_ROOTFS" "$GUEST_OUTPUT"
-  if run_guest_worker_with_retry legacy "$GUEST_ROOTFS" "$GUEST_OUTPUT" "$IMAGE_FS" "$IMAGE_SIZE_MB" "$GUEST_INIT" "" "$GUEST_APK_CACHE"; then
+  if run_guest_worker_with_retry "$single_pass_mode" "$GUEST_ROOTFS" "$GUEST_OUTPUT" "$IMAGE_FS" "$IMAGE_SIZE_MB" "$GUEST_INIT" "$single_pass_packages" "$GUEST_APK_CACHE"; then
     mark_stage_complete "$stage_name"
   else
     stage_code=$?
@@ -767,6 +816,10 @@ fi
 echo "imagewriter build completed"
 echo "instance: $INSTANCE"
 echo "fs: $IMAGE_FS"
-echo "rootfs: $ROOTFS_TARBALL"
+if [ -n "$ROOTFS_DIR" ]; then
+  echo "rootfs_dir: $ROOTFS_DIR"
+else
+  echo "rootfs: $ROOTFS_TARBALL"
+fi
 echo "output: $OUTPUT_RAW"
 progress_step "done"

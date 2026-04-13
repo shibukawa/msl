@@ -328,6 +328,7 @@ public final class RuntimeManager {
         targetAlias: String?,
         localFilePath: String?,
         rawDiskPath: String?,
+        containerImageRef: String?,
         rebuild: Bool,
         diskSizeGB: Int?
     ) throws -> Never {
@@ -337,6 +338,7 @@ public final class RuntimeManager {
                 name: name,
                 targetAlias: targetAlias,
                 localFilePath: localFilePath,
+                containerImageRef: containerImageRef,
                 rebuild: rebuild,
                 diskSizeGB: diskSizeGB
             )
@@ -356,6 +358,7 @@ public final class RuntimeManager {
                 name: name,
                 targetAlias: targetAlias,
                 localFilePath: localFilePath,
+                containerImageRef: containerImageRef,
                 rebuild: rebuild,
                 diskSizeGB: diskSizeGB,
                 mslExecutablePath: executablePath
@@ -371,6 +374,7 @@ public final class RuntimeManager {
         name: String,
         targetAlias: String?,
         localFilePath: String?,
+        containerImageRef _: String? = nil,
         rebuild: Bool,
         diskSizeGB: Int?
     ) throws -> Never {

@@ -105,6 +105,14 @@ struct ProcessExecutor {
     }
 }
 
+private struct RootFSMaterializationResult {
+    var source: DistributionSourceSelection
+    var sourceRecord: DistributionSourceRecord
+    var rootfsDir: URL
+    var sourceArchivePath: String?
+    var cleanupRoot: URL
+}
+
 final class DistributionManager {
     static let reservedInternalInstanceNames: Set<String> = ["_imagewriter"]
     static let defaultBootstrapDiskSizeGB = 8
@@ -116,19 +124,22 @@ final class DistributionManager {
     private let fileManager: FileManager
     private let manifestStore: DistributionManifestStore
     private let process: ProcessExecutor
+    private let environment: [String: String]
 
     init(
         paths: MSLPaths,
         logger: MSLLogger,
         fileManager: FileManager = .default,
         manifestStore: DistributionManifestStore = DistributionManifestStore(),
-        process: ProcessExecutor = ProcessExecutor()
+        process: ProcessExecutor = ProcessExecutor(),
+        environment: [String: String] = ProcessInfo.processInfo.environment
     ) {
         self.paths = paths
         self.logger = logger
         self.fileManager = fileManager
         self.manifestStore = manifestStore
         self.process = process
+        self.environment = environment
     }
 
     func installableDistributionNames() -> [String] {
@@ -280,14 +291,21 @@ final class DistributionManager {
     func fetch(
         targetAlias: String?,
         localFilePath: String?,
+        containerImageRef: String? = nil,
         force: Bool
     ) throws -> DistributionVerifiedRecord {
-        let source = try resolveSource(targetAlias: targetAlias, localFilePath: localFilePath)
+        let source = try resolveSource(
+            targetAlias: targetAlias,
+            localFilePath: localFilePath,
+            containerImageRef: containerImageRef
+        )
         switch source {
         case .manifest(let entry):
             return try fetchManifestEntry(entry, force: force)
         case .localFile(let url):
             return try cacheLocalFile(url, force: force)
+        case .containerRemote:
+            throw MSLRuntimeError("cache fetch does not support --from-container")
         }
     }
 
@@ -302,9 +320,9 @@ final class DistributionManager {
         try migrateLegacyRootfsCacheIfNeeded()
         let name = try validateInstanceName(rawName)
         emitStatus("install: preparing instance '\(name)'")
-        let source = try resolveSource(targetAlias: targetAlias, localFilePath: localFilePath)
+        let source = try resolveSource(targetAlias: targetAlias, localFilePath: localFilePath, containerImageRef: nil)
         emitStatus("install: fetching rootfs archive")
-        let verified = try fetch(targetAlias: targetAlias, localFilePath: localFilePath, force: false)
+        let verified = try fetch(targetAlias: targetAlias, localFilePath: localFilePath, containerImageRef: nil, force: false)
 
         try ensureDir(paths.appSupport)
         try ensureDir(paths.cacheDir)
@@ -378,6 +396,8 @@ final class DistributionManager {
                 sha256: verified.sha256,
                 verifiedAtEpochMs: verified.verifiedAtEpochMs
             )
+        case .containerRemote:
+            throw MSLRuntimeError("container sources are not supported for bootstrap installs")
         }
 
         let defaultKernelProfileRef = try? DefaultInstanceStore(paths: paths, fileManager: fileManager).loadDefaultKernelProfileRef()
@@ -434,6 +454,7 @@ final class DistributionManager {
         name rawName: String,
         targetAlias: String?,
         localFilePath: String?,
+        containerImageRef: String? = nil,
         rebuild: Bool,
         diskSizeGB: Int?,
         mslExecutablePath: String
@@ -441,9 +462,6 @@ final class DistributionManager {
         try migrateLegacyRootfsCacheIfNeeded()
         let name = try validateInstanceName(rawName)
         emitStatus("install: preparing instance '\(name)'")
-        let source = try resolveSource(targetAlias: targetAlias, localFilePath: localFilePath)
-        emitStatus("install: fetching rootfs archive")
-        let verified = try fetch(targetAlias: targetAlias, localFilePath: localFilePath, force: false)
 
         try ensureDir(paths.appSupport)
         try ensureDir(paths.cacheDir)
@@ -479,7 +497,14 @@ final class DistributionManager {
         }
 
         do {
-            let tarballURL = URL(fileURLWithPath: verified.tarballPath)
+            let materialized = try materializeRootFS(
+                targetAlias: targetAlias,
+                localFilePath: localFilePath,
+                containerImageRef: containerImageRef,
+                instanceName: name
+            )
+            defer { try? fileManager.removeItem(at: materialized.cleanupRoot) }
+
             let imagewriterScript = try resolveImagewriterBuildScriptPath(mslExecutablePath: mslExecutablePath)
             let requestedSizeGB = diskSizeGB ?? Self.defaultImagewriterDiskSizeGB
             let requestedSizeMB = max(1, requestedSizeGB) * 1024
@@ -490,39 +515,13 @@ final class DistributionManager {
             try runImagewriterBuild(
                 scriptPath: imagewriterScript,
                 mslExecutablePath: mslExecutablePath,
-                rootfsTarballPath: tarballURL.path,
+                rootfsTarballPath: nil,
+                rootfsDirectoryPath: materialized.rootfsDir.path,
                 outputDiskPath: diskFile.path,
                 sizeMB: requestedSizeMB,
-                initBinaryPath: initBinaryPath
+                initBinaryPath: initBinaryPath,
+                source: materialized.source
             )
-
-            let sourceRecord: DistributionSourceRecord
-            switch source {
-            case .manifest(let entry):
-                sourceRecord = DistributionSourceRecord(
-                    sourceType: "manifest",
-                    distro: entry.distro,
-                    version: entry.version,
-                    arch: entry.arch,
-                    manifestId: entry.id,
-                    localPath: nil,
-                    tarballFileName: tarballURL.lastPathComponent,
-                    sha256: verified.sha256,
-                    verifiedAtEpochMs: verified.verifiedAtEpochMs
-                )
-            case .localFile(let url):
-                sourceRecord = DistributionSourceRecord(
-                    sourceType: "local",
-                    distro: nil,
-                    version: nil,
-                    arch: nil,
-                    manifestId: nil,
-                    localPath: url.path,
-                    tarballFileName: tarballURL.lastPathComponent,
-                    sha256: verified.sha256,
-                    verifiedAtEpochMs: verified.verifiedAtEpochMs
-                )
-            }
 
             let defaultKernelProfileRef = try? DefaultInstanceStore(paths: paths, fileManager: fileManager).loadDefaultKernelProfileRef()
             let env = ProcessInfo.processInfo.environment
@@ -532,13 +531,13 @@ final class DistributionManager {
             let kernelProfileRef = envKernelProfileRef ?? defaultKernelProfileRef ?? "slim"
             let compressionPolicy = try resolveCompressionPolicyForInstall()
             compressionPolicyCount = compressionPolicy.pathPolicies.count
-            let initialPolicy = initialUserConvergencePolicy(for: source)
-            let initialCacheSharing = initialCacheSharingPolicy(for: source)
-            let runtimeProfile = initialRuntimeProfile(for: source, instanceName: name)
+            let initialPolicy = initialUserConvergencePolicy(for: materialized.source)
+            let initialCacheSharing = initialCacheSharingPolicy(for: materialized.source)
+            let runtimeProfile = initialRuntimeProfile(for: materialized.source, instanceName: name)
 
             let metadata = DistributionInstanceMetadata(
                 name: name,
-                distroFamily: sourceRecord.distro ?? inferDistroFamily(from: sourceRecord.manifestId),
+                distroFamily: materialized.sourceRecord.distro ?? inferDistroFamily(from: materialized.sourceRecord.manifestId),
                 createdAtEpochMs: nowEpochMs(),
                 bootstrap: DistributionInstanceMetadata.PrivilegeBootstrap(
                     firstBootPending: true,
@@ -552,7 +551,7 @@ final class DistributionManager {
                     gid: Int(getgid()),
                     groups: [initialPolicy.adminGroup]
                 ),
-                source: sourceRecord,
+                source: materialized.sourceRecord,
                 diskPath: diskFile.path,
                 kernelProfileRef: kernelProfileRef,
                 runtimeProfile: runtimeProfile,
@@ -563,7 +562,7 @@ final class DistributionManager {
                 cacheSharing: initialCacheSharing,
                 tmpStorage: DistributionInstanceMetadata.defaultTmpStoragePolicy(forNewInstanceNamed: name)
             )
-            try writeJSON(sourceRecord, to: sourceFile)
+            try writeJSON(materialized.sourceRecord, to: sourceFile)
             try writeJSON(metadata, to: metadataFile)
             shouldCleanupDistroDirOnFailure = false
         } catch {
@@ -684,6 +683,127 @@ final class DistributionManager {
         ])
         emitStatus("install: image ready")
         return distroDir
+    }
+
+    private func materializeRootFS(
+        targetAlias: String?,
+        localFilePath: String?,
+        containerImageRef: String?,
+        instanceName: String
+    ) throws -> RootFSMaterializationResult {
+        let source = try resolveSource(
+            targetAlias: targetAlias,
+            localFilePath: localFilePath,
+            containerImageRef: containerImageRef
+        )
+        let stagingRoot = paths.cacheStagingDir.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let rootfsDir = stagingRoot.appendingPathComponent("rootfs", isDirectory: true)
+        try ensureDir(stagingRoot)
+        try ensureDir(rootfsDir)
+
+        switch source {
+        case .manifest(let entry):
+            emitStatus("install: fetching rootfs archive")
+            let verified = try fetchManifestEntry(entry, force: false)
+            let tarballURL = URL(fileURLWithPath: verified.tarballPath)
+            emitStatus("install: validating archive entries")
+            try validateTarArchiveEntries(tarballURL)
+            emitStatus("install: extracting rootfs")
+            try extractTarArchive(tarballURL, to: rootfsDir)
+            try validateRuntimeShell(in: rootfsDir)
+            return RootFSMaterializationResult(
+                source: source,
+                sourceRecord: DistributionSourceRecord(
+                    sourceType: "manifest",
+                    distro: entry.distro,
+                    version: entry.version,
+                    arch: entry.arch,
+                    manifestId: entry.id,
+                    localPath: nil,
+                    tarballFileName: tarballURL.lastPathComponent,
+                    sha256: verified.sha256,
+                    verifiedAtEpochMs: verified.verifiedAtEpochMs
+                ),
+                rootfsDir: rootfsDir,
+                sourceArchivePath: tarballURL.path,
+                cleanupRoot: stagingRoot
+            )
+        case .localFile(let url):
+            emitStatus("install: caching local rootfs archive")
+            let verified = try cacheLocalFile(url, force: false)
+            let tarballURL = URL(fileURLWithPath: verified.tarballPath)
+            emitStatus("install: validating archive entries")
+            try validateTarArchiveEntries(tarballURL)
+            emitStatus("install: extracting rootfs")
+            try extractTarArchive(tarballURL, to: rootfsDir)
+            try validateRuntimeShell(in: rootfsDir)
+            return RootFSMaterializationResult(
+                source: source,
+                sourceRecord: DistributionSourceRecord(
+                    sourceType: "local",
+                    distro: nil,
+                    version: nil,
+                    arch: nil,
+                    manifestId: nil,
+                    localPath: url.path,
+                    tarballFileName: tarballURL.lastPathComponent,
+                    sha256: verified.sha256,
+                    verifiedAtEpochMs: verified.verifiedAtEpochMs
+                ),
+                rootfsDir: rootfsDir,
+                sourceArchivePath: tarballURL.path,
+                cleanupRoot: stagingRoot
+            )
+        case .containerRemote(let reference):
+            emitStatus("install: resolving container image")
+            let resolved = try resolveContainerImage(reference)
+            emitStatus("install: fetching container layers")
+            let tarballFileName = try materializeContainerRootFS(
+                resolved,
+                rootfsDir: rootfsDir,
+                cleanupRoot: stagingRoot
+            )
+            try validateRuntimeShell(in: rootfsDir)
+            return RootFSMaterializationResult(
+                source: source,
+                sourceRecord: DistributionSourceRecord(
+                    sourceType: "container-remote",
+                    distro: nil,
+                    version: nil,
+                    arch: "arm64",
+                    manifestId: nil,
+                    localPath: nil,
+                    tarballFileName: tarballFileName,
+                    sha256: resolved.digest,
+                    verifiedAtEpochMs: nowEpochMs(),
+                    imageRef: reference.original,
+                    resolvedReference: resolved.resolvedReference,
+                    registry: reference.registry,
+                    repository: reference.repository,
+                    tag: reference.tag,
+                    digest: resolved.digest,
+                    platform: resolved.platform
+                ),
+                rootfsDir: rootfsDir,
+                sourceArchivePath: nil,
+                cleanupRoot: stagingRoot
+            )
+        }
+    }
+
+    private func validateRuntimeShell(in rootfsDir: URL) throws {
+        let candidates = [
+            "bin/sh",
+            "bin/bash",
+            "bin/ash"
+        ]
+        for candidate in candidates {
+            let path = rootfsDir.appendingPathComponent(candidate, isDirectory: false).path
+            if fileManager.fileExists(atPath: path) {
+                return
+            }
+        }
+        throw MSLRuntimeError("rootfs is not supported: no usable shell found (/bin/sh, /bin/bash, /bin/ash)")
     }
 
     func readInstanceMetadata(at metadataURL: URL) throws -> DistributionInstanceMetadata {
@@ -831,7 +951,11 @@ final class DistributionManager {
         return validated
     }
 
-    internal func resolveSource(targetAlias: String?, localFilePath: String?) throws -> DistributionSourceSelection {
+    internal func resolveSource(
+        targetAlias: String?,
+        localFilePath: String?,
+        containerImageRef: String? = nil
+    ) throws -> DistributionSourceSelection {
         if let localFilePath, !localFilePath.isEmpty {
             let local = URL(fileURLWithPath: localFilePath)
             guard fileManager.fileExists(atPath: local.path) else {
@@ -844,8 +968,12 @@ final class DistributionManager {
             return .localFile(local)
         }
 
+        if let containerImageRef, !containerImageRef.isEmpty {
+            return .containerRemote(try parseContainerImageReference(containerImageRef))
+        }
+
         guard let targetAlias, !targetAlias.isEmpty else {
-            throw MSLRuntimeError("missing distribution target. use --distro <id> or --file <path>")
+            throw MSLRuntimeError("missing distribution target. use --distro <id>, --file <path>, or --from-container <image-ref>")
         }
         guard let entry = manifestStore.resolve(alias: targetAlias) else {
             throw MSLRuntimeError("unsupported distribution '\(targetAlias)'")
@@ -854,11 +982,460 @@ final class DistributionManager {
         return .manifest(entry)
     }
 
+    internal func parseContainerImageReference(_ raw: String) throws -> ContainerImageReference {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            throw MSLRuntimeError("container image reference must not be empty")
+        }
+        let digestParts = trimmed.split(separator: "@", maxSplits: 1, omittingEmptySubsequences: false)
+        let nameAndTag = String(digestParts[0])
+        let digest = digestParts.count == 2 ? String(digestParts[1]) : nil
+
+        let slashParts = nameAndTag.split(separator: "/")
+        let firstComponent = slashParts.first.map(String.init) ?? ""
+        let hasExplicitRegistry = slashParts.count > 1 &&
+            (firstComponent.contains(".") || firstComponent.contains(":") || firstComponent == "localhost")
+
+        let registry: String
+        let repositoryAndTag: String
+        if hasExplicitRegistry {
+            registry = firstComponent
+            repositoryAndTag = slashParts.dropFirst().joined(separator: "/")
+            guard !repositoryAndTag.isEmpty else {
+                throw MSLRuntimeError("container image reference is missing repository path: \(trimmed)")
+            }
+        } else {
+            registry = "docker.io"
+            let implicitRepository = nameAndTag.contains("/") ? nameAndTag : "library/\(nameAndTag)"
+            repositoryAndTag = implicitRepository
+        }
+
+        let lastSlash = repositoryAndTag.lastIndex(of: "/")
+        let lastColon = repositoryAndTag.lastIndex(of: ":")
+        let hasTag = lastColon != nil && (lastSlash == nil || lastColon! > lastSlash!)
+        let repository = hasTag ? String(repositoryAndTag[..<lastColon!]) : repositoryAndTag
+        let tag = hasTag ? String(repositoryAndTag[repositoryAndTag.index(after: lastColon!)...]) : nil
+        guard !repository.isEmpty else {
+            throw MSLRuntimeError("container image reference is missing repository path: \(trimmed)")
+        }
+
+        let normalizedName = "\(registry)/\(repository)"
+        return ContainerImageReference(
+            original: trimmed,
+            registry: registry,
+            repository: repository,
+            tag: tag,
+            digest: digest,
+            normalizedName: normalizedName
+        )
+    }
+
+    private func resolveContainerImage(_ reference: ContainerImageReference) throws -> ResolvedContainerImage {
+        let regctl = try resolveBundledOrInstalledContainerTool("regctl")
+
+        let imageReference = buildContainerReferenceString(reference)
+        let result = try process.run(
+            regctl,
+            [
+                "image",
+                "inspect",
+                "--platform", "linux/arm64",
+                imageReference
+            ],
+            captureOutput: true
+        )
+        guard result.exitCode == 0 else {
+            let detail = result.nonEmptyErrorOutput
+            if detail.localizedCaseInsensitiveContains("unauthorized") || detail.localizedCaseInsensitiveContains("authentication") {
+                throw MSLRuntimeError("container registry authentication is not supported in v1: \(reference.original)")
+            }
+            throw MSLRuntimeError("failed to inspect container image \(reference.original): \(detail)")
+        }
+        guard let data = result.stdout.data(using: .utf8),
+              let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw MSLRuntimeError("failed to parse regctl inspect output for \(reference.original)")
+        }
+        let digest = (object["Digest"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !digest.isEmpty else {
+            let headResult = try process.run(
+                regctl,
+                [
+                    "manifest",
+                    "head",
+                    "--platform", "linux/arm64",
+                    imageReference
+                ],
+                captureOutput: true
+            )
+            guard headResult.exitCode == 0 else {
+                throw MSLRuntimeError("failed to resolve digest for container image \(reference.original): \(headResult.nonEmptyErrorOutput)")
+            }
+            let headDigest = headResult.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !headDigest.isEmpty else {
+                throw MSLRuntimeError("failed to resolve digest for container image \(reference.original)")
+            }
+            return ResolvedContainerImage(
+                reference: reference,
+                resolvedReference: "\(reference.normalizedName)@\(headDigest)",
+                digest: headDigest,
+                platform: "linux/arm64",
+                manifestDigest: headDigest
+            )
+        }
+        let architecture = ((object["Architecture"] as? String) ?? "").lowercased()
+        let os = ((object["Os"] as? String) ?? "").lowercased()
+        guard architecture == "arm64", os == "linux" else {
+            throw MSLRuntimeError("container image must resolve to linux/arm64, got \(os)/\(architecture)")
+        }
+        return ResolvedContainerImage(
+            reference: reference,
+            resolvedReference: "\(reference.normalizedName)@\(digest)",
+            digest: digest,
+            platform: "linux/arm64",
+            manifestDigest: digest
+        )
+    }
+
+    private func materializeContainerRootFS(
+        _ resolved: ResolvedContainerImage,
+        rootfsDir: URL,
+        cleanupRoot: URL
+    ) throws -> String {
+        let regctl = try resolveBundledOrInstalledContainerTool("regctl")
+        let umoci = try resolveBundledOrInstalledContainerTool("umoci")
+
+        let digestKey = sanitizeDigestForPath(resolved.digest)
+        let cacheBase = containerCacheBaseDirectory(
+            registry: resolved.reference.registry,
+            repository: resolved.reference.repository,
+            digest: digestKey
+        )
+        let layoutDir = cacheBase.appendingPathComponent("oci", isDirectory: true)
+        let unpackDir = cacheBase.appendingPathComponent("bundle", isDirectory: true)
+        try ensureDir(cacheBase)
+
+        if !fileManager.fileExists(atPath: layoutDir.path) {
+            try ensureDir(layoutDir)
+            let copyResult = try process.run(
+                regctl,
+                [
+                    "image",
+                    "copy",
+                    "--platform", "linux/arm64",
+                    resolved.resolvedReference,
+                    "ocidir://\(layoutDir.path):image"
+                ],
+                captureOutput: true
+            )
+            guard copyResult.exitCode == 0 else {
+                throw MSLRuntimeError("failed to copy container image \(resolved.reference.original): \(copyResult.nonEmptyErrorOutput)")
+            }
+        }
+
+        if fileManager.fileExists(atPath: unpackDir.path) {
+            try? fileManager.removeItem(at: unpackDir)
+        }
+        let unpackResult = try process.run(
+            umoci,
+            [
+                "unpack",
+                "--rootless",
+                "--image", "\(layoutDir.path):image",
+                unpackDir.path
+            ],
+            captureOutput: true
+        )
+        guard unpackResult.exitCode == 0 else {
+            throw MSLRuntimeError("failed to unpack container image \(resolved.reference.original): \(unpackResult.nonEmptyErrorOutput)")
+        }
+
+        let unpackedRootfsDir = unpackDir.appendingPathComponent("rootfs", isDirectory: true)
+        guard fileManager.fileExists(atPath: unpackedRootfsDir.path) else {
+            throw MSLRuntimeError("container image unpack completed without rootfs: \(resolved.reference.original)")
+        }
+        try copyDirectoryContents(from: unpackedRootfsDir, to: rootfsDir)
+        try normalizeContainerRootFSPermissions(rootfsDir: rootfsDir)
+
+        let tarballFileName = "\(resolved.reference.repository.replacingOccurrences(of: "/", with: "-"))-\(digestKey).oci"
+        return tarballFileName
+    }
+
+    private func buildContainerReferenceString(_ reference: ContainerImageReference) -> String {
+        var result = reference.normalizedName
+        if let digest = reference.digest, !digest.isEmpty {
+            result += "@\(digest)"
+        } else {
+            result += ":\(reference.tag ?? "latest")"
+        }
+        return result
+    }
+
+    internal func resolveBundledOrInstalledContainerTool(_ name: String) throws -> String {
+        if let package = try findBundledContainerToolPackage() {
+            return try installBundledContainerTool(named: name, from: package)
+        }
+        if let staged = try findStagedContainerTool(named: name) {
+            return staged
+        }
+        if let installed = try findInstalledBundledContainerTool(named: name) {
+            return installed
+        }
+        if let pathExecutable = process.findExecutable([name]) {
+            return pathExecutable
+        }
+        throw MSLRuntimeError("container helper not found: \(name). bundled helper missing and PATH fallback was not available")
+    }
+
+    private func findBundledContainerToolPackage() throws -> (root: URL, manifest: BundledToolManifest)? {
+        for candidate in bundledContainerToolCandidateDirectories() {
+            let manifestURL = candidate.appendingPathComponent("manifest.json", isDirectory: false)
+            guard fileManager.fileExists(atPath: manifestURL.path) else {
+                continue
+            }
+            let manifest = try readJSON(BundledToolManifest.self, from: manifestURL)
+            return (candidate, manifest)
+        }
+        return nil
+    }
+
+    private func findStagedContainerTool(named name: String) throws -> String? {
+        let manifestURL = paths.bundledContainerToolsStageDir.appendingPathComponent("manifest.json", isDirectory: false)
+        guard fileManager.fileExists(atPath: manifestURL.path) else {
+            return nil
+        }
+        let manifest = try readJSON(BundledToolManifest.self, from: manifestURL)
+        guard manifest.platform == "darwin-arm64",
+              let record = manifest.record(named: name) else {
+            return nil
+        }
+        try verifyBundledToolRecord(record, root: paths.bundledContainerToolsStageDir, errorContext: "bundled helper checksum mismatch")
+        let toolURL = paths.bundledContainerToolsStageDir.appendingPathComponent(record.relativePath, isDirectory: false)
+        guard fileManager.isExecutableFile(atPath: toolURL.path) else {
+            throw MSLRuntimeError("bundled helper missing: \(name)")
+        }
+        return toolURL.path
+    }
+
+    private func bundledContainerToolCandidateDirectories() -> [URL] {
+        var candidates: [URL] = []
+        if let override = environment["MSL_BUNDLED_CONTAINER_TOOLS_DIR"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !override.isEmpty {
+            candidates.append(URL(fileURLWithPath: override, isDirectory: true))
+        }
+
+        if let resourceURL = Bundle.main.resourceURL {
+            candidates.append(resourceURL.appendingPathComponent("container-tools", isDirectory: true))
+            candidates.append(resourceURL.appendingPathComponent("tools", isDirectory: true))
+        }
+
+        let executableURL = Bundle.main.executableURL ?? URL(fileURLWithPath: CommandLine.arguments[0], isDirectory: false)
+        let executableDir = executableURL.deletingLastPathComponent()
+        candidates.append(executableDir.appendingPathComponent("container-tools", isDirectory: true))
+        candidates.append(executableDir.appendingPathComponent("tools", isDirectory: true))
+        candidates.append(executableDir.deletingLastPathComponent().appendingPathComponent("container-tools", isDirectory: true))
+        candidates.append(executableDir.deletingLastPathComponent().appendingPathComponent("tools", isDirectory: true))
+
+        var unique: [URL] = []
+        var seen: Set<String> = []
+        for candidate in candidates {
+            let standardized = candidate.standardizedFileURL.path
+            if seen.insert(standardized).inserted {
+                unique.append(candidate)
+            }
+        }
+        return unique
+    }
+
+    private func installBundledContainerTool(
+        named name: String,
+        from package: (root: URL, manifest: BundledToolManifest)
+    ) throws -> String {
+        let manifest = package.manifest
+        guard manifest.platform == "darwin-arm64" else {
+            throw MSLRuntimeError("bundled helper manifest has unsupported platform: \(manifest.platform)")
+        }
+        guard let record = manifest.record(named: name) else {
+            throw MSLRuntimeError("bundled helper missing: \(name)")
+        }
+
+        for tool in manifest.tools {
+            try verifyBundledToolRecord(tool, root: package.root, errorContext: "bundled helper checksum mismatch")
+        }
+
+        let targetDir = paths.bundledContainerToolsDirectory(bundleVersion: manifest.bundleVersion)
+        let targetManifestURL = paths.bundledContainerToolsManifestFile(bundleVersion: manifest.bundleVersion)
+        if fileManager.fileExists(atPath: targetManifestURL.path) {
+            let installedManifest = try readJSON(BundledToolManifest.self, from: targetManifestURL)
+            if installedManifest == manifest,
+               let installedPath = try installedToolPathIfValid(record, under: targetDir) {
+                return installedPath
+            }
+            try? fileManager.removeItem(at: targetDir)
+        }
+
+        do {
+            try ensureDir(paths.mslHostContainerToolsDir)
+            try ensureDir(targetDir)
+            for tool in manifest.tools {
+                let source = package.root.appendingPathComponent(tool.relativePath, isDirectory: false)
+                let destination = targetDir.appendingPathComponent(tool.name, isDirectory: false)
+                if fileManager.fileExists(atPath: destination.path) {
+                    try fileManager.removeItem(at: destination)
+                }
+                try fileManager.copyItem(at: source, to: destination)
+                try fileManager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: destination.path)
+            }
+            let manifestData = try JSONEncoder().encode(manifest)
+            try manifestData.write(to: targetManifestURL, options: .atomic)
+        } catch {
+            throw MSLRuntimeError("bundle extraction failed for container helper \(name): \(error)")
+        }
+
+        guard let installedPath = try installedToolPathIfValid(record, under: targetDir) else {
+            throw MSLRuntimeError("bundle extraction failed for container helper \(name): installed helper missing after extraction")
+        }
+        return installedPath
+    }
+
+    private func findInstalledBundledContainerTool(named name: String) throws -> String? {
+        guard fileManager.fileExists(atPath: paths.mslHostContainerToolsDir.path) else {
+            return nil
+        }
+        let contents = try fileManager.contentsOfDirectory(
+            at: paths.mslHostContainerToolsDir,
+            includingPropertiesForKeys: [.contentModificationDateKey, .isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        )
+        let sorted = try contents.sorted { lhs, rhs in
+            let lhsDate = try lhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate ?? .distantPast
+            let rhsDate = try rhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate ?? .distantPast
+            return lhsDate > rhsDate
+        }
+        for directory in sorted {
+            guard (try? directory.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else {
+                continue
+            }
+            let manifestURL = directory.appendingPathComponent("manifest.json", isDirectory: false)
+            guard fileManager.fileExists(atPath: manifestURL.path) else {
+                continue
+            }
+            let manifest = try readJSON(BundledToolManifest.self, from: manifestURL)
+            guard manifest.platform == "darwin-arm64",
+                  let record = manifest.record(named: name),
+                  let path = try installedToolPathIfValid(record, under: directory) else {
+                continue
+            }
+            return path
+        }
+        return nil
+    }
+
+    private func installedToolPathIfValid(_ record: BundledToolRecord, under directory: URL) throws -> String? {
+        let installed = directory.appendingPathComponent(record.name, isDirectory: false)
+        guard fileManager.fileExists(atPath: installed.path), fileManager.isExecutableFile(atPath: installed.path) else {
+            return nil
+        }
+        try verifyFileChecksum(installed, expected: record.checksum, errorContext: "bundled helper checksum mismatch")
+        return installed.path
+    }
+
+    private func verifyBundledToolRecord(_ record: BundledToolRecord, root: URL, errorContext: String) throws {
+        let toolURL = root.appendingPathComponent(record.relativePath, isDirectory: false)
+        guard fileManager.fileExists(atPath: toolURL.path) else {
+            throw MSLRuntimeError("bundled helper missing: \(record.name)")
+        }
+        try verifyFileChecksum(toolURL, expected: record.checksum, errorContext: errorContext)
+    }
+
+    private func verifyFileChecksum(_ url: URL, expected: String, errorContext: String) throws {
+        let data = try Data(contentsOf: url, options: [.mappedIfSafe])
+        let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        guard digest.caseInsensitiveCompare(expected) == .orderedSame else {
+            throw MSLRuntimeError("\(errorContext): \(url.lastPathComponent)")
+        }
+    }
+
+    private func sanitizeDigestForPath(_ digest: String) -> String {
+        digest.replacingOccurrences(of: ":", with: "_")
+    }
+
+    private func containerCacheBaseDirectory(registry: String, repository: String, digest: String) -> URL {
+        repository
+            .split(separator: "/")
+            .reduce(
+                paths.cacheDownloadsDir
+                    .appendingPathComponent("containers", isDirectory: true)
+                    .appendingPathComponent(registry, isDirectory: true)
+            ) { partial, component in
+                partial.appendingPathComponent(String(component), isDirectory: true)
+            }
+            .appendingPathComponent(digest, isDirectory: true)
+    }
+
+    private func copyDirectoryContents(from source: URL, to destination: URL) throws {
+        let contents = try fileManager.contentsOfDirectory(
+            at: source,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        )
+        for item in contents {
+            let target = destination.appendingPathComponent(item.lastPathComponent, isDirectory: true)
+            if fileManager.fileExists(atPath: target.path) {
+                try fileManager.removeItem(at: target)
+            }
+            try fileManager.copyItem(at: item, to: target)
+        }
+    }
+
+    internal func normalizeContainerRootFSPermissions(rootfsDir: URL) throws {
+        var normalizedCount = 0
+        let enumerator = fileManager.enumerator(
+            at: rootfsDir,
+            includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey],
+            options: [.skipsHiddenFiles],
+            errorHandler: { url, error in
+                self.logger.log("container_rootfs_permission_walk_failed", fields: [
+                    "path": url.path,
+                    "error": error.localizedDescription
+                ])
+                return false
+            }
+        )
+
+        while let item = enumerator?.nextObject() as? URL {
+            let values = try item.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+            if values.isSymbolicLink == true || values.isRegularFile != true {
+                continue
+            }
+
+            let attributes = try fileManager.attributesOfItem(atPath: item.path)
+            guard let modeNumber = attributes[.posixPermissions] as? NSNumber else {
+                continue
+            }
+            let currentMode = modeNumber.uint16Value
+            if currentMode & 0o400 != 0 {
+                continue
+            }
+            let normalizedMode = currentMode | 0o400
+            do {
+                try fileManager.setAttributes([.posixPermissions: NSNumber(value: normalizedMode)], ofItemAtPath: item.path)
+            } catch {
+                throw MSLRuntimeError("failed to normalize container rootfs permissions: \(item.path)")
+            }
+            normalizedCount += 1
+        }
+
+        logger.log("container_rootfs_permissions_normalized", fields: [
+            "rootfs": rootfsDir.path,
+            "file_count": String(normalizedCount)
+        ])
+    }
+
     private func initialUserConvergencePolicy(for source: DistributionSourceSelection) -> UserConvergencePolicy {
         switch source {
         case .manifest(let entry):
             return entry.userConvergenceTemplate ?? defaultPolicyTemplate(forManifestEntry: entry)
-        case .localFile:
+        case .localFile, .containerRemote:
             return makeUseraddPolicyTemplate(
                 templateID: "generic-useradd-v1",
                 adminGroup: "sudo",
@@ -875,7 +1452,7 @@ final class DistributionManager {
                 return defaults
             }
             return defaultCacheSharingPolicy(distroFamily: entry.distro)
-        case .localFile:
+        case .localFile, .containerRemote:
             return defaultCacheSharingPolicy(distroFamily: nil)
         }
     }
@@ -909,7 +1486,7 @@ final class DistributionManager {
             }
         }
 
-        if metadata.source.sourceType == "local" {
+        if metadata.source.sourceType == "local" || metadata.source.sourceType == "container-remote" {
             return makeUseraddPolicyTemplate(
                 templateID: "generic-useradd-v1",
                 adminGroup: "sudo",
@@ -956,7 +1533,7 @@ final class DistributionManager {
         switch source {
         case .manifest:
             canUseServiceManaged = resolvedServiceManager != nil
-        case .localFile:
+        case .localFile, .containerRemote:
             canUseServiceManaged = false
         }
         let initMode: String
@@ -1025,7 +1602,7 @@ final class DistributionManager {
                 return explicit
             }
             return inferServiceManagerFromDistro(entry.distro)
-        case .localFile:
+        case .localFile, .containerRemote:
             return nil
         }
     }
@@ -1034,7 +1611,7 @@ final class DistributionManager {
         switch source {
         case .manifest(let entry):
             return normalizeInitMode(entry.defaultInitMode)
-        case .localFile:
+        case .localFile, .containerRemote:
             return nil
         }
     }
@@ -1217,11 +1794,16 @@ final class DistributionManager {
     private func runImagewriterBuild(
         scriptPath: String,
         mslExecutablePath: String,
-        rootfsTarballPath: String,
+        rootfsTarballPath: String?,
+        rootfsDirectoryPath: String?,
         outputDiskPath: String,
         sizeMB: Int,
-        initBinaryPath: String
+        initBinaryPath: String,
+        source: DistributionSourceSelection? = nil
     ) throws {
+        if (rootfsTarballPath?.isEmpty ?? true) && (rootfsDirectoryPath?.isEmpty ?? true) {
+            throw MSLRuntimeError("imagewriter build requires a rootfs tarball or rootfs directory")
+        }
         var env: [String: String] = [
             "MSL_BIN": mslExecutablePath,
             "IMAGEWRITER_CLEAN_DISTROS": "0",
@@ -1229,12 +1811,17 @@ final class DistributionManager {
             "IMAGEWRITER_ALLOW_SETUP_WHEN_MISSING": "0",
             "IMAGEWRITER_REQUIRED_FS": "erofs",
             "IMAGE_FS": "btrfs",
-            "ROOTFS_TARBALL": rootfsTarballPath,
             "OUTPUT_RAW": outputDiskPath,
             "IMAGE_SIZE_MB": String(sizeMB),
             "IMAGEWRITER_INIT_BINARY": initBinaryPath,
             "IMAGEWRITER_RUN_TIMEOUT": "900"
         ]
+        if let rootfsTarballPath, !rootfsTarballPath.isEmpty {
+            env["ROOTFS_TARBALL"] = rootfsTarballPath
+        }
+        if let rootfsDirectoryPath, !rootfsDirectoryPath.isEmpty {
+            env["ROOTFS_DIR"] = rootfsDirectoryPath
+        }
         if let mslHome = ProcessInfo.processInfo.environment["MSL_HOME"], !mslHome.isEmpty {
             env["MSL_HOME"] = mslHome
         }
@@ -1262,8 +1849,14 @@ final class DistributionManager {
             default:
                 stageHint = "stage=unknown"
             }
+            let detailHint: String
+            if result.exitCode == 22, case .containerRemote? = source {
+                detailHint = " container rootfs permissions may be incompatible."
+            } else {
+                detailHint = ""
+            }
             throw MSLRuntimeError(
-                "imagewriter build failed (\(result.exitCode), \(stageHint)). see imagewriter logs/output above."
+                "imagewriter build failed (\(result.exitCode), \(stageHint)).\(detailHint) see imagewriter logs/output above."
             )
         }
     }
@@ -2349,6 +2942,16 @@ final class DistributionManager {
             return paths.cacheDownloadsDir
                 .appendingPathComponent("local", isDirectory: true)
                 .appendingPathComponent(short, isDirectory: true)
+        }
+        if source.sourceType == "container-remote",
+           let registry = source.registry,
+           let repository = source.repository,
+           let digest = (source.digest?.isEmpty == false ? source.digest : (source.sha256.isEmpty ? nil : source.sha256)) {
+            return containerCacheBaseDirectory(
+                registry: registry,
+                repository: repository,
+                digest: sanitizeDigestForPath(digest)
+            )
         }
         return nil
     }

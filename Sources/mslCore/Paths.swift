@@ -46,6 +46,8 @@ public struct MSLPaths {
     public let bootstrapCloudInitMetaDataFile: URL
     public let bootstrapCloudInitSeedISOFile: URL
     public let mslHostToolsDir: URL
+    public let bundledContainerToolsStageDir: URL
+    public let mslHostContainerToolsDir: URL
     public let mslHostExt4MkfsHelperBinaryFile: URL
     public let mslHostInitBinaryFile: URL
     public let mslHostInitBootloaderBinaryFile: URL
@@ -80,6 +82,11 @@ public struct MSLPaths {
         self.runtimeControlSocketFile = runtime.appendingPathComponent("control.sock", isDirectory: false)
         self.runtimeEventSocketFile = runtime.appendingPathComponent("events.sock", isDirectory: false)
         self.mslHostToolsDir = mslSystemHome
+        self.bundledContainerToolsStageDir = appSupport
+            .appendingPathComponent("tools", isDirectory: true)
+            .appendingPathComponent("bundled", isDirectory: true)
+            .appendingPathComponent("darwin-arm64", isDirectory: true)
+        self.mslHostContainerToolsDir = mslHostToolsDir.appendingPathComponent("tools", isDirectory: true)
         self.mslHostExt4MkfsHelperBinaryFile = mslHostToolsDir.appendingPathComponent("msl-ext4-mkfs", isDirectory: false)
         self.mslHostInitBinaryFile = mslHostToolsDir.appendingPathComponent("msl-init", isDirectory: false)
         self.mslHostInitBootloaderBinaryFile = mslHostToolsDir.appendingPathComponent("msl-init-bootloader", isDirectory: false)
@@ -136,6 +143,15 @@ public struct MSLPaths {
 
     public func distroEphemeralTmpDiskFile(named name: String) -> URL {
         distroTmpDirectory(named: name).appendingPathComponent("ephemeral-tmp.raw", isDirectory: false)
+    }
+
+    public func bundledContainerToolsDirectory(bundleVersion: String) -> URL {
+        mslHostContainerToolsDir.appendingPathComponent(bundleVersion, isDirectory: true)
+    }
+
+    public func bundledContainerToolsManifestFile(bundleVersion: String) -> URL {
+        bundledContainerToolsDirectory(bundleVersion: bundleVersion)
+            .appendingPathComponent("manifest.json", isDirectory: false)
     }
 
     public func diagnosticLogsDirectory(named instanceName: String) -> URL {

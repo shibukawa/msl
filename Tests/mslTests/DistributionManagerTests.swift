@@ -1,4 +1,5 @@
 import XCTest
+import CryptoKit
 @testable import mslCore
 
 final class DistributionManagerTests: XCTestCase {
@@ -59,6 +60,180 @@ final class DistributionManagerTests: XCTestCase {
         XCTAssertFalse(DistributionManager.isSafeTarEntryPath("var/../etc/passwd"))
     }
 
+    func testResolveBundledContainerToolExtractsIntoVersionedHostDirectory() throws {
+        let ctx = try DistributionContext.make()
+        defer { ctx.cleanup() }
+
+        let bundleDir = ctx.root.appendingPathComponent("bundle-tools", isDirectory: true)
+        try FileManager.default.createDirectory(at: bundleDir, withIntermediateDirectories: true)
+        let regctl = bundleDir.appendingPathComponent("regctl", isDirectory: false)
+        try ctx.makeShellScript(at: regctl, contents: "#!/bin/sh\nexit 0\n")
+        try ctx.writeBundledToolManifest(
+            at: bundleDir.appendingPathComponent("manifest.json", isDirectory: false),
+            bundleVersion: "bundle-v1",
+            toolURLs: ["regctl": regctl]
+        )
+
+        let manager = DistributionManager(
+            paths: ctx.paths,
+            logger: MSLLogger(logFile: ctx.paths.logs.appendingPathComponent("test.log", isDirectory: false)),
+            environment: ["MSL_BUNDLED_CONTAINER_TOOLS_DIR": bundleDir.path]
+        )
+
+        let resolved = try manager.resolveBundledOrInstalledContainerTool("regctl")
+        XCTAssertEqual(resolved, ctx.paths.bundledContainerToolsDirectory(bundleVersion: "bundle-v1").appendingPathComponent("regctl", isDirectory: false).path)
+        XCTAssertTrue(FileManager.default.isExecutableFile(atPath: resolved))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: ctx.paths.bundledContainerToolsManifestFile(bundleVersion: "bundle-v1").path))
+    }
+
+    func testResolveBundledContainerToolUsesAppSupportStagingDirectory() throws {
+        let ctx = try DistributionContext.make()
+        defer { ctx.cleanup() }
+
+        try FileManager.default.createDirectory(at: ctx.paths.bundledContainerToolsStageDir, withIntermediateDirectories: true)
+        let regctl = ctx.paths.bundledContainerToolsStageDir.appendingPathComponent("regctl", isDirectory: false)
+        try ctx.makeShellScript(at: regctl, contents: "#!/bin/sh\nexit 0\n")
+        try ctx.writeBundledToolManifest(
+            at: ctx.paths.bundledContainerToolsStageDir.appendingPathComponent("manifest.json", isDirectory: false),
+            bundleVersion: "bundle-stage",
+            toolURLs: ["regctl": regctl]
+        )
+
+        let manager = ctx.makeManager()
+        XCTAssertEqual(try manager.resolveBundledOrInstalledContainerTool("regctl"), regctl.path)
+    }
+
+    func testResolveBundledContainerToolRejectsChecksumMismatch() throws {
+        let ctx = try DistributionContext.make()
+        defer { ctx.cleanup() }
+
+        let bundleDir = ctx.root.appendingPathComponent("bundle-tools", isDirectory: true)
+        try FileManager.default.createDirectory(at: bundleDir, withIntermediateDirectories: true)
+        let regctl = bundleDir.appendingPathComponent("regctl", isDirectory: false)
+        try ctx.makeShellScript(at: regctl, contents: "#!/bin/sh\nexit 0\n")
+        let manifest = BundledToolManifest(
+            bundleVersion: "bundle-bad",
+            platform: "darwin-arm64",
+            generatedAtEpochMs: 100,
+            tools: [
+                BundledToolRecord(
+                    name: "regctl",
+                    version: "v0.11.2",
+                    checksum: "deadbeef",
+                    relativePath: "regctl"
+                )
+            ]
+        )
+        try JSONEncoder().encode(manifest).write(
+            to: bundleDir.appendingPathComponent("manifest.json", isDirectory: false),
+            options: .atomic
+        )
+
+        let manager = DistributionManager(
+            paths: ctx.paths,
+            logger: MSLLogger(logFile: ctx.paths.logs.appendingPathComponent("test.log", isDirectory: false)),
+            environment: ["MSL_BUNDLED_CONTAINER_TOOLS_DIR": bundleDir.path]
+        )
+
+        XCTAssertThrowsError(try manager.resolveBundledOrInstalledContainerTool("regctl")) { error in
+            guard let runtime = error as? MSLRuntimeError else {
+                return XCTFail("unexpected error: \(error)")
+            }
+            XCTAssertTrue(runtime.message.contains("bundled helper checksum mismatch"))
+        }
+    }
+
+    func testResolveBundledContainerToolFallsBackToPATH() throws {
+        let ctx = try DistributionContext.make()
+        defer { ctx.cleanup() }
+
+        let binDir = ctx.root.appendingPathComponent("bin", isDirectory: true)
+        let helper = binDir.appendingPathComponent("regctl", isDirectory: false)
+        try ctx.makeShellScript(at: helper, contents: "#!/bin/sh\nexit 0\n")
+
+        let previousPath = ProcessInfo.processInfo.environment["PATH"] ?? ""
+        setenv("PATH", "\(binDir.path):\(previousPath)", 1)
+        defer { setenv("PATH", previousPath, 1) }
+
+        let manager = DistributionManager(
+            paths: ctx.paths,
+            logger: MSLLogger(logFile: ctx.paths.logs.appendingPathComponent("test.log", isDirectory: false))
+        )
+        XCTAssertEqual(try manager.resolveBundledOrInstalledContainerTool("regctl"), helper.path)
+    }
+
+    func testNormalizeContainerRootFSPermissionsAddsOwnerReadToUnreadableRegularFile() throws {
+        let ctx = try DistributionContext.make()
+        defer { ctx.cleanup() }
+
+        let rootfs = ctx.root.appendingPathComponent("container-rootfs", isDirectory: true)
+        let binDir = rootfs.appendingPathComponent("bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: binDir, withIntermediateDirectories: true)
+        let file = binDir.appendingPathComponent("bbsuid", isDirectory: false)
+        try Data("binary".utf8).write(to: file, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o111], ofItemAtPath: file.path)
+
+        let manager = ctx.makeManager()
+        try manager.normalizeContainerRootFSPermissions(rootfsDir: rootfs)
+
+        let mode = try ctx.fileMode(at: file)
+        XCTAssertEqual(mode, 0o511)
+    }
+
+    func testNormalizeContainerRootFSPermissionsPreservesSetuidBit() throws {
+        let ctx = try DistributionContext.make()
+        defer { ctx.cleanup() }
+
+        let rootfs = ctx.root.appendingPathComponent("container-rootfs", isDirectory: true)
+        let binDir = rootfs.appendingPathComponent("bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: binDir, withIntermediateDirectories: true)
+        let file = binDir.appendingPathComponent("suid-tool", isDirectory: false)
+        try Data("binary".utf8).write(to: file, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o4111], ofItemAtPath: file.path)
+
+        let manager = ctx.makeManager()
+        try manager.normalizeContainerRootFSPermissions(rootfsDir: rootfs)
+
+        let mode = try ctx.fileMode(at: file)
+        XCTAssertEqual(mode, 0o4511)
+    }
+
+    func testNormalizeContainerRootFSPermissionsLeavesSymlinkUnchanged() throws {
+        let ctx = try DistributionContext.make()
+        defer { ctx.cleanup() }
+
+        let rootfs = ctx.root.appendingPathComponent("container-rootfs", isDirectory: true)
+        let binDir = rootfs.appendingPathComponent("bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: binDir, withIntermediateDirectories: true)
+        let target = binDir.appendingPathComponent("bbsuid", isDirectory: false)
+        try Data("binary".utf8).write(to: target, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o111], ofItemAtPath: target.path)
+        let link = binDir.appendingPathComponent("mount", isDirectory: false)
+        try FileManager.default.createSymbolicLink(atPath: link.path, withDestinationPath: "/bin/bbsuid")
+
+        let manager = ctx.makeManager()
+        try manager.normalizeContainerRootFSPermissions(rootfsDir: rootfs)
+
+        let destination = try FileManager.default.destinationOfSymbolicLink(atPath: link.path)
+        XCTAssertEqual(destination, "/bin/bbsuid")
+        XCTAssertEqual(try ctx.fileMode(at: target), 0o511)
+    }
+
+    func testNormalizeContainerRootFSPermissionsLeavesDirectoriesUnchanged() throws {
+        let ctx = try DistributionContext.make()
+        defer { ctx.cleanup() }
+
+        let rootfs = ctx.root.appendingPathComponent("container-rootfs", isDirectory: true)
+        let dir = rootfs.appendingPathComponent("secure-dir", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes([.posixPermissions: 0o711], ofItemAtPath: dir.path)
+
+        let manager = ctx.makeManager()
+        try manager.normalizeContainerRootFSPermissions(rootfsDir: rootfs)
+
+        XCTAssertEqual(try ctx.fileMode(at: dir), 0o711)
+    }
+
     func testStageInitBinaryStagesBootloaderOnly() throws {
         let ctx = try DistributionContext.make()
         defer { ctx.cleanup() }
@@ -117,6 +292,28 @@ final class DistributionManagerTests: XCTestCase {
         default:
             XCTFail("expected localFile source")
         }
+    }
+
+    func testParseContainerImageReferenceNormalizesDockerHubLibraryImage() throws {
+        let ctx = try DistributionContext.make()
+        defer { ctx.cleanup() }
+
+        let reference = try ctx.makeManager().parseContainerImageReference("debian:slim")
+        XCTAssertEqual(reference.registry, "docker.io")
+        XCTAssertEqual(reference.repository, "library/debian")
+        XCTAssertEqual(reference.tag, "slim")
+        XCTAssertEqual(reference.normalizedName, "docker.io/library/debian")
+    }
+
+    func testParseContainerImageReferenceKeepsExplicitRegistry() throws {
+        let ctx = try DistributionContext.make()
+        defer { ctx.cleanup() }
+
+        let reference = try ctx.makeManager().parseContainerImageReference("ghcr.io/example/app:latest")
+        XCTAssertEqual(reference.registry, "ghcr.io")
+        XCTAssertEqual(reference.repository, "example/app")
+        XCTAssertEqual(reference.tag, "latest")
+        XCTAssertEqual(reference.normalizedName, "ghcr.io/example/app")
     }
 
     func testInstallableNames() {
@@ -453,8 +650,7 @@ final class DistributionManagerTests: XCTestCase {
         let ctx = try DistributionContext.make()
         defer { ctx.cleanup() }
 
-        let localTarball = ctx.root.appendingPathComponent("rootfs.tar.gz", isDirectory: false)
-        try Data("not-a-real-tarball".utf8).write(to: localTarball)
+        let localTarball = try ctx.makeRootfsArchive(named: "rootfs.tar.gz")
 
         let fakeInit = ctx.root.appendingPathComponent("msl-init-bootloader-fake", isDirectory: false)
         try Data(repeating: 0x42, count: 64).write(to: fakeInit)
@@ -487,8 +683,7 @@ final class DistributionManagerTests: XCTestCase {
         let ctx = try DistributionContext.make()
         defer { ctx.cleanup() }
 
-        let localTarball = ctx.root.appendingPathComponent("rootfs.tar.gz", isDirectory: false)
-        try Data("not-a-real-tarball".utf8).write(to: localTarball)
+        let localTarball = try ctx.makeRootfsArchive(named: "rootfs.tar.gz")
 
         let fakeInit = ctx.root.appendingPathComponent("msl-init-bootloader-fake-default-size", isDirectory: false)
         try Data(repeating: 0x42, count: 64).write(to: fakeInit)
@@ -527,8 +722,7 @@ final class DistributionManagerTests: XCTestCase {
         let ctx = try DistributionContext.make()
         defer { ctx.cleanup() }
 
-        let localTarball = ctx.root.appendingPathComponent("rootfs.tar.gz", isDirectory: false)
-        try Data("not-a-real-tarball".utf8).write(to: localTarball)
+        let localTarball = try ctx.makeRootfsArchive(named: "rootfs.tar.gz")
 
         let fakeInit = ctx.root.appendingPathComponent("msl-init-bootloader-fake-require-erofs", isDirectory: false)
         try Data(repeating: 0x42, count: 64).write(to: fakeInit)
@@ -545,6 +739,8 @@ final class DistributionManagerTests: XCTestCase {
               printf 'allow=%s\n' "$IMAGEWRITER_ALLOW_SETUP_WHEN_MISSING"
               printf 'required_fs=%s\n' "$IMAGEWRITER_REQUIRED_FS"
               printf 'force_setup=%s\n' "$IMAGEWRITER_FORCE_SETUP"
+              printf 'rootfs_tarball=%s\n' "$ROOTFS_TARBALL"
+              printf 'rootfs_dir=%s\n' "$ROOTFS_DIR"
             } > "\(recordedEnv.path)"
             : > "$OUTPUT_RAW"
             exit 0
@@ -567,6 +763,9 @@ final class DistributionManagerTests: XCTestCase {
         XCTAssertTrue(recorded.contains("allow=0"))
         XCTAssertTrue(recorded.contains("required_fs=erofs"))
         XCTAssertTrue(recorded.contains("force_setup=0"))
+        XCTAssertTrue(recorded.contains("rootfs_tarball="))
+        XCTAssertFalse(recorded.contains("rootfs_tarball=/"))
+        XCTAssertTrue(recorded.contains("rootfs_dir=/"))
     }
 
     func testCreateImageUses1GiBDefaultForInternalImagewriterWhenDiskSizeIsNil() throws {
@@ -646,8 +845,7 @@ final class DistributionManagerTests: XCTestCase {
         let ctx = try DistributionContext.make()
         defer { ctx.cleanup() }
 
-        let localTarball = ctx.root.appendingPathComponent("rootfs.tar.gz", isDirectory: false)
-        try Data("not-a-real-tarball".utf8).write(to: localTarball)
+        let localTarball = try ctx.makeRootfsArchive(named: "rootfs.tar.gz")
 
         let fakeInit = ctx.root.appendingPathComponent("msl-init-bootloader-fake-explicit-size", isDirectory: false)
         try Data(repeating: 0x43, count: 64).write(to: fakeInit)
@@ -686,8 +884,7 @@ final class DistributionManagerTests: XCTestCase {
         let ctx = try DistributionContext.make()
         defer { ctx.cleanup() }
 
-        let localTarball = ctx.root.appendingPathComponent("rootfs.tar.gz", isDirectory: false)
-        try Data("not-a-real-tarball".utf8).write(to: localTarball)
+        let localTarball = try ctx.makeRootfsArchive(named: "rootfs.tar.gz")
 
         let fakeInit = ctx.root.appendingPathComponent("msl-init-bootloader-fake-verify-stage", isDirectory: false)
         try Data(repeating: 0x43, count: 64).write(to: fakeInit)
@@ -720,8 +917,7 @@ final class DistributionManagerTests: XCTestCase {
         let ctx = try DistributionContext.make()
         defer { ctx.cleanup() }
 
-        let localTarball = ctx.root.appendingPathComponent("rootfs.tar.gz", isDirectory: false)
-        try Data("not-a-real-tarball".utf8).write(to: localTarball)
+        let localTarball = try ctx.makeRootfsArchive(named: "rootfs.tar.gz")
 
         let fakeInit = ctx.root.appendingPathComponent("msl-init-bootloader-fake-missing-stage", isDirectory: false)
         try Data(repeating: 0x44, count: 64).write(to: fakeInit)
@@ -761,8 +957,7 @@ final class DistributionManagerTests: XCTestCase {
         let ctx = try DistributionContext.make()
         defer { ctx.cleanup() }
 
-        let localTarball = ctx.root.appendingPathComponent("rootfs.tar.gz", isDirectory: false)
-        try Data("not-a-real-tarball".utf8).write(to: localTarball)
+        let localTarball = try ctx.makeRootfsArchive(named: "rootfs.tar.gz")
 
         let fakeInit = ctx.root.appendingPathComponent("msl-init-bootloader-fake", isDirectory: false)
         try Data(repeating: 0x24, count: 64).write(to: fakeInit)
@@ -1035,6 +1230,61 @@ private struct DistributionContext {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         try Data(contents.utf8).write(to: path, options: .atomic)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: path.path)
+    }
+
+    func writeBundledToolManifest(at path: URL, bundleVersion: String, toolURLs: [String: URL]) throws {
+        var tools: [BundledToolRecord] = []
+        for name in toolURLs.keys.sorted() {
+            guard let url = toolURLs[name] else { continue }
+            let digest = SHA256.hash(data: try Data(contentsOf: url)).map { String(format: "%02x", $0) }.joined()
+            tools.append(
+                BundledToolRecord(
+                    name: name,
+                    version: "test-version",
+                    checksum: digest,
+                    relativePath: url.lastPathComponent
+                )
+            )
+        }
+        let manifest = BundledToolManifest(
+            bundleVersion: bundleVersion,
+            platform: "darwin-arm64",
+            generatedAtEpochMs: nowEpochMs(),
+            tools: tools
+        )
+        let dir = path.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try JSONEncoder().encode(manifest).write(to: path, options: .atomic)
+    }
+
+    func fileMode(at url: URL) throws -> UInt16 {
+        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+        guard let mode = attributes[.posixPermissions] as? NSNumber else {
+            XCTFail("missing posixPermissions for \(url.path)")
+            return 0
+        }
+        return mode.uint16Value
+    }
+
+    func makeRootfsArchive(named name: String) throws -> URL {
+        let sourceDir = root.appendingPathComponent("\(name)-src", isDirectory: true)
+        let binDir = sourceDir.appendingPathComponent("bin", isDirectory: true)
+        let etcDir = sourceDir.appendingPathComponent("etc", isDirectory: true)
+        try FileManager.default.createDirectory(at: binDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: etcDir, withIntermediateDirectories: true)
+        let shellPath = binDir.appendingPathComponent("sh", isDirectory: false)
+        try Data("#!/bin/sh\nexit 0\n".utf8).write(to: shellPath, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: shellPath.path)
+        try Data("# placeholder\n".utf8).write(to: etcDir.appendingPathComponent("fstab"), options: .atomic)
+
+        let archive = root.appendingPathComponent(name, isDirectory: false)
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
+        process.arguments = ["-czf", archive.path, "-C", sourceDir.path, "."]
+        try process.run()
+        process.waitUntilExit()
+        XCTAssertEqual(process.terminationStatus, 0)
+        return archive
     }
 
     func makeInstance(name: String) throws {

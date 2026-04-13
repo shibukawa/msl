@@ -8,6 +8,7 @@ fi
 
 MODE="legacy"
 ROOTFS_ARCHIVE=""
+ROOTFS_SOURCE_DIR=""
 OUTPUT_IMAGE=""
 FS_TYPE="btrfs"
 SIZE_MB="0"
@@ -19,8 +20,8 @@ APK_RETRY_LIMIT="5"
 usage() {
   cat >&2 <<'EOF_USAGE'
 usage:
-  imagewriter-build-guest.sh --mode stage1 --rootfs <rootfs-archive> --output <output-image> --size-mb <n> [--init-binary <path>] [--packages "<apk packages>"]
-  imagewriter-build-guest.sh --mode stage2 --fs-type <btrfs|erofs> --rootfs <rootfs-archive> --output <output-image> --size-mb <n> [--init-binary <path>] [--packages "<apk packages>"]
+  imagewriter-build-guest.sh --mode stage1 (--rootfs <rootfs-archive> | --rootfs-dir <rootfs-dir>) --output <output-image> --size-mb <n> [--init-binary <path>] [--packages "<apk packages>"]
+  imagewriter-build-guest.sh --mode stage2 --fs-type <btrfs|erofs> (--rootfs <rootfs-archive> | --rootfs-dir <rootfs-dir>) --output <output-image> --size-mb <n> [--init-binary <path>] [--packages "<apk packages>"]
 
 legacy:
   imagewriter-build-guest.sh <rootfs-archive> <output-image> [btrfs|erofs|ext4] <size-mb> [init-binary]
@@ -49,6 +50,10 @@ if [ "$#" -gt 0 ] && [ "${1#--}" != "$1" ]; then
         ;;
       --rootfs)
         ROOTFS_ARCHIVE="${2:-}"
+        shift 2
+        ;;
+      --rootfs-dir)
+        ROOTFS_SOURCE_DIR="${2:-}"
         shift 2
         ;;
       --output)
@@ -116,16 +121,16 @@ fi
 case "$MODE" in
   stage1)
     FS_TYPE="ext4"
-    if [ -z "$ROOTFS_ARCHIVE" ] || [ -z "$OUTPUT_IMAGE" ]; then
-      echo "error: stage1 requires --rootfs and --output" >&2
+    if { [ -z "$ROOTFS_ARCHIVE" ] && [ -z "$ROOTFS_SOURCE_DIR" ]; } || [ -z "$OUTPUT_IMAGE" ]; then
+      echo "error: stage1 requires --rootfs/--rootfs-dir and --output" >&2
       usage
       exit 1
     fi
     ;;
   stage2)
     FS_TYPE="${FS_TYPE:-erofs}"
-    if [ -z "$ROOTFS_ARCHIVE" ] || [ -z "$OUTPUT_IMAGE" ]; then
-      echo "error: stage2 requires --rootfs and --output" >&2
+    if { [ -z "$ROOTFS_ARCHIVE" ] && [ -z "$ROOTFS_SOURCE_DIR" ]; } || [ -z "$OUTPUT_IMAGE" ]; then
+      echo "error: stage2 requires --rootfs/--rootfs-dir and --output" >&2
       usage
       exit 1
     fi
@@ -157,8 +162,16 @@ case "$MODE" in
     ;;
 esac
 
+if [ -n "$ROOTFS_ARCHIVE" ] && [ -n "$ROOTFS_SOURCE_DIR" ]; then
+  echo "error: specify only one of --rootfs or --rootfs-dir" >&2
+  exit 1
+fi
 if [ -n "$ROOTFS_ARCHIVE" ] && [ ! -f "$ROOTFS_ARCHIVE" ]; then
   echo "error: rootfs archive not found: $ROOTFS_ARCHIVE" >&2
+  exit 1
+fi
+if [ -n "$ROOTFS_SOURCE_DIR" ] && [ ! -d "$ROOTFS_SOURCE_DIR" ]; then
+  echo "error: rootfs directory not found: $ROOTFS_SOURCE_DIR" >&2
   exit 1
 fi
 if [ -n "$INIT_BINARY" ] && [ ! -f "$INIT_BINARY" ]; then
@@ -469,6 +482,11 @@ install_packages() {
 extract_rootfs() {
   rm -rf "$ROOTFS_DIR"
   mkdir -p "$ROOTFS_DIR"
+  if [ -n "$ROOTFS_SOURCE_DIR" ]; then
+    cp -R "$ROOTFS_SOURCE_DIR"/. "$ROOTFS_DIR"/
+    normalize_root_fstab
+    return
+  fi
   case "$ROOTFS_ARCHIVE" in
     *.tar.gz|*.tgz)
       tar -xzf "$ROOTFS_ARCHIVE" -C "$ROOTFS_DIR"

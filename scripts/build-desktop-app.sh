@@ -7,11 +7,21 @@ APP_DIR="$ROOT_DIR/.build/debug/$APP_NAME"
 CONTENTS_DIR="$APP_DIR/Contents"
 MACOS_DIR="$CONTENTS_DIR/MacOS"
 RESOURCES_DIR="$CONTENTS_DIR/Resources"
+CONTAINER_TOOLS_SOURCE_DIR="$ROOT_DIR/.build/debug/tools"
+CONTAINER_TOOLS_DEST_DIR="$RESOURCES_DIR/container-tools"
 
 mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"
 
 cp "$ROOT_DIR/.build/debug/MSLDesktop" "$MACOS_DIR/MSLDesktop"
 cp "$ROOT_DIR/.build/debug/msl" "$MACOS_DIR/msl"
+rm -rf "$CONTAINER_TOOLS_DEST_DIR"
+if [[ -f "$CONTAINER_TOOLS_SOURCE_DIR/manifest.json" ]]; then
+  mkdir -p "$CONTAINER_TOOLS_DEST_DIR"
+  cp "$CONTAINER_TOOLS_SOURCE_DIR/manifest.json" "$CONTAINER_TOOLS_DEST_DIR/manifest.json"
+  cp "$CONTAINER_TOOLS_SOURCE_DIR/regctl" "$CONTAINER_TOOLS_DEST_DIR/regctl"
+  cp "$CONTAINER_TOOLS_SOURCE_DIR/umoci" "$CONTAINER_TOOLS_DEST_DIR/umoci"
+  chmod 0755 "$CONTAINER_TOOLS_DEST_DIR/regctl" "$CONTAINER_TOOLS_DEST_DIR/umoci"
+fi
 
 cat > "$CONTENTS_DIR/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>

@@ -1,4 +1,5 @@
 .PHONY: build build-init build-ext4-helper build-image build-imagewriter build-imagewriter-help imagewriter-help imagewriter-setup imagewriter \
+	stage-container-tools package-container-tools install-container-tools \
 	reset reset-disk reset-full clean-alpine clean-ubuntu run \
 	test test-regression \
 	update-distribution-list \
@@ -6,6 +7,9 @@
 	clean
 
 MSL ?= ./.build/debug/msl
+CONTAINER_TOOLS_STAGE_DIR ?= $(HOME)/Library/Application Support/msl/tools/bundled/darwin-arm64
+REGCTL_VERSION ?= latest
+UMOCI_VERSION ?= latest
 
 build:
 	$(MAKE) build-init
@@ -20,6 +24,18 @@ build-ext4-helper:
 
 build-image:
 	./scripts/build-msl-image.sh
+
+stage-container-tools:
+	CONTAINER_TOOLS_STAGE_DIR="$(CONTAINER_TOOLS_STAGE_DIR)" \
+	REGCTL_VERSION="$(REGCTL_VERSION)" \
+	UMOCI_VERSION="$(UMOCI_VERSION)" \
+	./scripts/stage-container-tools.sh
+
+package-container-tools:
+	CONTAINER_TOOLS_STAGE_DIR="$(CONTAINER_TOOLS_STAGE_DIR)" \
+	./scripts/package-container-tools.sh
+
+install-container-tools: stage-container-tools
 
 build-imagewriter-help:
 	@echo "Imagewriter (Alpine instance for storage image build)"
