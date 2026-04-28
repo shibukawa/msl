@@ -41,14 +41,16 @@ TARGET_RELEASES = [
     {
         "distro": "ubuntu",
         "release": "noble",
-        "canonicalName": "ubuntu-noble",
-        "aliases": ["ubuntu", "ubuntu-lts"],
+        "version": "24.04",
+        "canonicalName": "ubuntu-24.04",
+        "aliases": ["ubuntu"],
     },
     {
         "distro": "ubuntu",
-        "release": "questing",
-        "canonicalName": "ubuntu-questing",
-        "aliases": ["ubuntu-latest"],
+        "release": "resolute",
+        "version": "26.04",
+        "canonicalName": "ubuntu-26.04",
+        "aliases": ["ubuntu-latest", "ubuntu-lts"],
     },
     {
         "distro": "fedora",
@@ -337,6 +339,7 @@ def cache_sharing_defaults_for_manager(normalized_manager: str):
 def linuxcontainers_entry(target: dict, products: dict, tmp_dir: Path):
     distro = target["distro"]
     release = target["release"]
+    version = target.get("version", release)
     product_key = f"{distro}:{release}:arm64:default"
     product = products.get(product_key)
     if not product:
@@ -385,9 +388,9 @@ def linuxcontainers_entry(target: dict, products: dict, tmp_dir: Path):
     normalized_manager = normalize_package_manager(parse_packages_manager(image_yaml))
 
     entry = {
-        "id": f"{distro}-{release}-arm64",
+        "id": f"{distro}-{version}-arm64",
         "distro": distro,
-        "version": release,
+        "version": version,
         "arch": "arm64",
         "tarballURL": tar_url,
         "sha256": sha256,
@@ -742,7 +745,8 @@ def build_install_catalog(targets, entries):
         f"{entry['distro']}:{entry['version']}": entry for entry in entries
     }
     for target in targets:
-        key = f"{target['distro']}:{target['release']}"
+        version = target.get("version", target["release"])
+        key = f"{target['distro']}:{version}"
         manifest = entry_by_key.get(key)
         if not manifest:
             raise RuntimeError(f"missing manifest entry for install catalog target {key}")

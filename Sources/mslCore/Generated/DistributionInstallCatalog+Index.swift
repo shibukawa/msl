@@ -18,14 +18,14 @@ enum EmbeddedDistributionInstallCatalog {
             manifestId: "debian-trixie-arm64"
         ),
         DistributionInstallDescriptor(
-            canonicalName: "ubuntu-noble",
-            aliases: ["ubuntu", "ubuntu-lts"],
-            manifestId: "ubuntu-noble-arm64"
+            canonicalName: "ubuntu-24.04",
+            aliases: ["ubuntu"],
+            manifestId: "ubuntu-24.04-arm64"
         ),
         DistributionInstallDescriptor(
-            canonicalName: "ubuntu-questing",
-            aliases: ["ubuntu-latest"],
-            manifestId: "ubuntu-questing-arm64"
+            canonicalName: "ubuntu-26.04",
+            aliases: ["ubuntu-latest", "ubuntu-lts"],
+            manifestId: "ubuntu-26.04-arm64"
         ),
         DistributionInstallDescriptor(
             canonicalName: "fedora-43",
