@@ -114,7 +114,7 @@ Install from catalog:
 ```bash
 ./.build/debug/msl install ubuntu
 ./.build/debug/msl install ubuntu-latest --name test-next
-./.build/debug/msl install ubuntu-questing --name test-questing
+./.build/debug/msl install ubuntu-26.04 --name test-26-04
 ```
 
 Install from local rootfs archive through the btrfs/imagewriter pipeline:
@@ -155,7 +155,7 @@ Uninstall instance:
 
 ```bash
 ./.build/debug/msl uninstall test-next
-./.build/debug/msl uninstall --keep-cache test-questing
+./.build/debug/msl uninstall --keep-cache test-26-04
 ```
 
 ## Workspace config scaffold

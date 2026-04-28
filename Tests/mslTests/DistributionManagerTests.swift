@@ -5,9 +5,9 @@ import CryptoKit
 final class DistributionManagerTests: XCTestCase {
     func testManifestAliasResolution() throws {
         let entry = DistributionManifestEntry(
-            id: "ubuntu-noble-arm64",
+            id: "ubuntu-24.04-arm64",
             distro: "ubuntu",
-            version: "noble",
+            version: "24.04",
             arch: "arm64",
             tarballURL: "https://example.com/rootfs.tar.xz",
             sha256: "abc",
@@ -18,12 +18,12 @@ final class DistributionManagerTests: XCTestCase {
             supportState: .supported
         )
         let descriptor = DistributionInstallDescriptor(
-            canonicalName: "ubuntu-noble",
-            aliases: ["ubuntu", "ubuntu-lts", "ubuntu-noble"],
+            canonicalName: "ubuntu-24.04",
+            aliases: ["ubuntu", "ubuntu-24.04"],
             manifestId: entry.id
         )
         let store = DistributionManifestStore(entries: [entry], installDescriptors: [descriptor])
-        XCTAssertEqual(store.resolve(alias: "ubuntu-noble")?.id, entry.id)
+        XCTAssertEqual(store.resolve(alias: "ubuntu-24.04")?.id, entry.id)
         XCTAssertEqual(store.resolve(alias: "ubuntu")?.id, entry.id)
         XCTAssertNil(store.resolve(alias: "alpine"))
     }
@@ -332,9 +332,9 @@ final class DistributionManagerTests: XCTestCase {
                 supportState: .supported
             ),
             DistributionManifestEntry(
-                id: "ubuntu-noble-arm64",
+                id: "ubuntu-24.04-arm64",
                 distro: "ubuntu",
-                version: "noble",
+                version: "24.04",
                 arch: "arm64",
                 tarballURL: "https://example.com/u2404.tar.xz",
                 sha256: "b",
@@ -345,9 +345,9 @@ final class DistributionManagerTests: XCTestCase {
                 supportState: .supported
             ),
             DistributionManifestEntry(
-                id: "ubuntu-questing-arm64",
+                id: "ubuntu-26.04-arm64",
                 distro: "ubuntu",
-                version: "questing",
+                version: "26.04",
                 arch: "arm64",
                 tarballURL: "https://example.com/u2510.tar.xz",
                 sha256: "c",
@@ -360,14 +360,14 @@ final class DistributionManagerTests: XCTestCase {
         ]
         let descriptors = [
             DistributionInstallDescriptor(canonicalName: "alpine-3.23", aliases: ["alpine"], manifestId: "alpine-3.23-arm64"),
-            DistributionInstallDescriptor(canonicalName: "ubuntu-noble", aliases: ["ubuntu", "ubuntu-lts"], manifestId: "ubuntu-noble-arm64"),
-            DistributionInstallDescriptor(canonicalName: "ubuntu-questing", aliases: ["ubuntu-latest"], manifestId: "ubuntu-questing-arm64"),
+            DistributionInstallDescriptor(canonicalName: "ubuntu-24.04", aliases: ["ubuntu"], manifestId: "ubuntu-24.04-arm64"),
+            DistributionInstallDescriptor(canonicalName: "ubuntu-26.04", aliases: ["ubuntu-latest", "ubuntu-lts"], manifestId: "ubuntu-26.04-arm64"),
         ]
         let store = DistributionManifestStore(entries: entries, installDescriptors: descriptors)
-        XCTAssertEqual(store.installableNames(), ["alpine-3.23", "ubuntu-noble", "ubuntu-questing"])
+        XCTAssertEqual(store.installableNames(), ["alpine-3.23", "ubuntu-24.04", "ubuntu-26.04"])
     }
 
-    func testInstallableDescriptorsExposeAliases() {
+    func testInstallableDescriptorsExposeUbuntuAlias() {
         let entry = DistributionManifestEntry(
             id: "ubuntu-24.04-arm64",
             distro: "ubuntu",
@@ -383,20 +383,20 @@ final class DistributionManagerTests: XCTestCase {
         )
         let descriptor = DistributionInstallDescriptor(
             canonicalName: "ubuntu-24.04",
-            aliases: ["ubuntu", "ubuntu-lts"],
+            aliases: ["ubuntu"],
             manifestId: entry.id
         )
         let store = DistributionManifestStore(entries: [entry], installDescriptors: [descriptor])
         XCTAssertEqual(store.resolve(alias: "ubuntu")?.id, entry.id)
-        XCTAssertEqual(store.resolve(alias: "ubuntu-lts")?.id, entry.id)
         XCTAssertEqual(store.installableDescriptors(), [descriptor])
     }
 
-    func testInstallCatalogContainsUbuntuQuestingAlias() {
+    func testInstallCatalogContainsUbuntuLatestAndLtsAliases() {
         let descriptor = EmbeddedDistributionInstallCatalog.descriptors
-            .first { $0.canonicalName == "ubuntu-questing" }
+            .first { $0.canonicalName == "ubuntu-26.04" }
         XCTAssertNotNil(descriptor)
         XCTAssertTrue(descriptor?.aliases.contains("ubuntu-latest") == true)
+        XCTAssertTrue(descriptor?.aliases.contains("ubuntu-lts") == true)
     }
 
     func testInternalInstanceDefaultsToEphemeralTmpStorage() {
