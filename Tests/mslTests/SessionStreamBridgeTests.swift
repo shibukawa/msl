@@ -36,4 +36,12 @@ final class SessionStreamBridgeTests: XCTestCase {
         XCTAssertEqual(snapshot.exitCode, 1)
         XCTAssertEqual(snapshot.failureReason, "stdout_write_failed")
     }
+
+    func testInitProcBridgeThrottlesEmptyPolls() throws {
+        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+        let source = try String(contentsOf: root.appendingPathComponent("Sources/mslCore/SessionStreamBridge.swift"), encoding: .utf8)
+
+        XCTAssertTrue(source.contains("var emittedChunk = false"))
+        XCTAssertTrue(source.contains("Thread.sleep(forTimeInterval: 0.02)"))
+    }
 }

@@ -2785,33 +2785,16 @@ public final class DaemonServer {
         metadataURL: URL,
         instanceName: String
     ) throws {
+        let _ = client
         let metadata = try distributionManager.readOrRebuildInstanceMetadata(at: metadataURL)
         let policy = try metadata.resolveValidatedTmpStoragePolicy()
         guard policy.mode == "ephemeral" else { return }
-        let label = tmpStorageLabel(instanceName: instanceName)
-        let response = try client.send(InitChannelRequest(
-            op: "exec",
-            argv: ["/bin/sh", "-lc", Self.tmpStoragePrepareScript, "msl-tmp-prepare", label],
-            runAsRoot: true,
-            timeoutMs: 15_000
-        ))
-        let exitCode = response.exitCode ?? 0
-        if response.ok, exitCode == 0 {
-            logger.log("tmp_mount_succeeded", fields: [
-                "instance": instanceName,
-                "mode": policy.mode,
-                "size_mib": String(policy.sizeMiB)
-            ])
-            return
-        }
-        let detail = response.error?.message ?? response.stderr ?? "tmp prepare failed"
-        logger.log("tmp_mount_failed", fields: [
+        logger.log("tmp_mount_bootstrap_delegated", fields: [
             "instance": instanceName,
-            "phase": "mount",
-            "exit_code": String(exitCode),
-            "detail": detail
+            "mode": policy.mode,
+            "size_mib": String(policy.sizeMiB),
+            "bootstrap": "msl-init"
         ])
-        throw MSLRuntimeError("tmp mount failed for instance '\(instanceName)': \(detail)")
     }
 
     private func resetTmpStorageAfterStop(metadataURL: URL?, instanceName: String) {
@@ -2834,16 +2817,6 @@ public final class DaemonServer {
                 "error": String(describing: error)
             ])
         }
-    }
-
-    private func tmpStorageLabel(instanceName: String) -> String {
-        let mapped = instanceName.lowercased().map { ch -> Character in
-            if ch.isLetter || ch.isNumber || ch == "-" || ch == "_" {
-                return ch
-            }
-            return "-"
-        }
-        return "msl-\(String(mapped))-tmp"
     }
 
     private func resolveConfiguredHostShareRoot() -> String {
@@ -5546,11 +5519,17 @@ public final class DaemonServer {
                 previousMetricsSamples[instanceName] = sample
                 return previous
             }
+            let metadata = try? distributionManager.readOrRebuildInstanceMetadata(
+                at: paths.distroMetadataFile(named: instanceName)
+            )
             let metrics = RuntimeInstanceMetrics(
                 sampledAtEpochMs: sample.sampledAtEpochMs,
                 memory: buildMemoryBreakdown(sample: sample, balloon: balloon, hostPID: loadInstanceRuntimeState(named: instanceName)?.runtimeHostPid),
                 cpu: buildCPUSnapshot(current: sample, previous: previous),
-                network: buildNetworkSnapshot(current: sample, previous: previous)
+                network: buildNetworkSnapshot(current: sample, previous: previous),
+                containerRuntime: metadata?.resolvedWorkloadKind() == .containerRuntime
+                    ? readContainerRuntimeMetrics(client: client)
+                    : nil
             )
             return RuntimeControlResponse(ok: true, metrics: metrics)
         } catch {
@@ -5886,6 +5865,46 @@ public final class DaemonServer {
             totalBytes: UInt64(fields[1]),
             usedBytes: UInt64(fields[2]),
             availableBytes: UInt64(fields[3])
+        )
+    }
+
+    private func readContainerRuntimeMetrics(client: InitChannelClient) -> RuntimeContainerRuntimeMetrics? {
+        let response = try? client.send(InitChannelRequest(
+            op: "exec",
+            argv: [
+                "/bin/sh", "-lc",
+                """
+                c_status=0; b_status=0
+                rc-service containerd status >/dev/null 2>&1 || c_status=$?
+                rc-service buildkitd status >/dev/null 2>&1 || b_status=$?
+                c_count=$(/usr/local/bin/nerdctl container ls -a -q 2>/dev/null | wc -l | tr -d ' ')
+                i_count=$(/usr/local/bin/nerdctl images -q 2>/dev/null | wc -l | tr -d ' ')
+                printf '%s\\n%s\\n%s\\n%s\\n' "$c_status" "$b_status" "${c_count:-}" "${i_count:-}"
+                """
+            ],
+            runAsRoot: true,
+            timeoutMs: 2_500
+        ))
+        guard let response, response.ok, (response.exitCode ?? 0) == 0, let stdout = response.stdout else {
+            return nil
+        }
+
+        let lines = stdout
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map(String.init)
+        guard lines.count >= 4 else {
+            return nil
+        }
+        let trimSet = CharacterSet.whitespacesAndNewlines
+        let containerdHealthy = Int(lines[0].trimmingCharacters(in: trimSet)) == 0
+        let buildkitdHealthy = Int(lines[1].trimmingCharacters(in: trimSet)) == 0
+        let containerCount = Int(lines[2].trimmingCharacters(in: trimSet))
+        let imageCount = Int(lines[3].trimmingCharacters(in: trimSet))
+        return RuntimeContainerRuntimeMetrics(
+            containerdHealthy: containerdHealthy,
+            buildkitdHealthy: buildkitdHealthy,
+            containerCount: containerCount,
+            imageCount: imageCount
         )
     }
 

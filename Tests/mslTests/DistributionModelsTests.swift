@@ -12,11 +12,11 @@ final class DistributionModelsTests: XCTestCase {
         let raw = """
         {
           "bundleVersion": "darwin-arm64-regctl-v0.11.2_umoci-v0.6.0",
-          "platform": "darwin-arm64",
           "generatedAtEpochMs": 100,
           "tools": [
             {
               "name": "regctl",
+              "platform": "darwin-arm64",
               "version": "v0.11.2",
               "checksum": "abc",
               "relativePath": "regctl"
@@ -27,8 +27,84 @@ final class DistributionModelsTests: XCTestCase {
 
         let decoded = try JSONDecoder().decode(BundledToolManifest.self, from: Data(raw.utf8))
         XCTAssertEqual(decoded.bundleVersion, "darwin-arm64-regctl-v0.11.2_umoci-v0.6.0")
-        XCTAssertEqual(decoded.record(named: "regctl")?.version, "v0.11.2")
-        XCTAssertNil(decoded.record(named: "umoci"))
+        XCTAssertEqual(decoded.record(named: "regctl", platform: "darwin-arm64")?.version, "v0.11.2")
+        XCTAssertNil(decoded.record(named: "umoci", platform: "darwin-arm64"))
+    }
+
+    func testImagewriterExtraFilesManifestRoundTrips() throws {
+        let manifest = ImagewriterExtraFilesManifest(
+            files: [
+                ImagewriterExtraFileEntry(
+                    sourceRelativePath: "payload/umoci",
+                    guestPath: "extras/umoci",
+                    mode: "0755"
+                )
+            ]
+        )
+        let data = try JSONEncoder().encode(manifest)
+        let decoded = try JSONDecoder().decode(ImagewriterExtraFilesManifest.self, from: data)
+        XCTAssertEqual(decoded.files.count, 1)
+        XCTAssertEqual(decoded.files.first?.sourceRelativePath, "payload/umoci")
+        XCTAssertEqual(decoded.files.first?.guestPath, "extras/umoci")
+        XCTAssertEqual(decoded.files.first?.mode, "0755")
+    }
+
+    func testDefaultExecRoundTripsSource() throws {
+        let metadata = DistributionInstanceMetadata(
+            name: "python",
+            createdAtEpochMs: 100,
+            source: DistributionSourceRecord(
+                sourceType: "container-remote",
+                tarballFileName: "rootfs.oci",
+                sha256: "abc",
+                verifiedAtEpochMs: 100
+            ),
+            diskPath: "/tmp/disk.raw",
+            kernelProfileRef: nil,
+            userConvergencePolicy: nil,
+            defaultExec: DistributionInstanceMetadata.DefaultExec(
+                argv: ["/usr/bin/python3", "-i"],
+                env: ["PYTHONUNBUFFERED=1"],
+                source: "install-override"
+            ),
+            shellAvailable: false,
+            startupMode: .processFirst,
+            workloadKind: .containerRuntime
+        )
+
+        let data = try JSONEncoder().encode(metadata)
+        let decoded = try JSONDecoder().decode(DistributionInstanceMetadata.self, from: data)
+        XCTAssertEqual(decoded.defaultExec?.argv, ["/usr/bin/python3", "-i"])
+        XCTAssertEqual(decoded.defaultExec?.source, "install-override")
+        XCTAssertEqual(decoded.startupMode, .processFirst)
+        XCTAssertEqual(decoded.resolvedStartupMode(), .processFirst)
+        XCTAssertEqual(decoded.workloadKind, .containerRuntime)
+        XCTAssertEqual(decoded.resolvedWorkloadKind(), .containerRuntime)
+    }
+
+    func testDistributionInstanceMetadataDefaultsStartupModeToInteractive() throws {
+        let raw = """
+        {
+          "name": "python",
+          "createdAtEpochMs": 100,
+          "source": {
+            "sourceType": "container-remote",
+            "tarballFileName": "rootfs.oci",
+            "sha256": "abc",
+            "verifiedAtEpochMs": 100
+          },
+          "diskPath": "/tmp/disk.raw",
+          "kernelProfileRef": null,
+          "userConvergencePolicy": null,
+          "shellAvailable": false
+        }
+        """
+
+        let decoded = try JSONDecoder().decode(DistributionInstanceMetadata.self, from: Data(raw.utf8))
+        XCTAssertNil(decoded.startupMode)
+        XCTAssertEqual(decoded.resolvedStartupMode(), .interactive)
+        XCTAssertNil(decoded.workloadKind)
+        XCTAssertEqual(decoded.resolvedWorkloadKind(), .generic)
     }
 
     func testDistributionInstanceMetadataDecodesWithoutWorkspacePolicy() throws {

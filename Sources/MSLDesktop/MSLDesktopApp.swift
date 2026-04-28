@@ -137,7 +137,7 @@ struct DashboardSelectionSummary {
 
 @MainActor
 final class DashboardModel: ObservableObject {
-    private static let hiddenInstanceNames: Set<String> = ["_imagewriter", "_podman"]
+    private static let hiddenInstanceNames: Set<String> = ["_imagewriter", "_container", "_podman"]
 
     @Published var workers: [AppManagerWorkerRecord] = []
     @Published var installedInstances: [String] = []

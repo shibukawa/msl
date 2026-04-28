@@ -4,7 +4,17 @@ import XCTest
 final class InitBootTransferProtocolTests: XCTestCase {
     func testParseHelloLine() {
         let hello = MSLInitBootTransferProtocol.parseHelloLine("MSLB2 HELLO 1 direct-init")
-        XCTAssertEqual(hello, .init(version: "1", initMode: "direct-init"))
+        XCTAssertEqual(hello, .init(version: "1", role: "bootloader", detail: "direct-init"))
+    }
+
+    func testParseControlHelloLine() {
+        let hello = MSLInitBootTransferProtocol.parseHelloLine("MSLB2 HELLO 1 control")
+        XCTAssertEqual(hello, .init(version: "1", role: "control"))
+    }
+
+    func testParseSidebandHelloLine() {
+        let hello = MSLInitBootTransferProtocol.parseHelloLine("MSLB2 HELLO 1 sideband:sideband")
+        XCTAssertEqual(hello, .init(version: "1", role: "sideband", detail: "sideband"))
     }
 
     func testEncodeDecodeMetadataBlockRoundTrip() throws {

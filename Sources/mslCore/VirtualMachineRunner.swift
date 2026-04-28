@@ -183,7 +183,8 @@ public final class VirtualMachineRunner {
                 vmQueue: vmQueue,
                 delegate: delegate,
                 runnerStartMs: runnerStartMs,
-                instanceName: metadata.instanceName
+                instanceName: metadata.instanceName,
+                metadata: metadata
             )
         }
 
@@ -255,13 +256,21 @@ public final class VirtualMachineRunner {
         let instanceDir = metadataURL.deletingLastPathComponent()
         let tmpStorage = try distribution.resolveValidatedTmpStoragePolicy()
         let ephemeralTmpDiskURL: URL?
+        let ephemeralTmpDevicePath: String?
+        let ephemeralTmpLabel: String?
         if tmpStorage.mode == "ephemeral" {
+            let tmpLabel = sanitizeTmpStorageLabel(instanceName: distribution.name)
             ephemeralTmpDiskURL = try prepareEphemeralTmpDisk(
                 instanceName: distribution.name,
-                sizeMiB: tmpStorage.sizeMiB
+                sizeMiB: tmpStorage.sizeMiB,
+                label: tmpLabel
             )
+            ephemeralTmpDevicePath = "/dev/vdb"
+            ephemeralTmpLabel = tmpLabel
         } else {
             ephemeralTmpDiskURL = nil
+            ephemeralTmpDevicePath = nil
+            ephemeralTmpLabel = nil
         }
         logger?.log("tmp_storage_mode_resolved", fields: [
             "instance": distribution.name,
@@ -275,11 +284,13 @@ public final class VirtualMachineRunner {
             machineIdentifierURL: instanceDir.appendingPathComponent("machine-identifier.bin", isDirectory: false),
             efiVariableStoreURL: instanceDir.appendingPathComponent("efi-variable-store", isDirectory: false),
             tmpStorage: tmpStorage,
-            ephemeralTmpDiskURL: ephemeralTmpDiskURL
+            ephemeralTmpDiskURL: ephemeralTmpDiskURL,
+            ephemeralTmpDevicePath: ephemeralTmpDevicePath,
+            ephemeralTmpLabel: ephemeralTmpLabel
         )
     }
 
-    private func prepareEphemeralTmpDisk(instanceName: String, sizeMiB: Int) throws -> URL {
+    private func prepareEphemeralTmpDisk(instanceName: String, sizeMiB: Int, label: String) throws -> URL {
         let fileManager = FileManager.default
         let tmpDir = paths.distroTmpDirectory(named: instanceName)
         try fileManager.createDirectory(at: tmpDir, withIntermediateDirectories: true)
@@ -288,23 +299,19 @@ public final class VirtualMachineRunner {
             try fileManager.removeItem(at: diskURL)
         }
 
-        if let mkfsHelper = resolveExt4MkfsHelperExecutable() {
-            let result = try runHostProcess(mkfsHelper, [
-                "--output", diskURL.path,
-                "--size-mb", String(sizeMiB),
-                "--label", "msl-tmp-\(instanceName)"
-            ], captureOutput: true)
-            guard result.exitCode == 0 else {
-                let detail = result.stderr.isEmpty ? result.stdout : result.stderr
-                throw MSLRuntimeError("tmp ext4 mkfs helper failed (\(result.exitCode)): \(detail)")
-            }
-        } else {
-            guard fileManager.createFile(atPath: diskURL.path, contents: nil) else {
-                throw MSLRuntimeError("failed to create tmp image file: \(diskURL.path)")
-            }
-            let handle = try FileHandle(forWritingTo: diskURL)
-            defer { try? handle.close() }
-            try handle.truncate(atOffset: UInt64(sizeMiB) * 1024 * 1024)
+        guard let mkfsHelper = resolveExt4MkfsHelperExecutable() else {
+            throw MSLRuntimeError(
+                "tmp ext4 mkfs helper not found; expected staged helper at \(paths.mslHostExt4MkfsHelperBinaryFile.path)"
+            )
+        }
+        let result = try runHostProcess(mkfsHelper, [
+            "--output", diskURL.path,
+            "--size-mb", String(sizeMiB),
+            "--label", label
+        ], captureOutput: true)
+        guard result.exitCode == 0 else {
+            let detail = result.stderr.isEmpty ? result.stdout : result.stderr
+            throw MSLRuntimeError("tmp ext4 mkfs helper failed (\(result.exitCode)): \(detail)")
         }
         logger?.log("tmp_image_created", fields: [
             "instance": instanceName,
@@ -312,6 +319,16 @@ public final class VirtualMachineRunner {
             "size_mib": String(sizeMiB)
         ])
         return diskURL
+    }
+
+    private func sanitizeTmpStorageLabel(instanceName: String) -> String {
+        let mapped = instanceName.lowercased().map { ch -> Character in
+            if ch.isLetter || ch.isNumber || ch == "-" || ch == "_" {
+                return ch
+            }
+            return "-"
+        }
+        return "msl-\(String(mapped))-tmp"
     }
 
     private func resolveExt4MkfsHelperExecutable() -> String? {
@@ -675,23 +692,23 @@ public final class VirtualMachineRunner {
 
     private func performBootloaderTransfer(
         listenerDelegate: VsockListenerDelegate,
-        timeoutSec: Int
+        timeoutSec: Int,
+        metadata: RuntimeInstanceMetadata
     ) throws {
         let connection = try acquireInitVsockConnection(
             listenerDelegate: listenerDelegate,
             timeoutSec: timeoutSec,
             role: "bootloader"
         )
-
-        let line = try readBootProtocolLine(fd: connection.fd, timeoutSec: timeoutSec)
-        guard let hello = MSLInitBootTransferProtocol.parseHelloLine(line) else {
-            throw MSLRuntimeError("invalid bootloader hello: \(line)")
+        guard connection.hello.role == "bootloader",
+              let initMode = connection.hello.initMode else {
+            throw MSLRuntimeError("invalid bootloader hello role: \(connection.hello.role)")
         }
 
         let payload = try initBinaryData()
         let hostEpochMs = UInt64(Date().timeIntervalSince1970 * 1000)
         let hostTimeZoneID = TimeZone.current.identifier
-        let metadataRecords: [MSLInitBootTransferProtocol.MetadataRecord] = [
+        var metadataRecords: [MSLInitBootTransferProtocol.MetadataRecord] = [
             .init(
                 targetKind: .bootloader,
                 flags: MSLInitBootTransferProtocol.requiredFlag,
@@ -703,11 +720,12 @@ public final class VirtualMachineRunner {
                 entry: "TZ=\(hostTimeZoneID)"
             )
         ]
+        metadataRecords.append(contentsOf: ephemeralTmpMetadataRecords(metadata: metadata))
         let metadata = try MSLInitBootTransferProtocol.encodeMetadataBlock(records: metadataRecords)
 
         logger?.log("init_bootloader_hello_received", fields: [
-            "version": hello.version,
-            "init_mode": hello.initMode,
+            "version": connection.hello.version,
+            "init_mode": initMode,
             "payload_size": String(payload.count)
         ])
 
@@ -724,12 +742,43 @@ public final class VirtualMachineRunner {
             ])
         }
         try writeAll(fd: connection.fd, data: payload)
+        if shutdown(connection.fd, SHUT_WR) != 0 {
+            let err = String(cString: strerror(errno))
+            logger?.log("init_bootloader_shutdown_failed", fields: [
+                "error": err
+            ])
+        } else {
+            logger?.log("init_bootloader_write_shutdown", fields: [:])
+        }
 
         logger?.log("init_bootloader_transfer_completed", fields: [
             "payload_size": String(payload.count),
             "metadata_version": String(MSLInitBootTransferProtocol.metadataVersion),
             "record_count": String(metadataRecords.count)
         ])
+    }
+
+    private func ephemeralTmpMetadataRecords(
+        metadata: RuntimeInstanceMetadata
+    ) -> [MSLInitBootTransferProtocol.MetadataRecord] {
+        guard metadata.tmpStorage.mode == "ephemeral",
+              let devicePath = metadata.ephemeralTmpDevicePath else {
+            return []
+        }
+        var records: [MSLInitBootTransferProtocol.MetadataRecord] = [
+            .init(targetKind: .execEnv, flags: 0, entry: "MSL_EPHEMERAL_TMP_MODE=ephemeral"),
+            .init(targetKind: .execEnv, flags: 0, entry: "MSL_EPHEMERAL_TMP_DEVICE=\(devicePath)"),
+            .init(targetKind: .execEnv, flags: 0, entry: "MSL_EPHEMERAL_TMP_SIZE_MIB=\(metadata.tmpStorage.sizeMiB)"),
+            .init(
+                targetKind: .execEnv,
+                flags: 0,
+                entry: "MSL_EPHEMERAL_TMP_RESET_ON_STOP=\(metadata.tmpStorage.resetOnStop ? "true" : "false")"
+            )
+        ]
+        if let label = metadata.ephemeralTmpLabel, !label.isEmpty {
+            records.append(.init(targetKind: .execEnv, flags: 0, entry: "MSL_EPHEMERAL_TMP_LABEL=\(label)"))
+        }
+        return records
     }
 
     private func readBootProtocolLine(fd: Int32, timeoutSec: Int) throws -> String {
@@ -924,7 +973,8 @@ public final class VirtualMachineRunner {
         let transferStartMs = monotonicMs()
         try performBootloaderTransfer(
             listenerDelegate: listenerDelegate,
-            timeoutSec: timeoutSec
+            timeoutSec: timeoutSec,
+            metadata: metadata
         )
         logStartupPhase(
             phase: "init_bootloader_transfer",
@@ -933,41 +983,16 @@ public final class VirtualMachineRunner {
         )
 
         let handshakeStartMs = monotonicMs()
-        let controlConnection = try waitForInitChannel(
+        let (client, ping) = try makeVerifiedInitChannelClient(
             listenerDelegate: listenerDelegate,
-            timeoutSec: timeoutSec
+            timeoutSec: timeoutSec,
+            instanceName: metadata.instanceName
         )
         logStartupPhase(
             phase: "init_handshake_wait",
             elapsedMs: monotonicMs() - handshakeStartMs,
             instanceName: metadata.instanceName
         )
-
-        let client = InitChannelClient(
-            socketPath: paths.initChannelSocketFile.path,
-            handoffPath: paths.initChannelHandoffFile.path,
-            ackPath: paths.initChannelAckFile.path,
-            retryCount: 2,
-            retryDelayMs: 50,
-            timeoutMs: 400,
-            vsockFD: controlConnection.fd,
-            retainedVsockConnection: controlConnection.retainedConnection,
-            sidebandConnector: { [weak listenerDelegate, weak self] in
-                guard let self, let listenerDelegate else {
-                    throw MSLRuntimeError("init vsock broker unavailable")
-                }
-                return try self.acquireInitVsockConnection(listenerDelegate: listenerDelegate, timeoutSec: timeoutSec, role: "sideband")
-            },
-            sidebandSupported: true,
-            traceLogger: { [weak logger] event, fields in
-                logger?.log(event, fields: fields)
-            }
-        )
-
-        let ping = try client.ping()
-        if !ping.ok {
-            throw MSLRuntimeError("init channel ping failed after vsock accept")
-        }
         logger?.log("vm_daemon_init_ready", fields: [
             "requestId": ping.requestId
         ])
@@ -999,11 +1024,10 @@ public final class VirtualMachineRunner {
     }
 
     /// Stop a VM previously started via `startVMForDaemon()`.
-    public func stopRunningVM() {
+    public func requestStopRunningVM() {
         #if canImport(Virtualization)
         stopBalloonController()
         guard let vm = runningVM, let queue = runningVMQueue else { return }
-        let sem = DispatchSemaphore(value: 0)
         queue.async {
             if vm.canRequestStop {
                 do {
@@ -1017,9 +1041,64 @@ public final class VirtualMachineRunner {
             } else if vm.canStop {
                 vm.stop { _ in }
             }
-            sem.signal()
         }
-        _ = sem.wait(timeout: .now() + .seconds(5))
+        #endif
+    }
+
+    public func stopRunningVM() {
+        #if canImport(Virtualization)
+        stopBalloonController()
+        guard let vm = runningVM, let queue = runningVMQueue, let delegate = runningDelegate else {
+            clearRunningVMReferences()
+            return
+        }
+        let requestSem = DispatchSemaphore(value: 0)
+        queue.async {
+            if vm.canRequestStop {
+                do {
+                    try vm.requestStop()
+                } catch {
+                    fputs("msl: daemon requestStop failed: \(error.localizedDescription)\n", stderr)
+                    if vm.canStop {
+                        vm.stop { _ in }
+                    }
+                }
+            } else if vm.canStop {
+                vm.stop { _ in }
+            }
+            requestSem.signal()
+        }
+        _ = requestSem.wait(timeout: .now() + .seconds(2))
+        if !waitForRunningVMStop(delegate: delegate, timeoutMs: 5_000) {
+            let forceSem = DispatchSemaphore(value: 0)
+            queue.async {
+                if vm.canStop {
+                    vm.stop { _ in forceSem.signal() }
+                } else {
+                    forceSem.signal()
+                }
+            }
+            _ = forceSem.wait(timeout: .now() + .seconds(5))
+        }
+        clearRunningVMReferences()
+        logger?.log("vm_daemon_stopped")
+        #endif
+    }
+
+    #if canImport(Virtualization)
+    private func waitForRunningVMStop(delegate: VMDelegate, timeoutMs: Int) -> Bool {
+        let deadline = Date().addingTimeInterval(TimeInterval(timeoutMs) / 1000.0)
+        while Date() < deadline {
+            if delegate.didStop {
+                return true
+            }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        return delegate.didStop
+    }
+    #endif
+
+    private func clearRunningVMReferences() {
         self.runningVM = nil
         self.runningVMQueue = nil
         self.runningDelegate = nil
@@ -1044,8 +1123,6 @@ public final class VirtualMachineRunner {
         #endif
         self.diagnosticCollector?.stop()
         self.diagnosticCollector = nil
-        logger?.log("vm_daemon_stopped")
-        #endif
     }
 
     /// Check if the VM (started via daemon mode) has stopped unexpectedly.
@@ -1357,7 +1434,8 @@ public final class VirtualMachineRunner {
         vmQueue: DispatchQueue,
         delegate: VMDelegate,
         runnerStartMs: Int64,
-        instanceName: String
+        instanceName: String,
+        metadata: RuntimeInstanceMetadata
     ) throws -> Int32 {
         fputs("msl: VM started, attaching via msl-init control channel (vsock)\n", stderr)
 
@@ -1376,7 +1454,8 @@ public final class VirtualMachineRunner {
         let transferStartMs = monotonicMs()
         try performBootloaderTransfer(
             listenerDelegate: listenerDelegate,
-            timeoutSec: timeoutSec
+            timeoutSec: timeoutSec,
+            metadata: metadata
         )
         logStartupPhase(
             phase: "init_bootloader_transfer",
@@ -1385,9 +1464,10 @@ public final class VirtualMachineRunner {
         )
 
         let handshakeStartMs = monotonicMs()
-        let controlConnection = try waitForInitChannel(
+        let (client, ping) = try makeVerifiedInitChannelClient(
             listenerDelegate: listenerDelegate,
-            timeoutSec: timeoutSec
+            timeoutSec: timeoutSec,
+            instanceName: instanceName
         )
         logStartupPhase(
             phase: "init_handshake_wait",
@@ -1395,32 +1475,7 @@ public final class VirtualMachineRunner {
             instanceName: instanceName
         )
 
-        let client = InitChannelClient(
-            socketPath: paths.initChannelSocketFile.path,
-            handoffPath: paths.initChannelHandoffFile.path,
-            ackPath: paths.initChannelAckFile.path,
-            retryCount: 2,
-            retryDelayMs: 50,
-            timeoutMs: 400,
-            vsockFD: controlConnection.fd,
-            retainedVsockConnection: controlConnection.retainedConnection,
-            sidebandConnector: { [weak listenerDelegate, weak self] in
-                guard let self, let listenerDelegate else {
-                    throw MSLRuntimeError("init vsock broker unavailable")
-                }
-                return try self.acquireInitVsockConnection(listenerDelegate: listenerDelegate, timeoutSec: timeoutSec, role: "sideband")
-            },
-            sidebandSupported: true,
-            traceLogger: { [weak logger] event, fields in
-                logger?.log(event, fields: fields)
-            }
-        )
-
         // Verify the connection with a ping
-        let ping = try client.ping()
-        if !ping.ok {
-            throw MSLRuntimeError("init channel ping failed after vsock accept")
-        }
         logger?.log("init_heartbeat_ok", fields: [
             "requestId": ping.requestId,
             "op": ping.op,
@@ -1468,21 +1523,25 @@ public final class VirtualMachineRunner {
 
     private func waitForInitChannel(
         listenerDelegate: VsockListenerDelegate,
-        timeoutSec: Int
+        timeoutSec: Int,
+        role: String = "control"
     ) throws -> InitChannelClient.SidebandConnection {
-        try acquireInitVsockConnection(listenerDelegate: listenerDelegate, timeoutSec: timeoutSec, role: "control")
+        let accepted = try acquireInitVsockConnection(listenerDelegate: listenerDelegate, timeoutSec: timeoutSec, role: role)
+        return (fd: accepted.fd, retainedConnection: accepted.retainedConnection)
     }
 
     private func acquireInitVsockConnection(
         listenerDelegate: VsockListenerDelegate,
         timeoutSec: Int,
         role: String
-    ) throws -> InitChannelClient.SidebandConnection {
+    ) throws -> AcceptedInitVsockConnection {
         let initMode = bootProfile?.initMode ?? "direct-init"
         let serviceManager = bootProfile?.serviceManager ?? "-"
         let checkCommand = initHandshakeCheckCommand()
 
-        fputs("msl: waiting for guest init vsock connection (role \(role), timeout \(timeoutSec)s)\n", stderr)
+        if shouldEmitInitHandshakeStderrLogs() {
+            fputs("msl: waiting for guest init vsock connection (role \(role), timeout \(timeoutSec)s)\n", stderr)
+        }
         logger?.log("init_handshake_wait_started", fields: [
             "transport": "vsock_listener",
             "timeout_sec": String(timeoutSec),
@@ -1490,42 +1549,163 @@ public final class VirtualMachineRunner {
             "service_manager": serviceManager
         ])
 
-        guard let connection = listenerDelegate.takeConnection(timeoutSec: timeoutSec) else {
-            logger?.log("init_handshake_timeout", fields: [
-                "timeout_sec": String(timeoutSec),
-                "serial_log": paths.serialConsoleLogFile.path,
-                "init_mode": initMode,
-                "service_manager": serviceManager,
-                "check_command": checkCommand
-            ])
-            throw MSLRuntimeError(
-                "init channel did not connect within \(timeoutSec)s; " +
-                "init_mode=\(initMode), service_manager=\(serviceManager). " +
-                "check guest service with `\(checkCommand)` and inspect serial log at \(paths.serialConsoleLogFile.path)"
+        let deadline = Date().addingTimeInterval(TimeInterval(timeoutSec))
+        while Date() < deadline {
+            let remaining = max(1, Int(deadline.timeIntervalSinceNow.rounded(.up)))
+            if let accepted = listenerDelegate.takeAcceptedConnection(role: role) {
+                return accepted
+            }
+            guard let connection = listenerDelegate.takeConnection(timeoutSec: remaining) else {
+                break
+            }
+            let line = try readBootProtocolLine(fd: connection.fileDescriptor, timeoutSec: remaining)
+            guard let hello = MSLInitBootTransferProtocol.parseHelloLine(line) else {
+                logger?.log("init_vsock_role_discarded", fields: [
+                    "requested_role": role,
+                    "reason": "invalid_hello",
+                    "line": line
+                ])
+                continue
+            }
+            let accepted = AcceptedInitVsockConnection(
+                fd: {
+                    let duplicated = dup(connection.fileDescriptor)
+                    guard duplicated >= 0 else {
+                        logger?.log("init_vsock_fd_dup_failed", fields: [
+                            "role": hello.role,
+                            "errno": String(errno)
+                        ])
+                        return -1
+                    }
+                    return duplicated
+                }(),
+                retainedConnection: connection,
+                hello: hello
             )
+            guard accepted.fd >= 0 else {
+                continue
+            }
+            logger?.log("init_vsock_role_received", fields: [
+                "role": hello.role,
+                "detail": hello.detail ?? "",
+                "version": hello.version
+            ])
+            if hello.role == role {
+                if role == "control" {
+                    self.acceptedVsockConnection = connection
+                }
+                if shouldEmitInitHandshakeStderrLogs() {
+                    fputs("msl: guest init connected via vsock (role \(role), fd=\(connection.fileDescriptor))\n", stderr)
+                }
+                logger?.log("init_vsock_connection_assigned", fields: [
+                    "fd": String(connection.fileDescriptor),
+                    "role": role
+                ])
+                logger?.log("init_service_ready", fields: [
+                    "fd": String(connection.fileDescriptor),
+                    "role": role,
+                    "init_mode": initMode,
+                    "service_manager": serviceManager
+                ])
+                logger?.log("init_handshake_ready", fields: [
+                    "fd": String(connection.fileDescriptor),
+                    "init_mode": initMode,
+                    "service_manager": serviceManager
+                ])
+                return accepted
+            }
+            listenerDelegate.storeAcceptedConnection(accepted)
+            logger?.log("init_vsock_role_queued", fields: [
+                "requested_role": role,
+                "received_role": hello.role,
+                "detail": hello.detail ?? ""
+            ])
         }
 
-        let fd = connection.fileDescriptor
-        if role == "control" {
-            self.acceptedVsockConnection = connection
+        logger?.log("init_handshake_timeout", fields: [
+            "timeout_sec": String(timeoutSec),
+            "serial_log": paths.serialConsoleLogFile.path,
+            "init_mode": initMode,
+            "service_manager": serviceManager,
+            "check_command": checkCommand,
+            "requested_role": role
+        ])
+        throw MSLRuntimeError(
+            "init channel did not connect within \(timeoutSec)s; " +
+            "requested_role=\(role), init_mode=\(initMode), service_manager=\(serviceManager). " +
+            "check guest service with `\(checkCommand)` and inspect serial log at \(paths.serialConsoleLogFile.path)"
+        )
+    }
+
+    private func shouldEmitInitHandshakeStderrLogs() -> Bool {
+        ProcessInfo.processInfo.environment["MSL_DEBUG_INIT_HANDSHAKE"]?.isEmpty == false
+    }
+
+    private func makeVerifiedInitChannelClient(
+        listenerDelegate: VsockListenerDelegate,
+        timeoutSec: Int,
+        instanceName: String
+    ) throws -> (InitChannelClient, InitChannelResponse) {
+        var lastError: Error?
+        for attempt in 1...2 {
+            let controlConnection = try waitForInitChannel(
+                listenerDelegate: listenerDelegate,
+                timeoutSec: timeoutSec,
+                role: "control"
+            )
+            let client = InitChannelClient(
+                socketPath: paths.initChannelSocketFile.path,
+                handoffPath: paths.initChannelHandoffFile.path,
+                ackPath: paths.initChannelAckFile.path,
+                retryCount: 2,
+                retryDelayMs: 50,
+                timeoutMs: 400,
+                vsockFD: controlConnection.fd,
+                retainedVsockConnection: controlConnection.retainedConnection,
+                sidebandConnector: { [weak listenerDelegate, weak self] in
+                    guard let self, let listenerDelegate else {
+                        throw MSLRuntimeError("init vsock broker unavailable")
+                    }
+                    let accepted = try self.acquireInitVsockConnection(
+                        listenerDelegate: listenerDelegate,
+                        timeoutSec: timeoutSec,
+                        role: "sideband"
+                    )
+                    return (fd: accepted.fd, retainedConnection: accepted.retainedConnection)
+                },
+                sidebandSupported: true,
+                allowStreamingOnVsock: false,
+                traceLogger: { [weak logger] event, fields in
+                    logger?.log(event, fields: fields)
+                }
+            )
+            do {
+                let ping = try client.ping()
+                if !ping.ok {
+                    throw MSLRuntimeError("init channel ping failed after vsock accept")
+                }
+                if attempt > 1 {
+                    logger?.log("init_handshake_retry_succeeded", fields: [
+                        "instance": instanceName,
+                        "attempt": String(attempt)
+                    ])
+                }
+                return (client, ping)
+            } catch {
+                lastError = error
+                if attempt >= 2 {
+                    break
+                }
+                acceptedVsockConnection = nil
+                logger?.log("init_handshake_retry_after_ping_failure", fields: [
+                    "instance": instanceName,
+                    "attempt": String(attempt),
+                    "error": String(describing: error)
+                ])
+            }
         }
-        fputs("msl: guest init connected via vsock (role \(role), fd=\(fd))\n", stderr)
-        logger?.log("init_vsock_connection_assigned", fields: [
-            "fd": String(fd),
-            "role": role
-        ])
-        logger?.log("init_service_ready", fields: [
-            "fd": String(fd),
-            "role": role,
-            "init_mode": initMode,
-            "service_manager": serviceManager
-        ])
-        logger?.log("init_handshake_ready", fields: [
-            "fd": String(fd),
-            "init_mode": initMode,
-            "service_manager": serviceManager
-        ])
-        return (fd: fd, retainedConnection: connection)
+
+        throw lastError ?? MSLRuntimeError("init channel ping failed after vsock accept")
     }
 
     private func initHandshakeCheckCommand() -> String {
@@ -1676,6 +1856,8 @@ private struct RuntimeInstanceMetadata {
     var efiVariableStoreURL: URL
     var tmpStorage: DistributionInstanceMetadata.TmpStoragePolicy
     var ephemeralTmpDiskURL: URL?
+    var ephemeralTmpDevicePath: String?
+    var ephemeralTmpLabel: String?
 }
 
 #if canImport(Virtualization)
@@ -1695,10 +1877,17 @@ private final class VMDelegate: NSObject, VZVirtualMachineDelegate {
 
 /// Accepts the first inbound vsock connection from the guest (msl-init).
 /// The accepted connection signals that msl-init is ready.
+private struct AcceptedInitVsockConnection {
+    var fd: Int32
+    var retainedConnection: AnyObject?
+    var hello: MSLInitBootTransferProtocol.Hello
+}
+
 private final class VsockListenerDelegate: NSObject, VZVirtioSocketListenerDelegate {
     private let lock = NSLock()
     private let semaphore = DispatchSemaphore(value: 0)
     private var pendingConnections: [VZVirtioSocketConnection] = []
+    private var acceptedConnectionsByRole: [String: [AcceptedInitVsockConnection]] = [:]
 
     func listener(
         _ listener: VZVirtioSocketListener,
@@ -1720,6 +1909,27 @@ private final class VsockListenerDelegate: NSObject, VZVirtioSocketListenerDeleg
         lock.lock()
         defer { lock.unlock() }
         return pendingConnections.isEmpty ? nil : pendingConnections.removeFirst()
+    }
+
+    func storeAcceptedConnection(_ connection: AcceptedInitVsockConnection) {
+        lock.lock()
+        acceptedConnectionsByRole[connection.hello.role, default: []].append(connection)
+        lock.unlock()
+    }
+
+    func takeAcceptedConnection(role: String) -> AcceptedInitVsockConnection? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard var connections = acceptedConnectionsByRole[role], !connections.isEmpty else {
+            return nil
+        }
+        let accepted = connections.removeFirst()
+        if connections.isEmpty {
+            acceptedConnectionsByRole.removeValue(forKey: role)
+        } else {
+            acceptedConnectionsByRole[role] = connections
+        }
+        return accepted
     }
 }
 

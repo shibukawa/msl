@@ -102,11 +102,14 @@ struct PollFd {
 }
 
 const POLLIN: i16 = 0x001;
+const POLLOUT: i16 = 0x004;
 const POLLHUP: i16 = 0x010;
 const POLLERR: i16 = 0x008;
 const F_GETFL: i32 = 3;
 const F_SETFL: i32 = 4;
 const O_NONBLOCK: i32 = 0x800;
+const MS_NOSUID: usize = 2;
+const MS_NODEV: usize = 4;
 const MS_BIND: usize = 4096;
 
 extern "C" {
@@ -1019,6 +1022,10 @@ fn main() -> Result<(), String> {
     log_line(&format!("started vsock_port={}", vsock_port));
     ensure_process_environment();
     ensure_mount_prerequisites();
+    if let Err(err) = bootstrap_ephemeral_tmp_storage() {
+        log_line(&format!("tmp_storage_prepare_failed {}", err));
+        return Err(format!("tmp storage bootstrap failed: {}", err));
+    }
     ensure_pty_prerequisites();
     ensure_guest_network_ready();
     start_local_control_server();
@@ -1594,7 +1601,215 @@ fn is_valid_timezone_id(value: &str) -> bool {
 fn ensure_mount_prerequisites() {
     mount_fs_if_needed("/proc", b"proc\0", b"proc\0", None);
     mount_fs_if_needed("/sys", b"sysfs\0", b"sysfs\0", None);
+    mount_fs_if_needed("/sys/fs/cgroup", b"cgroup2\0", b"cgroup2\0", None);
     mount_fs_if_needed("/run", b"tmpfs\0", b"tmpfs\0", Some(b"mode=0755\0"));
+}
+
+fn bootstrap_ephemeral_tmp_storage() -> Result<(), String> {
+    let mode = env::var("MSL_EPHEMERAL_TMP_MODE").unwrap_or_default();
+    if !mode.eq_ignore_ascii_case("ephemeral") {
+        return Ok(());
+    }
+
+    let device = env::var("MSL_EPHEMERAL_TMP_DEVICE")
+        .map_err(|_| "stage=env detail=missing_device".to_string())?;
+    let size_mib = env::var("MSL_EPHEMERAL_TMP_SIZE_MIB").unwrap_or_else(|_| "-".to_string());
+    let reset_on_stop = env::var("MSL_EPHEMERAL_TMP_RESET_ON_STOP").unwrap_or_else(|_| "-".to_string());
+    let label = env::var("MSL_EPHEMERAL_TMP_LABEL").unwrap_or_else(|_| "-".to_string());
+
+    log_line(&format!(
+        "tmp_storage_prepare_started mode=ephemeral device={} size_mib={} reset_on_stop={} label={}",
+        device, size_mib, reset_on_stop, label
+    ));
+
+    mount_ephemeral_tmp_storage(&device)?;
+    log_line(&format!(
+        "tmp_storage_prepare_succeeded mode=ephemeral device={} size_mib={} reset_on_stop={} label={}",
+        device, size_mib, reset_on_stop, label
+    ));
+    Ok(())
+}
+
+fn mount_ephemeral_tmp_storage(device: &str) -> Result<(), String> {
+    mount_ext4_if_needed(device, "/run/msl/tmp")?;
+    set_path_mode("/run/msl/tmp", 0o1777)
+        .map_err(|e| format!("stage=chmod_tmp_root detail={}", e))?;
+
+    fs::create_dir_all("/tmp")
+        .map_err(|e| format!("stage=tmp_dir_create detail=failed to create /tmp: {}", e))?;
+    bind_mount_directory_if_needed("/run/msl/tmp", "/tmp")
+        .map_err(|e| format!("stage=tmp_bind detail={}", e))?;
+    set_path_mode("/tmp", 0o1777)
+        .map_err(|e| format!("stage=chmod_tmp detail={}", e))?;
+
+    if mount_fstype("/").as_deref() == Some("erofs") {
+        prepare_erofs_ephemeral_state()?;
+    }
+    Ok(())
+}
+
+fn mount_ext4_if_needed(device: &str, target: &str) -> Result<(), String> {
+    fs::create_dir_all(target)
+        .map_err(|e| format!("failed to create {}: {}", target, e))?;
+    if is_mountpoint(target) {
+        return Ok(());
+    }
+
+    let source_bytes = to_c_string_bytes(device);
+    let target_bytes = to_c_string_bytes(target);
+    let fstype = b"ext4\0";
+    let mount_ret = unsafe {
+        mount(
+            source_bytes.as_ptr(),
+            target_bytes.as_ptr(),
+            fstype.as_ptr(),
+            MS_NOSUID | MS_NODEV,
+            std::ptr::null(),
+        )
+    };
+    if mount_ret == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() == Some(16) {
+        return Ok(());
+    }
+    Err(format!("failed to mount {} on {}: {}", device, target, err))
+}
+
+fn set_path_mode(path: &str, mode: u32) -> Result<(), String> {
+    let permissions = fs::Permissions::from_mode(mode);
+    fs::set_permissions(path, permissions)
+        .map_err(|e| format!("failed to chmod {} to {:o}: {}", path, mode, e))
+}
+
+fn bind_mount_directory_if_needed(source: &str, target: &str) -> Result<bool, String> {
+    bind_mount_any_if_needed(source, target, true)
+}
+
+fn bind_mount_any_if_needed(source: &str, target: &str, directory: bool) -> Result<bool, String> {
+    if directory {
+        fs::create_dir_all(target)
+            .map_err(|e| format!("failed to create {}: {}", target, e))?;
+    } else {
+        let target_path = Path::new(target);
+        if let Some(parent) = target_path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("failed to create {}: {}", parent.display(), e))?;
+        }
+        if !target_path.exists() {
+            OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(target_path)
+                .map_err(|e| format!("failed to create {}: {}", target, e))?;
+        }
+    }
+
+    let source_bytes = to_c_string_bytes(source);
+    let target_bytes = to_c_string_bytes(target);
+    let mount_ret = unsafe {
+        mount(
+            source_bytes.as_ptr(),
+            target_bytes.as_ptr(),
+            std::ptr::null(),
+            MS_BIND,
+            std::ptr::null(),
+        )
+    };
+    if mount_ret == 0 {
+        return Ok(true);
+    }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() == Some(16) {
+        return Ok(false);
+    }
+    Err(format!("bind mount {} -> {} failed: {}", source, target, err))
+}
+
+fn prepare_erofs_ephemeral_state() -> Result<(), String> {
+    fs::create_dir_all("/run/msl/tmp/var")
+        .map_err(|e| format!("stage=erofs_var_root detail={}", e))?;
+    fs::create_dir_all("/run/msl/tmp/etc")
+        .map_err(|e| format!("stage=erofs_etc_root detail={}", e))?;
+
+    copy_tree_best_effort("/var", "/run/msl/tmp/var", "erofs_var_copy");
+    for path in ["/run/msl/tmp/var/log", "/run/msl/tmp/var/tmp", "/run/msl/tmp/var/devcontainer"] {
+        fs::create_dir_all(path)
+            .map_err(|e| format!("stage=erofs_var_tree detail=failed to create {}: {}", path, e))?;
+    }
+    set_path_mode("/run/msl/tmp/var/tmp", 0o1777)
+        .map_err(|e| format!("stage=erofs_var_tmp_mode detail={}", e))?;
+    bind_mount_directory_if_needed("/run/msl/tmp/var", "/var")
+        .map_err(|e| format!("stage=erofs_var_bind detail={}", e))?;
+    let _ = set_path_mode("/var/tmp", 0o1777);
+
+    copy_tree_best_effort("/etc", "/run/msl/tmp/etc", "erofs_etc_copy");
+    bind_mount_directory_if_needed("/run/msl/tmp/etc", "/etc")
+        .map_err(|e| format!("stage=erofs_etc_bind detail={}", e))?;
+    Ok(())
+}
+
+fn copy_tree_best_effort(source: &str, target: &str, stage: &str) {
+    let source_path = Path::new(source);
+    if !source_path.exists() {
+        return;
+    }
+    if let Err(err) = copy_tree_entry(source_path, Path::new(target)) {
+        log_line(&format!(
+            "tmp_storage_prepare_warning stage={} source={} target={} error={}",
+            stage, source, target, err
+        ));
+    }
+}
+
+fn copy_tree_entry(source: &Path, target: &Path) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(source)
+        .map_err(|e| format!("failed to stat {}: {}", source.display(), e))?;
+    let file_type = metadata.file_type();
+
+    if file_type.is_symlink() {
+        if target.exists() {
+            let _ = fs::remove_file(target);
+            let _ = fs::remove_dir_all(target);
+        }
+        let link_target = fs::read_link(source)
+            .map_err(|e| format!("failed to read symlink {}: {}", source.display(), e))?;
+        symlink(&link_target, target)
+            .map_err(|e| format!("failed to create symlink {}: {}", target.display(), e))?;
+        return Ok(());
+    }
+
+    if file_type.is_dir() {
+        fs::create_dir_all(target)
+            .map_err(|e| format!("failed to create {}: {}", target.display(), e))?;
+        let _ = fs::set_permissions(target, fs::Permissions::from_mode(metadata.permissions().mode() & 0o7777));
+        let entries = fs::read_dir(source)
+            .map_err(|e| format!("failed to read {}: {}", source.display(), e))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("failed to read dir entry {}: {}", source.display(), e))?;
+            copy_tree_entry(&entry.path(), &target.join(entry.file_name()))?;
+        }
+        return Ok(());
+    }
+
+    if file_type.is_file() {
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("failed to create {}: {}", parent.display(), e))?;
+        }
+        fs::copy(source, target)
+            .map_err(|e| format!("failed to copy {} to {}: {}", source.display(), target.display(), e))?;
+        let _ = fs::set_permissions(target, fs::Permissions::from_mode(metadata.permissions().mode() & 0o7777));
+        return Ok(());
+    }
+
+    log_line(&format!(
+        "tmp_storage_prepare_warning stage=erofs_tree_copy_skip source={} reason=unsupported_file_type",
+        source.display()
+    ));
+    Ok(())
 }
 
 fn is_mountpoint(target: &str) -> bool {
@@ -1722,28 +1937,7 @@ fn mount_virtiofs_macos_if_needed() -> Result<bool, String> {
 }
 
 fn bind_mount_if_needed(source: &str, target: &str) -> Result<bool, String> {
-    fs::create_dir_all(target)
-        .map_err(|e| format!("failed to create {}: {}", target, e))?;
-
-    let source_bytes = to_c_string_bytes(source);
-    let target_bytes = to_c_string_bytes(target);
-    let mount_ret = unsafe {
-        mount(
-            source_bytes.as_ptr(),
-            target_bytes.as_ptr(),
-            std::ptr::null(),
-            MS_BIND,
-            std::ptr::null(),
-        )
-    };
-    if mount_ret == 0 {
-        return Ok(true);
-    }
-    let err = std::io::Error::last_os_error();
-    if err.raw_os_error() == Some(16) {
-        return Ok(false);
-    }
-    Err(format!("bind mount {} -> {} failed: {}", source, target, err))
+    bind_mount_directory_if_needed(source, target)
 }
 
 fn ensure_pty_prerequisites() {
@@ -1788,53 +1982,65 @@ fn run_vsock_client(port: u32) -> Result<(), String> {
     const MAX_BACKOFF_MS: u64 = 2000;
 
     loop {
-        let fd = unsafe { socket(AF_VSOCK, SOCK_STREAM, 0) };
-        if fd < 0 {
-            log_line(&format!(
-                "socket(AF_VSOCK) failed: {}",
-                std::io::Error::last_os_error()
-            ));
-            thread::sleep(Duration::from_millis(backoff_ms));
-            backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
-            continue;
-        }
-
-        let addr = SockaddrVm {
-            svm_family: AF_VSOCK as u16,
-            svm_reserved1: 0,
-            svm_port: port,
-            svm_cid: VMADDR_CID_HOST,
-            svm_zero: [0; 4],
+        log_line(&format!("attempting vsock connect to host port {}", port));
+        let stream = match connect_vsock_stream(port) {
+            Ok(stream) => stream,
+            Err(err) => {
+                log_line(&format!("vsock connect to host port {} failed: {}", port, err));
+                thread::sleep(Duration::from_millis(backoff_ms));
+                backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
+                continue;
+            }
         };
-
-        let ret = unsafe { connect(fd, &addr, std::mem::size_of::<SockaddrVm>() as u32) };
-        if ret < 0 {
-            let err = std::io::Error::last_os_error();
-            log_line(&format!("vsock connect to host port {} failed: {}", port, err));
-            unsafe { close(fd); }
-            thread::sleep(Duration::from_millis(backoff_ms));
-            backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
-            continue;
-        }
 
         log_line(&format!("vsock connected to host port {}", port));
         backoff_ms = 100; // reset on successful connect
-
-        handle_persistent_connection(fd);
+        let mut stream = stream;
+        if let Err(err) = send_role_hello(&mut stream, "control") {
+            log_line(&format!("control hello send failed: {}", err));
+            drop(stream);
+            thread::sleep(Duration::from_millis(backoff_ms));
+            backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
+            continue;
+        }
+        log_line("control hello sent");
+        handle_persistent_connection(stream);
 
         log_line("vsock connection closed, reconnecting...");
-        // fd is closed by handle_persistent_connection (via File drop)
     }
 }
 
 fn connect_single_vsock_session(port: u32, role: &str) -> Result<(), String> {
+    log_line(&format!("attempting vsock connect to host port {} role={}", port, role));
+    let mut stream = connect_vsock_stream(port)
+        .map_err(|err| format!("vsock connect to host port {} failed for role={}: {}", port, role, err))?;
+    log_line(&format!("vsock connected to host port {} role={}", port, role));
+    send_role_hello(&mut stream, &format!("sideband:{}", role))?;
+    log_line(&format!("sideband hello sent role={}", role));
+    handle_persistent_connection(stream);
+    log_line(&format!("vsock connection closed role={}", role));
+    Ok(())
+}
+
+fn connect_vsock_stream(port: u32) -> Result<std::fs::File, String> {
     let fd = unsafe { socket(AF_VSOCK, SOCK_STREAM, 0) };
     if fd < 0 {
         return Err(format!(
-            "socket(AF_VSOCK) failed for role={}: {}",
-            role,
+            "socket(AF_VSOCK) failed: {}",
             std::io::Error::last_os_error()
         ));
+    }
+
+    let flags = unsafe { fcntl(fd, F_GETFL) };
+    if flags < 0 {
+        let err = std::io::Error::last_os_error();
+        unsafe { close(fd); }
+        return Err(format!("fcntl(F_GETFL) failed: {}", err));
+    }
+    if unsafe { fcntl(fd, F_SETFL, flags | O_NONBLOCK) } < 0 {
+        let err = std::io::Error::last_os_error();
+        unsafe { close(fd); }
+        return Err(format!("fcntl(F_SETFL, O_NONBLOCK) failed: {}", err));
     }
 
     let addr = SockaddrVm {
@@ -1846,29 +2052,56 @@ fn connect_single_vsock_session(port: u32, role: &str) -> Result<(), String> {
     };
 
     let ret = unsafe { connect(fd, &addr, std::mem::size_of::<SockaddrVm>() as u32) };
-    if ret < 0 {
-        let err = std::io::Error::last_os_error();
-        unsafe { close(fd); }
-        return Err(format!("vsock connect to host port {} failed for role={}: {}", port, role, err));
+    if ret == 0 {
+        if unsafe { fcntl(fd, F_SETFL, flags) } < 0 {
+            let err = std::io::Error::last_os_error();
+            unsafe { close(fd); }
+            return Err(format!("fcntl(F_SETFL) restore failed: {}", err));
+        }
+        return Ok(unsafe { FromRawFd::from_raw_fd(fd) });
     }
 
-    log_line(&format!("vsock connected to host port {} role={}", port, role));
-    handle_persistent_connection(fd);
-    log_line(&format!("vsock connection closed role={}", role));
-    Ok(())
+    let err = std::io::Error::last_os_error();
+    let raw = err.raw_os_error();
+    if raw != Some(libc::EINPROGRESS) && raw != Some(libc::EAGAIN) && raw != Some(libc::EINTR) {
+        unsafe { close(fd); }
+        return Err(err.to_string());
+    }
+
+    let mut pfd = PollFd {
+        fd,
+        events: POLLOUT,
+        revents: 0,
+    };
+    let poll_ret = unsafe { poll(&mut pfd, 1, 1000) };
+    if poll_ret == 0 {
+        unsafe { close(fd); }
+        return Err("connect timed out waiting for writable socket".to_string());
+    }
+    if poll_ret < 0 {
+        let poll_err = std::io::Error::last_os_error();
+        unsafe { close(fd); }
+        return Err(format!("poll during connect failed: {}", poll_err));
+    }
+
+    let retry = unsafe { connect(fd, &addr, std::mem::size_of::<SockaddrVm>() as u32) };
+    if retry < 0 {
+        let retry_err = std::io::Error::last_os_error();
+        if retry_err.raw_os_error() != Some(libc::EISCONN) {
+            unsafe { close(fd); }
+            return Err(retry_err.to_string());
+        }
+    }
+
+    if unsafe { fcntl(fd, F_SETFL, flags) } < 0 {
+        let err = std::io::Error::last_os_error();
+        unsafe { close(fd); }
+        return Err(format!("fcntl(F_SETFL) restore failed: {}", err));
+    }
+    Ok(unsafe { FromRawFd::from_raw_fd(fd) })
 }
 
-fn handle_persistent_connection(fd: i32) {
-    // SAFETY: fd is a valid file descriptor from connect()
-    let stream: std::fs::File = unsafe { FromRawFd::from_raw_fd(fd) };
-    let reader_stream = match stream.try_clone() {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-
-    let mut reader = BufReader::new(reader_stream);
-    let mut writer = stream;
-
+fn handle_persistent_connection(mut stream: std::fs::File) {
     loop {
         // Poll for data before blocking on frame read.
         // This prevents the connection handler from blocking indefinitely when the
@@ -1876,6 +2109,7 @@ fn handle_persistent_connection(fd: i32) {
         // Use -1 (infinite wait): the daemon owns the VM lifecycle and will
         // shut down msl-init by stopping the VM. No need for msl-init to
         // independently timeout the vsock connection.
+        let fd = stream.as_raw_fd();
         let mut rpfd = PollFd { fd, events: POLLIN, revents: 0 };
         let poll_ret = unsafe { poll(&mut rpfd, 1, -1) };
         if poll_ret == 0 {
@@ -1900,7 +2134,7 @@ fn handle_persistent_connection(fd: i32) {
             return;
         }
 
-        let request_frame = match read_frame(&mut reader) {
+        let request_frame = match read_frame(&mut stream) {
             Ok(Some(frame)) => frame,
             Ok(None) => {
                 log_line("vsock EOF from host");
@@ -1916,6 +2150,7 @@ fn handle_persistent_connection(fd: i32) {
             Ok(decoded) if decoded.magic == INIT_CHANNEL_FRAME_MAGIC => {
                 let decoded_op = decoded.opcode;
                 let decoded_header = decoded._header.clone();
+                log_line(&format!("direct_frame_received opcode={}", decoded_op));
                 let streamed = match decoded.opcode {
                     INIT_CHANNEL_FRAME_OPCODE_PROC_SUBSCRIBE_REQUEST => {
                         if let Some(proc_id) = extract_direct_string(&decoded_header, "procId") {
@@ -1923,7 +2158,7 @@ fn handle_persistent_connection(fd: i32) {
                         } else {
                             log_line("proc_subscribe_stream_started proc_id=unknown");
                         }
-                        if let Err(err) = handle_direct_proc_subscribe(decoded._header, &mut writer) {
+                        if let Err(err) = handle_direct_proc_subscribe(decoded._header, &mut stream) {
                             log_line(&format!("proc subscribe error: {}", err));
                         }
                         true
@@ -1934,7 +2169,7 @@ fn handle_persistent_connection(fd: i32) {
                         } else {
                             log_line("pty_subscribe_stream_started pty_id=unknown");
                         }
-                        if let Err(err) = handle_direct_pty_subscribe(decoded._header, &mut writer) {
+                        if let Err(err) = handle_direct_pty_subscribe(decoded._header, &mut stream) {
                             log_line(&format!("pty subscribe error: {}", err));
                         }
                         true
@@ -1950,16 +2185,27 @@ fn handle_persistent_connection(fd: i32) {
         }
 
         let response_frame = handle_frame(request_frame);
-        if writer.write_all(&response_frame).is_err() {
+        if stream.write_all(&response_frame).is_err() {
             log_line("vsock write error");
             return;
         }
-        if writer.flush().is_err() {
+        if stream.flush().is_err() {
             log_line("vsock flush error");
             return;
         }
     }
-    // writer (owning the fd) is dropped here, closing the fd
+    // stream (owning the fd) is dropped here, closing the fd
+}
+
+fn send_role_hello(stream: &mut std::fs::File, role: &str) -> Result<(), String> {
+    let line = format!("MSLB2 HELLO 1 {}", role);
+    stream
+        .write_all(format!("{line}\n").as_bytes())
+        .map_err(|e| format!("write role hello failed: {e}"))?;
+    stream
+        .flush()
+        .map_err(|e| format!("flush role hello failed: {e}"))?;
+    Ok(())
 }
 
 fn run_file_handoff_loop(handoff_file: &str, ack_file: &str) -> Result<(), String> {
@@ -2522,7 +2768,12 @@ fn handle_direct_proc_read(header: Vec<u8>) -> Vec<u8> {
             )
         }
     };
-    let timeout_ms = extract_direct_int(&header, "timeoutMs");
+    let requested_timeout_ms = extract_direct_int(&header, "timeoutMs");
+    log_line(&format!(
+        "proc_read_direct_received proc_id={} requested_timeout_ms={} effective_timeout_ms=0",
+        proc_id,
+        requested_timeout_ms.unwrap_or(-1)
+    ));
 
     let mut map = match proc_sessions().lock() {
         Ok(v) => v,
@@ -2546,7 +2797,9 @@ fn handle_direct_proc_read(header: Vec<u8>) -> Vec<u8> {
                 )
             }
         };
-        collect_proc_read_events(session, timeout_ms)
+        // Direct-frame clients already poll from the host side. Blocking here can
+        // stall the single control connection and delay terminal progress output.
+        collect_proc_read_events(session, Some(0))
     };
     if finalize {
         map.remove(&proc_id);
@@ -3030,19 +3283,11 @@ fn pty_open_response(request_id: &str, op: &str, line: &str) -> String {
     }
     let requested_cwd = extract_string(line, "cwd");
     let env_additions = extract_string_map(line, "envAdditions").unwrap_or_default();
+    let run_as_root = extract_bool(line, "runAsRoot").unwrap_or(false);
 
     let rows = extract_int(line, "rows").unwrap_or(24) as u16;
     let cols = extract_int(line, "cols").unwrap_or(80) as u16;
-    let runtime = runtime_user()
-        .lock()
-        .map(|v| v.clone())
-        .unwrap_or(RuntimeUserContext {
-            username: "root".to_string(),
-            uid: 0,
-            gid: 0,
-            home: "/root".to_string(),
-            shell: "/bin/sh".to_string(),
-        });
+    let runtime = runtime_context_for_request(run_as_root);
     let supplementary_gids = supplementary_gids_for_user(&runtime.username, runtime.gid);
 
     let started = Instant::now();
@@ -6057,11 +6302,21 @@ fn decode_json_string(input: &str) -> Option<(String, usize)> {
 }
 
 fn escape_json(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
-        .replace('\t', "\\t")
+    let mut escaped = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            '\u{08}' => escaped.push_str("\\b"),
+            '\u{0c}' => escaped.push_str("\\f"),
+            c if c <= '\u{1f}' => escaped.push_str(&format!("\\u{:04x}", c as u32)),
+            c => escaped.push(c),
+        }
+    }
+    escaped
 }
 
 #[cfg(test)]
@@ -6106,6 +6361,12 @@ mod tests {
                 ("NPM_CONFIG_CACHE".to_string(), "/tmp/npm".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn escape_json_escapes_ascii_control_characters() {
+        let escaped = escape_json("a\u{1b}b\u{0001}c");
+        assert_eq!(escaped, "a\\u001bb\\u0001c");
     }
 
     #[test]

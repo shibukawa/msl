@@ -71,16 +71,13 @@ instance_exists() {
 }
 
 if [ "$CLEAN_DISTROS" = "1" ]; then
-  echo "cleaning distros before imagewriter setup..."
+  echo "cleaning imagewriter instance before setup..."
   "$MSL_BIN" stop >/dev/null 2>&1 || true
-  INSTANCES="$($MSL_BIN list --all 2>/dev/null | sed -e 's/ \[default\]$//' | awk '{print $1}')"
-  if [ -n "$INSTANCES" ]; then
-    for name in $INSTANCES; do
-      echo "uninstalling instance (keep cache): $name"
-      "$MSL_BIN" uninstall --keep-cache "$name"
-    done
+  if "$MSL_BIN" list --all 2>/dev/null | sed -e 's/ \[default\]$//' | awk '{print $1}' | grep -Fx "$INSTANCE" >/dev/null 2>&1; then
+    echo "uninstalling imagewriter instance only (keep cache): $INSTANCE"
+    "$MSL_BIN" uninstall --keep-cache "$INSTANCE" >/dev/null 2>&1 || true
   else
-    echo "no installed instances to clean"
+    echo "imagewriter instance is not installed yet: $INSTANCE"
   fi
 fi
 

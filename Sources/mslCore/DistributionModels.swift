@@ -299,6 +299,38 @@ public struct DistributionNetworkPolicy: Codable, Equatable {
 }
 
 public struct DistributionInstanceMetadata: Codable, Equatable {
+    public enum StartupMode: String, Codable {
+        case interactive
+        case processFirst = "process-first"
+    }
+
+    public enum WorkloadKind: String, Codable {
+        case generic
+        case containerRuntime = "container-runtime"
+    }
+
+    public struct DefaultExec: Codable, Equatable {
+        public var argv: [String]
+        public var workingDir: String?
+        public var user: String?
+        public var env: [String]
+        public var source: String?
+
+        public init(
+            argv: [String],
+            workingDir: String? = nil,
+            user: String? = nil,
+            env: [String] = [],
+            source: String? = nil
+        ) {
+            self.argv = argv
+            self.workingDir = workingDir
+            self.user = user
+            self.env = env
+            self.source = source
+        }
+    }
+
     public struct TmpStoragePolicy: Codable, Equatable {
         public var mode: String
         public var sizeMiB: Int
@@ -422,6 +454,10 @@ public struct DistributionInstanceMetadata: Codable, Equatable {
     public var cacheSharing: CacheSharingConfig?
     public var imageMaintenance: ImageMaintenanceStatus?
     public var tmpStorage: TmpStoragePolicy?
+    public var defaultExec: DefaultExec?
+    public var shellAvailable: Bool?
+    public var startupMode: StartupMode?
+    public var workloadKind: WorkloadKind?
 
     public init(
         name: String,
@@ -439,7 +475,11 @@ public struct DistributionInstanceMetadata: Codable, Equatable {
         networkPolicy: DistributionNetworkPolicy? = nil,
         cacheSharing: CacheSharingConfig? = nil,
         imageMaintenance: ImageMaintenanceStatus? = nil,
-        tmpStorage: TmpStoragePolicy? = nil
+        tmpStorage: TmpStoragePolicy? = nil,
+        defaultExec: DefaultExec? = nil,
+        shellAvailable: Bool? = nil,
+        startupMode: StartupMode? = nil,
+        workloadKind: WorkloadKind? = nil
     ) {
         self.name = name
         self.distroFamily = distroFamily
@@ -457,6 +497,18 @@ public struct DistributionInstanceMetadata: Codable, Equatable {
         self.cacheSharing = cacheSharing
         self.imageMaintenance = imageMaintenance
         self.tmpStorage = tmpStorage
+        self.defaultExec = defaultExec
+        self.shellAvailable = shellAvailable
+        self.startupMode = startupMode
+        self.workloadKind = workloadKind
+    }
+
+    public func resolvedStartupMode() -> StartupMode {
+        startupMode ?? .interactive
+    }
+
+    public func resolvedWorkloadKind() -> WorkloadKind {
+        workloadKind ?? .generic
     }
 
     public static func defaultTmpStoragePolicyForNewInstance() -> TmpStoragePolicy {
@@ -542,19 +594,34 @@ public struct ResolvedContainerImage: Codable, Equatable {
     public var digest: String
     public var platform: String
     public var manifestDigest: String?
+    public var entrypoint: [String]?
+    public var cmd: [String]?
+    public var user: String?
+    public var workingDir: String?
+    public var env: [String]
 
     public init(
         reference: ContainerImageReference,
         resolvedReference: String,
         digest: String,
         platform: String,
-        manifestDigest: String? = nil
+        manifestDigest: String? = nil,
+        entrypoint: [String]? = nil,
+        cmd: [String]? = nil,
+        user: String? = nil,
+        workingDir: String? = nil,
+        env: [String] = []
     ) {
         self.reference = reference
         self.resolvedReference = resolvedReference
         self.digest = digest
         self.platform = platform
         self.manifestDigest = manifestDigest
+        self.entrypoint = entrypoint
+        self.cmd = cmd
+        self.user = user
+        self.workingDir = workingDir
+        self.env = env
     }
 }
 
@@ -562,4 +629,5 @@ enum DistributionSourceSelection {
     case manifest(DistributionManifestEntry)
     case localFile(URL)
     case containerRemote(ContainerImageReference)
+    case containerRuntime
 }

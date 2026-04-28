@@ -9,6 +9,8 @@ fi
 MODE="legacy"
 ROOTFS_ARCHIVE=""
 ROOTFS_SOURCE_DIR=""
+OCI_LAYOUT_DIR=""
+EXTRA_FILES_BUNDLE=""
 OUTPUT_IMAGE=""
 FS_TYPE="btrfs"
 SIZE_MB="0"
@@ -16,12 +18,17 @@ INIT_BINARY=""
 PACKAGES=""
 APK_CACHE_DIR=""
 APK_RETRY_LIMIT="5"
+RUNTIME_SUMMARY_PATH=""
+DEFAULT_EXEC_ARGV_B64=""
+DEFAULT_EXEC_ENV_B64=""
+DEFAULT_EXEC_WORKDIR=""
+DEFAULT_EXEC_USER=""
 
 usage() {
   cat >&2 <<'EOF_USAGE'
 usage:
   imagewriter-build-guest.sh --mode stage1 (--rootfs <rootfs-archive> | --rootfs-dir <rootfs-dir>) --output <output-image> --size-mb <n> [--init-binary <path>] [--packages "<apk packages>"]
-  imagewriter-build-guest.sh --mode stage2 --fs-type <btrfs|erofs> (--rootfs <rootfs-archive> | --rootfs-dir <rootfs-dir>) --output <output-image> --size-mb <n> [--init-binary <path>] [--packages "<apk packages>"]
+  imagewriter-build-guest.sh --mode stage2 --fs-type <btrfs|erofs> (--rootfs <rootfs-archive> | --rootfs-dir <rootfs-dir> | --oci-layout-dir <oci-layout-dir>) [--extra-files-bundle <bundle-dir>] --output <output-image> --size-mb <n> [--init-binary <path>] [--packages "<apk packages>"]
 
 legacy:
   imagewriter-build-guest.sh <rootfs-archive> <output-image> [btrfs|erofs|ext4] <size-mb> [init-binary]
@@ -56,6 +63,14 @@ if [ "$#" -gt 0 ] && [ "${1#--}" != "$1" ]; then
         ROOTFS_SOURCE_DIR="${2:-}"
         shift 2
         ;;
+      --oci-layout-dir)
+        OCI_LAYOUT_DIR="${2:-}"
+        shift 2
+        ;;
+      --extra-files-bundle)
+        EXTRA_FILES_BUNDLE="${2:-}"
+        shift 2
+        ;;
       --output)
         OUTPUT_IMAGE="${2:-}"
         shift 2
@@ -82,6 +97,26 @@ if [ "$#" -gt 0 ] && [ "${1#--}" != "$1" ]; then
         ;;
       --retry-limit)
         APK_RETRY_LIMIT="${2:-}"
+        shift 2
+        ;;
+      --runtime-summary)
+        RUNTIME_SUMMARY_PATH="${2:-}"
+        shift 2
+        ;;
+      --default-exec-argv-b64)
+        DEFAULT_EXEC_ARGV_B64="${2:-}"
+        shift 2
+        ;;
+      --default-exec-env-b64)
+        DEFAULT_EXEC_ENV_B64="${2:-}"
+        shift 2
+        ;;
+      --default-exec-workdir)
+        DEFAULT_EXEC_WORKDIR="${2:-}"
+        shift 2
+        ;;
+      --default-exec-user)
+        DEFAULT_EXEC_USER="${2:-}"
         shift 2
         ;;
       --help|-h)
@@ -129,8 +164,8 @@ case "$MODE" in
     ;;
   stage2)
     FS_TYPE="${FS_TYPE:-erofs}"
-    if { [ -z "$ROOTFS_ARCHIVE" ] && [ -z "$ROOTFS_SOURCE_DIR" ]; } || [ -z "$OUTPUT_IMAGE" ]; then
-      echo "error: stage2 requires --rootfs/--rootfs-dir and --output" >&2
+    if { [ -z "$ROOTFS_ARCHIVE" ] && [ -z "$ROOTFS_SOURCE_DIR" ] && [ -z "$OCI_LAYOUT_DIR" ]; } || [ -z "$OUTPUT_IMAGE" ]; then
+      echo "error: stage2 requires --rootfs/--rootfs-dir/--oci-layout-dir and --output" >&2
       usage
       exit 1
     fi
@@ -162,8 +197,12 @@ case "$MODE" in
     ;;
 esac
 
-if [ -n "$ROOTFS_ARCHIVE" ] && [ -n "$ROOTFS_SOURCE_DIR" ]; then
-  echo "error: specify only one of --rootfs or --rootfs-dir" >&2
+source_count=0
+[ -n "$ROOTFS_ARCHIVE" ] && source_count=$((source_count + 1))
+[ -n "$ROOTFS_SOURCE_DIR" ] && source_count=$((source_count + 1))
+[ -n "$OCI_LAYOUT_DIR" ] && source_count=$((source_count + 1))
+if [ "$source_count" -gt 1 ]; then
+  echo "error: specify only one of --rootfs, --rootfs-dir, or --oci-layout-dir" >&2
   exit 1
 fi
 if [ -n "$ROOTFS_ARCHIVE" ] && [ ! -f "$ROOTFS_ARCHIVE" ]; then
@@ -172,6 +211,14 @@ if [ -n "$ROOTFS_ARCHIVE" ] && [ ! -f "$ROOTFS_ARCHIVE" ]; then
 fi
 if [ -n "$ROOTFS_SOURCE_DIR" ] && [ ! -d "$ROOTFS_SOURCE_DIR" ]; then
   echo "error: rootfs directory not found: $ROOTFS_SOURCE_DIR" >&2
+  exit 1
+fi
+if [ -n "$OCI_LAYOUT_DIR" ] && [ ! -d "$OCI_LAYOUT_DIR" ]; then
+  echo "error: OCI layout directory not found: $OCI_LAYOUT_DIR" >&2
+  exit 1
+fi
+if [ -n "$EXTRA_FILES_BUNDLE" ] && [ ! -d "$EXTRA_FILES_BUNDLE" ]; then
+  echo "error: extra files bundle not found: $EXTRA_FILES_BUNDLE" >&2
   exit 1
 fi
 if [ -n "$INIT_BINARY" ] && [ ! -f "$INIT_BINARY" ]; then
@@ -201,6 +248,15 @@ progress_step() {
     i=$((i + 1))
   done
   echo "imagewriter guest progress: [${bar}] ${percent}% - $1"
+}
+
+fail_guest_stage() {
+  stage="$1"
+  code="${2:-1}"
+  shift 2
+  message="$*"
+  echo "imagewriter_guest_failure stage=$stage code=$code message=$message" >&2
+  exit "$code"
 }
 
 detect_image_fs_type() {
@@ -482,6 +538,30 @@ install_packages() {
 extract_rootfs() {
   rm -rf "$ROOTFS_DIR"
   mkdir -p "$ROOTFS_DIR"
+  if [ -n "$OCI_LAYOUT_DIR" ]; then
+    bundle_dir="$WORK_DIR/oci-bundle"
+    rm -rf "$bundle_dir"
+    umoci_bin="$(resolve_injected_umoci)"
+    if [ -z "$umoci_bin" ]; then
+      fail_guest_stage "container_unpack" 26 "umoci command not found in guest worker environment"
+    fi
+    if ! "$umoci_bin" unpack --rootless --image "$OCI_LAYOUT_DIR:image" "$bundle_dir"; then
+      fail_guest_stage "container_unpack" 26 "guest umoci unpack failed for OCI layout: $OCI_LAYOUT_DIR"
+    fi
+    if [ ! -d "$bundle_dir/rootfs" ]; then
+      fail_guest_stage "container_unpack" 26 "guest umoci unpack completed without rootfs: $OCI_LAYOUT_DIR"
+    fi
+    if [ -x "$bundle_dir/rootfs/bin/sh" ]; then
+      echo "imagewriter_runtime_probe shell=/bin/sh exists=true"
+    else
+      echo "imagewriter_runtime_probe shell=/bin/sh exists=false"
+    fi
+    if ! tar -C "$bundle_dir/rootfs" -cf - . | tar -C "$ROOTFS_DIR" -xf -; then
+      fail_guest_stage "rootfs_copy" 26 "failed to copy unpacked OCI rootfs into guest work dir"
+    fi
+    normalize_root_fstab
+    return
+  fi
   if [ -n "$ROOTFS_SOURCE_DIR" ]; then
     cp -R "$ROOTFS_SOURCE_DIR"/. "$ROOTFS_DIR"/
     normalize_root_fstab
@@ -504,14 +584,178 @@ extract_rootfs() {
   normalize_root_fstab
 }
 
+install_extra_files() {
+  if [ -z "$EXTRA_FILES_BUNDLE" ]; then
+    return 0
+  fi
+  manifest_lines="$EXTRA_FILES_BUNDLE/manifest.lines"
+  if [ ! -f "$manifest_lines" ]; then
+    fail_guest_stage "extra_files" 26 "extra files manifest is missing staged line spec: $manifest_lines"
+  fi
+  while IFS="$(printf '\t')" read -r source_rel guest_path mode; do
+    [ -n "$source_rel" ] || continue
+    source_path="$EXTRA_FILES_BUNDLE/$source_rel"
+    if [ ! -f "$source_path" ]; then
+      fail_guest_stage "extra_files" 26 "extra file source missing: $source_path"
+    fi
+    case "$guest_path" in
+      /*) target_path="$guest_path" ;;
+      *) target_path="$WORK_DIR/$guest_path" ;;
+    esac
+    case "$target_path" in
+      "$WORK_DIR"/*) ;;
+      *)
+        fail_guest_stage "extra_files" 26 "extra file guestPath must stay under work dir: $guest_path"
+        ;;
+    esac
+    mkdir -p "$(dirname "$target_path")"
+    cp -f "$source_path" "$target_path"
+    chmod "$mode" "$target_path"
+  done < "$manifest_lines"
+}
+
+resolve_injected_umoci() {
+  candidate="$WORK_DIR/extras/umoci"
+  if [ -x "$candidate" ]; then
+    printf '%s\n' "$candidate"
+    return 0
+  fi
+  if command -v umoci >/dev/null 2>&1; then
+    command -v umoci
+    return 0
+  fi
+  printf '%s\n' ""
+}
+
+decode_b64() {
+  value="$1"
+  if [ -z "$value" ]; then
+    return 0
+  fi
+  printf '%s' "$value" | base64 -d
+}
+
+resolve_default_exec_to_file() {
+  output_file="$1"
+  : > "$output_file"
+  if [ -z "$DEFAULT_EXEC_ARGV_B64" ]; then
+    return 1
+  fi
+
+  argv_file="$WORK_DIR/default-exec.argv"
+  env_file="$WORK_DIR/default-exec.env"
+  decode_b64 "$DEFAULT_EXEC_ARGV_B64" > "$argv_file"
+  decode_b64 "$DEFAULT_EXEC_ENV_B64" > "$env_file"
+
+  cmd0=""
+  rest_file="$WORK_DIR/default-exec-rest.argv"
+  : > "$rest_file"
+  first=1
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [ "$first" -eq 1 ]; then
+      cmd0="$line"
+      first=0
+    else
+      printf '%s\n' "$line" >> "$rest_file"
+    fi
+  done < "$argv_file"
+
+  [ -n "$cmd0" ] || return 1
+  path_value="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  while IFS= read -r env_line || [ -n "$env_line" ]; do
+    case "$env_line" in
+      PATH=*)
+        path_value="${env_line#PATH=}"
+        ;;
+    esac
+  done < "$env_file"
+
+  resolved=""
+  case "$cmd0" in
+    /*)
+      candidate="$ROOTFS_DIR${cmd0}"
+      if [ -f "$candidate" ] && [ -x "$candidate" ]; then
+        resolved="$cmd0"
+      fi
+      ;;
+    *)
+      old_ifs="${IFS}"
+      IFS=':'
+      set -- $path_value
+      IFS="${old_ifs}"
+      for entry in "$@"; do
+        [ -n "$entry" ] || entry="."
+        case "$entry" in
+          /*) rel="${entry#/}" ;;
+          *) rel="$entry" ;;
+        esac
+        candidate="$ROOTFS_DIR/$rel/$cmd0"
+        if [ -f "$candidate" ] && [ -x "$candidate" ]; then
+          case "$entry" in
+            /*) resolved="$entry/$cmd0" ;;
+            *) resolved="/$entry/$cmd0" ;;
+          esac
+          break
+        fi
+      done
+      ;;
+  esac
+
+  [ -n "$resolved" ] || return 1
+  echo "imagewriter_default_exec_resolved command=$cmd0 path=$resolved"
+  printf '%s\n' "$resolved" > "$output_file"
+  cat "$rest_file" >> "$output_file"
+  return 0
+}
+
+write_runtime_summary() {
+  if [ -z "$RUNTIME_SUMMARY_PATH" ]; then
+    return 0
+  fi
+  shell_available=0
+  for shell in /bin/sh /bin/bash /bin/ash; do
+    if [ -x "$ROOTFS_DIR${shell}" ]; then
+      shell_available=1
+      break
+    fi
+  done
+
+  resolved_argv_file="$WORK_DIR/default-exec-resolved.argv"
+  resolved_env_file="$WORK_DIR/default-exec.env"
+  has_default_exec=0
+  if resolve_default_exec_to_file "$resolved_argv_file"; then
+    has_default_exec=1
+  fi
+
+  if [ "$shell_available" -eq 0 ] && [ "$has_default_exec" -eq 0 ]; then
+    fail_guest_stage "runtime_validation" 26 "container rootfs has no usable shell and no resolvable default command"
+  fi
+
+  mkdir -p "$(dirname "$RUNTIME_SUMMARY_PATH")"
+  if [ "$has_default_exec" -eq 1 ]; then
+    default_exec_argv_b64="$(base64 < "$resolved_argv_file" | tr -d '\n')"
+    default_exec_env_b64="$(base64 < "$resolved_env_file" | tr -d '\n')"
+  else
+    default_exec_argv_b64=""
+    default_exec_env_b64=""
+  fi
+  {
+    printf 'SHELL_AVAILABLE=%s\n' "$([ "$shell_available" -eq 1 ] && echo true || echo false)"
+    printf 'DEFAULT_EXEC_ARGV_B64=%s\n' "$default_exec_argv_b64"
+    printf 'DEFAULT_EXEC_ENV_B64=%s\n' "$default_exec_env_b64"
+    printf 'DEFAULT_EXEC_WORKDIR=%s\n' "$DEFAULT_EXEC_WORKDIR"
+    printf 'DEFAULT_EXEC_USER=%s\n' "$DEFAULT_EXEC_USER"
+  } > "$RUNTIME_SUMMARY_PATH"
+}
+
 install_init_binary() {
   if [ -z "$INIT_BINARY" ]; then
     return
   fi
-  mkdir -p "$ROOTFS_DIR/sbin" "$ROOTFS_DIR/usr/local/bin"
-  cp -f "$INIT_BINARY" "$ROOTFS_DIR/sbin/msl-init-bootloader"
-  cp -f "$INIT_BINARY" "$ROOTFS_DIR/usr/local/bin/msl-init-bootloader"
-  chmod 0755 "$ROOTFS_DIR/sbin/msl-init-bootloader" "$ROOTFS_DIR/usr/local/bin/msl-init-bootloader"
+  mkdir -p "$ROOTFS_DIR/sbin" "$ROOTFS_DIR/usr/local/bin" || fail_guest_stage "init_injection" 1 "failed to create init target directories"
+  cp -f "$INIT_BINARY" "$ROOTFS_DIR/sbin/msl-init-bootloader" || fail_guest_stage "init_injection" 1 "failed to install init bootloader into /sbin"
+  cp -f "$INIT_BINARY" "$ROOTFS_DIR/usr/local/bin/msl-init-bootloader" || fail_guest_stage "init_injection" 1 "failed to install init bootloader into /usr/local/bin"
+  chmod 0755 "$ROOTFS_DIR/sbin/msl-init-bootloader" "$ROOTFS_DIR/usr/local/bin/msl-init-bootloader" || fail_guest_stage "init_injection" 1 "failed to chmod init bootloader"
 
   SERVICE_MANAGER="$(detect_service_manager)"
   case "$SERVICE_MANAGER" in
@@ -531,26 +775,25 @@ build_from_source_dir() {
   source_dir="$1"
   case "$FS_TYPE" in
     btrfs)
-      truncate -s "${SIZE_MB}M" "$OUTPUT_IMAGE"
+      truncate -s "${SIZE_MB}M" "$OUTPUT_IMAGE" || fail_guest_stage "image_build" 1 "failed to allocate btrfs output image"
       progress_step "allocated output image"
-      mkfs.btrfs -f "$OUTPUT_IMAGE" >/dev/null
-      mount -o loop "$OUTPUT_IMAGE" "$OUTPUT_MOUNT_DIR"
+      mkfs.btrfs -f "$OUTPUT_IMAGE" >/dev/null || fail_guest_stage "image_build" 1 "mkfs.btrfs failed"
+      mount -o loop "$OUTPUT_IMAGE" "$OUTPUT_MOUNT_DIR" || fail_guest_stage "image_build" 1 "failed to mount btrfs output image"
       prepare_btrfs_policy "$OUTPUT_MOUNT_DIR"
       ;;
     ext4)
-      truncate -s "${SIZE_MB}M" "$OUTPUT_IMAGE"
+      truncate -s "${SIZE_MB}M" "$OUTPUT_IMAGE" || fail_guest_stage "image_build" 1 "failed to allocate ext4 output image"
       progress_step "allocated output image"
-      mkfs.ext4 -q -F -E lazy_itable_init=1,lazy_journal_init=1 "$OUTPUT_IMAGE"
-      mount -o loop "$OUTPUT_IMAGE" "$OUTPUT_MOUNT_DIR"
+      mkfs.ext4 -q -F -E lazy_itable_init=1,lazy_journal_init=1 "$OUTPUT_IMAGE" || fail_guest_stage "image_build" 1 "mkfs.ext4 failed"
+      mount -o loop "$OUTPUT_IMAGE" "$OUTPUT_MOUNT_DIR" || fail_guest_stage "image_build" 1 "failed to mount ext4 output image"
       ;;
     erofs)
       rm -f "$OUTPUT_IMAGE"
       progress_step "prepared erofs output path"
       if ! command -v mkfs.erofs >/dev/null 2>&1; then
-        echo "error: mkfs.erofs command not found" >&2
-        exit 1
+        fail_guest_stage "image_build" 1 "mkfs.erofs command not found"
       fi
-      mkfs.erofs "$OUTPUT_IMAGE" "$source_dir" >/dev/null
+      mkfs.erofs "$OUTPUT_IMAGE" "$source_dir" >/dev/null || fail_guest_stage "image_build" 1 "mkfs.erofs failed"
       progress_step "built erofs image"
       max_bytes=$((SIZE_MB * 1024 * 1024))
       actual_bytes="$(stat -c %s "$OUTPUT_IMAGE" 2>/dev/null || stat -f %z "$OUTPUT_IMAGE" 2>/dev/null || echo 0)"
@@ -560,8 +803,7 @@ build_from_source_dir() {
           ;;
       esac
       if [ "$actual_bytes" -gt "$max_bytes" ]; then
-        echo "error: erofs image exceeds requested size-mb: actual_bytes=$actual_bytes limit_bytes=$max_bytes" >&2
-        exit 1
+        fail_guest_stage "image_build" 1 "erofs image exceeds requested size-mb: actual_bytes=$actual_bytes limit_bytes=$max_bytes"
       fi
       verify_output_fs_type "erofs"
       return
@@ -569,7 +811,9 @@ build_from_source_dir() {
   esac
   progress_step "formatted and mounted output filesystem"
 
-  tar -C "$source_dir" -cf - . | tar -C "$OUTPUT_MOUNT_DIR" -xf -
+  if ! tar -C "$source_dir" -cf - . | tar -C "$OUTPUT_MOUNT_DIR" -xf -; then
+    fail_guest_stage "image_build" 1 "failed to copy source contents into output image"
+  fi
   progress_step "copied source contents into image"
 
   if [ "$FS_TYPE" = "btrfs" ]; then
@@ -591,8 +835,10 @@ trap cleanup EXIT INT TERM
 echo "imagewriter_guest_stage_start mode=$MODE fs=$FS_TYPE output=$OUTPUT_IMAGE"
 case "$MODE" in
   stage1|stage2|legacy)
+    install_extra_files
     extract_rootfs
     progress_step "extracted rootfs archive"
+    write_runtime_summary
     install_init_binary
     install_packages
     progress_step "installed stage packages"

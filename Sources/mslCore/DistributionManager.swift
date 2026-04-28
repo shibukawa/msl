@@ -108,16 +108,33 @@ struct ProcessExecutor {
 private struct RootFSMaterializationResult {
     var source: DistributionSourceSelection
     var sourceRecord: DistributionSourceRecord
-    var rootfsDir: URL
+    var rootfsDir: URL?
+    var ociLayoutDir: URL?
+    var defaultExec: DistributionInstanceMetadata.DefaultExec?
+    var shellAvailable: Bool?
+    var imagewriterPackages: String?
     var sourceArchivePath: String?
     var cleanupRoot: URL
 }
 
+private struct ContainerRuntimeValidationSummary {
+    var shellAvailable: Bool
+    var resolvedDefaultExec: DistributionInstanceMetadata.DefaultExec?
+}
+
 final class DistributionManager {
-    static let reservedInternalInstanceNames: Set<String> = ["_imagewriter"]
+    static let reservedInternalInstanceNames: Set<String> = ["_imagewriter", "_container"]
     static let defaultBootstrapDiskSizeGB = 8
     static let defaultInternalImagewriterBootstrapDiskSizeGB = 1
     static let defaultImagewriterDiskSizeGB = 16
+    private static let containerRuntimeAlias = "container-runtime"
+    private static let containerRuntimeInstanceName = "_container"
+    private static let defaultImagewriterPackages = "btrfs-progs e2fsprogs erofs-utils util-linux tar zstd xz coreutils"
+    private static let containerRuntimeImagewriterPackages = [
+        "btrfs-progs", "e2fsprogs", "erofs-utils", "util-linux", "tar", "zstd", "xz", "coreutils",
+        "openrc", "bash", "ca-certificates", "iproute2", "iptables", "nftables",
+        "containerd", "buildkit", "nerdctl", "runc", "cni-plugins"
+    ].joined(separator: " ")
 
     private let paths: MSLPaths
     private let logger: MSLLogger
@@ -143,11 +160,12 @@ final class DistributionManager {
     }
 
     func installableDistributionNames() -> [String] {
-        manifestStore.installableNames()
+        installableDistributions().map(\.canonicalName)
     }
 
     func installableDistributions() -> [DistributionInstallDescriptor] {
         manifestStore.installableDescriptors()
+            .sorted { $0.canonicalName.localizedCaseInsensitiveCompare($1.canonicalName) == .orderedAscending }
     }
 
     func installedInstances(includeReserved: Bool = false) -> [InstalledInstanceDescriptor] {
@@ -306,6 +324,8 @@ final class DistributionManager {
             return try cacheLocalFile(url, force: force)
         case .containerRemote:
             throw MSLRuntimeError("cache fetch does not support --from-container")
+        case .containerRuntime:
+            throw MSLRuntimeError("cache fetch does not support synthetic container-runtime")
         }
     }
 
@@ -398,6 +418,8 @@ final class DistributionManager {
             )
         case .containerRemote:
             throw MSLRuntimeError("container sources are not supported for bootstrap installs")
+        case .containerRuntime:
+            throw MSLRuntimeError("container-runtime is not supported for bootstrap installs")
         }
 
         let defaultKernelProfileRef = try? DefaultInstanceStore(paths: paths, fileManager: fileManager).loadDefaultKernelProfileRef()
@@ -455,6 +477,7 @@ final class DistributionManager {
         targetAlias: String?,
         localFilePath: String?,
         containerImageRef: String? = nil,
+        containerEntrypointOverride: [String]? = nil,
         rebuild: Bool,
         diskSizeGB: Int?,
         mslExecutablePath: String
@@ -501,6 +524,7 @@ final class DistributionManager {
                 targetAlias: targetAlias,
                 localFilePath: localFilePath,
                 containerImageRef: containerImageRef,
+                containerEntrypointOverride: containerEntrypointOverride,
                 instanceName: name
             )
             defer { try? fileManager.removeItem(at: materialized.cleanupRoot) }
@@ -509,6 +533,11 @@ final class DistributionManager {
             let requestedSizeGB = diskSizeGB ?? Self.defaultImagewriterDiskSizeGB
             let requestedSizeMB = max(1, requestedSizeGB) * 1024
             let initBinaryPath = try resolveImagewriterBootloaderBinaryPath()
+            let runtimeSummaryURL = materialized.cleanupRoot.appendingPathComponent("container-runtime-summary.json", isDirectory: false)
+            let extraGuestFilesBundleURL = try createImagewriterExtraFilesBundle(
+                for: materialized,
+                cleanupRoot: materialized.cleanupRoot
+            )
 
             emitStatus("install: creating btrfs disk image via imagewriter")
             didRunImagewriterBuild = true
@@ -516,12 +545,26 @@ final class DistributionManager {
                 scriptPath: imagewriterScript,
                 mslExecutablePath: mslExecutablePath,
                 rootfsTarballPath: nil,
-                rootfsDirectoryPath: materialized.rootfsDir.path,
+                rootfsDirectoryPath: materialized.rootfsDir?.path,
+                ociLayoutDirectoryPath: materialized.ociLayoutDir?.path,
                 outputDiskPath: diskFile.path,
                 sizeMB: requestedSizeMB,
                 initBinaryPath: initBinaryPath,
+                imagewriterPackages: materialized.imagewriterPackages,
+                extraGuestFilesBundlePath: extraGuestFilesBundleURL?.path,
+                runtimeValidationSummaryPath: materialized.ociLayoutDir == nil ? nil : runtimeSummaryURL.path,
+                requestedDefaultExec: materialized.defaultExec,
                 source: materialized.source
             )
+            var runtimeValidation = try resolveRuntimeValidationSummary(
+                for: materialized,
+                runtimeSummaryURL: runtimeSummaryURL
+            )
+            if runtimeValidation.resolvedDefaultExec?.source == nil,
+               let source = materialized.defaultExec?.source,
+               runtimeValidation.resolvedDefaultExec != nil {
+                runtimeValidation.resolvedDefaultExec?.source = source
+            }
 
             let defaultKernelProfileRef = try? DefaultInstanceStore(paths: paths, fileManager: fileManager).loadDefaultKernelProfileRef()
             let env = ProcessInfo.processInfo.environment
@@ -560,7 +603,14 @@ final class DistributionManager {
                 compressionPolicy: compressionPolicy,
                 networkPolicy: initialNetworkPolicy(),
                 cacheSharing: initialCacheSharing,
-                tmpStorage: DistributionInstanceMetadata.defaultTmpStoragePolicy(forNewInstanceNamed: name)
+                tmpStorage: DistributionInstanceMetadata.defaultTmpStoragePolicy(forNewInstanceNamed: name),
+                defaultExec: runtimeValidation.resolvedDefaultExec,
+                shellAvailable: runtimeValidation.shellAvailable,
+                startupMode: resolveStartupMode(
+                    source: materialized.sourceRecord,
+                    shellAvailable: runtimeValidation.shellAvailable
+                ),
+                workloadKind: resolveWorkloadKind(source: materialized.sourceRecord)
             )
             try writeJSON(materialized.sourceRecord, to: sourceFile)
             try writeJSON(metadata, to: metadataFile)
@@ -689,6 +739,7 @@ final class DistributionManager {
         targetAlias: String?,
         localFilePath: String?,
         containerImageRef: String?,
+        containerEntrypointOverride: [String]? = nil,
         instanceName: String
     ) throws -> RootFSMaterializationResult {
         let source = try resolveSource(
@@ -725,6 +776,10 @@ final class DistributionManager {
                     verifiedAtEpochMs: verified.verifiedAtEpochMs
                 ),
                 rootfsDir: rootfsDir,
+                ociLayoutDir: nil,
+                defaultExec: nil,
+                shellAvailable: true,
+                imagewriterPackages: nil,
                 sourceArchivePath: tarballURL.path,
                 cleanupRoot: stagingRoot
             )
@@ -751,6 +806,10 @@ final class DistributionManager {
                     verifiedAtEpochMs: verified.verifiedAtEpochMs
                 ),
                 rootfsDir: rootfsDir,
+                ociLayoutDir: nil,
+                defaultExec: nil,
+                shellAvailable: true,
+                imagewriterPackages: nil,
                 sourceArchivePath: tarballURL.path,
                 cleanupRoot: stagingRoot
             )
@@ -758,12 +817,10 @@ final class DistributionManager {
             emitStatus("install: resolving container image")
             let resolved = try resolveContainerImage(reference)
             emitStatus("install: fetching container layers")
-            let tarballFileName = try materializeContainerRootFS(
+            let (tarballFileName, ociLayoutDir) = try materializeContainerRootFS(
                 resolved,
-                rootfsDir: rootfsDir,
                 cleanupRoot: stagingRoot
             )
-            try validateRuntimeShell(in: rootfsDir)
             return RootFSMaterializationResult(
                 source: source,
                 sourceRecord: DistributionSourceRecord(
@@ -784,8 +841,57 @@ final class DistributionManager {
                     digest: resolved.digest,
                     platform: resolved.platform
                 ),
-                rootfsDir: rootfsDir,
+                rootfsDir: nil,
+                ociLayoutDir: ociLayoutDir,
+                defaultExec: initialContainerDefaultExec(
+                    for: resolved,
+                    overrideArgv: containerEntrypointOverride
+                ),
+                shellAvailable: nil,
+                imagewriterPackages: nil,
                 sourceArchivePath: nil,
+                cleanupRoot: stagingRoot
+            )
+        case .containerRuntime:
+            guard let alpineEntry = manifestStore.resolve(alias: "alpine") else {
+                throw MSLRuntimeError("embedded manifest is missing alpine base for container-runtime")
+            }
+            try manifestStore.validate(alpineEntry)
+            emitStatus("install: fetching runtime base rootfs")
+            let verified = try fetchManifestEntry(alpineEntry, force: false)
+            let tarballURL = URL(fileURLWithPath: verified.tarballPath)
+            emitStatus("install: validating runtime base archive")
+            try validateTarArchiveEntries(tarballURL)
+            emitStatus("install: extracting runtime base rootfs")
+            try extractTarArchive(tarballURL, to: rootfsDir)
+            try normalizeContainerRootFSPermissions(rootfsDir: rootfsDir)
+            try configureContainerRuntimeRootFS(rootfsDir: rootfsDir)
+            return RootFSMaterializationResult(
+                source: source,
+                sourceRecord: DistributionSourceRecord(
+                    sourceType: "container-runtime",
+                    distro: "alpine",
+                    version: alpineEntry.version,
+                    arch: alpineEntry.arch,
+                    manifestId: alpineEntry.id,
+                    localPath: nil,
+                    tarballFileName: tarballURL.lastPathComponent,
+                    sha256: verified.sha256,
+                    verifiedAtEpochMs: verified.verifiedAtEpochMs
+                ),
+                rootfsDir: rootfsDir,
+                ociLayoutDir: nil,
+                defaultExec: DistributionInstanceMetadata.DefaultExec(
+                    argv: ["/usr/local/bin/nerdctl", "help"],
+                    env: [
+                        "CONTAINERD_ADDRESS=/run/containerd/containerd.sock",
+                        "BUILDKIT_HOST=unix:///run/buildkit/buildkitd.sock"
+                    ],
+                    source: "runtime-default"
+                ),
+                shellAvailable: true,
+                imagewriterPackages: Self.containerRuntimeImagewriterPackages,
+                sourceArchivePath: tarballURL.path,
                 cleanupRoot: stagingRoot
             )
         }
@@ -804,6 +910,145 @@ final class DistributionManager {
             }
         }
         throw MSLRuntimeError("rootfs is not supported: no usable shell found (/bin/sh, /bin/bash, /bin/ash)")
+    }
+
+    private func initialContainerDefaultExec(
+        for resolved: ResolvedContainerImage,
+        overrideArgv: [String]? = nil
+    ) -> DistributionInstanceMetadata.DefaultExec? {
+        let cleanOverride = (overrideArgv ?? [])
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        let argv = cleanOverride.isEmpty
+            ? mergedContainerDefaultCommand(entrypoint: resolved.entrypoint, cmd: resolved.cmd)
+            : cleanOverride
+        guard let argv, !argv.isEmpty else {
+            return nil
+        }
+        return DistributionInstanceMetadata.DefaultExec(
+            argv: argv,
+            workingDir: resolved.workingDir,
+            user: resolved.user,
+            env: resolved.env,
+            source: cleanOverride.isEmpty ? "image-config" : "install-override"
+        )
+    }
+
+    private func mergedContainerDefaultCommand(entrypoint: [String]?, cmd: [String]?) -> [String]? {
+        let cleanEntrypoint = (entrypoint ?? []).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+        let cleanCmd = (cmd ?? []).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+        if !cleanEntrypoint.isEmpty {
+            return cleanEntrypoint + cleanCmd
+        }
+        if !cleanCmd.isEmpty {
+            return cleanCmd
+        }
+        return nil
+    }
+
+    private func resolveRuntimeValidationSummary(
+        for materialized: RootFSMaterializationResult,
+        runtimeSummaryURL: URL
+    ) throws -> ContainerRuntimeValidationSummary {
+        if case .containerRuntime = materialized.source {
+            return ContainerRuntimeValidationSummary(
+                shellAvailable: materialized.shellAvailable ?? true,
+                resolvedDefaultExec: materialized.defaultExec
+            )
+        }
+        if let rootfsDir = materialized.rootfsDir {
+            try validateRuntimeShell(in: rootfsDir)
+            return ContainerRuntimeValidationSummary(
+                shellAvailable: true,
+                resolvedDefaultExec: nil
+            )
+        }
+
+        guard materialized.ociLayoutDir != nil else {
+            throw MSLRuntimeError("install source did not provide a rootfs or OCI layout")
+        }
+        guard fileManager.fileExists(atPath: runtimeSummaryURL.path) else {
+            throw MSLRuntimeError("container runtime validation summary missing: \(runtimeSummaryURL.path)")
+        }
+        let summary = try parseContainerRuntimeValidationSummary(from: runtimeSummaryURL)
+        if !summary.shellAvailable, summary.resolvedDefaultExec == nil {
+            throw MSLRuntimeError("container image is not supported: no usable shell and no resolvable default command")
+        }
+        return summary
+    }
+
+    private func parseContainerRuntimeValidationSummary(from url: URL) throws -> ContainerRuntimeValidationSummary {
+        let raw = try String(contentsOf: url, encoding: .utf8)
+        var values: [String: String] = [:]
+        for line in raw.split(separator: "\n", omittingEmptySubsequences: true) {
+            guard let separator = line.firstIndex(of: "=") else { continue }
+            let key = String(line[..<separator]).trimmingCharacters(in: .whitespacesAndNewlines)
+            let value = String(line[line.index(after: separator)...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            values[key] = value
+        }
+
+        let shellAvailable = values["SHELL_AVAILABLE"] == "true"
+        let argv = decodeBase64Lines(values["DEFAULT_EXEC_ARGV_B64"])
+        let env = decodeBase64Lines(values["DEFAULT_EXEC_ENV_B64"])
+        let defaultExec: DistributionInstanceMetadata.DefaultExec?
+        if let argv, !argv.isEmpty {
+            defaultExec = DistributionInstanceMetadata.DefaultExec(
+                argv: argv,
+                workingDir: values["DEFAULT_EXEC_WORKDIR"].flatMap { $0.isEmpty ? nil : $0 },
+                user: values["DEFAULT_EXEC_USER"].flatMap { $0.isEmpty ? nil : $0 },
+                env: env ?? []
+            )
+        } else {
+            defaultExec = nil
+        }
+
+        return ContainerRuntimeValidationSummary(
+            shellAvailable: shellAvailable,
+            resolvedDefaultExec: defaultExec
+        )
+    }
+
+    private func decodeBase64Lines(_ value: String?) -> [String]? {
+        guard let value, !value.isEmpty, let data = Data(base64Encoded: value),
+              let text = String(data: data, encoding: .utf8) else {
+            return nil
+        }
+        let lines = text
+            .split(separator: "\n", omittingEmptySubsequences: true)
+            .map(String.init)
+        return lines.isEmpty ? nil : lines
+    }
+
+    private func createImagewriterExtraFilesBundle(
+        for materialized: RootFSMaterializationResult,
+        cleanupRoot: URL
+    ) throws -> URL? {
+        guard materialized.ociLayoutDir != nil else {
+            return nil
+        }
+        let guestUmoci = try resolveBundledContainerToolArtifact(named: "umoci", platform: "linux-arm64")
+        let bundleDir = cleanupRoot.appendingPathComponent("imagewriter-extra-files", isDirectory: true)
+        let payloadDir = bundleDir.appendingPathComponent("payload", isDirectory: true)
+        try ensureDir(payloadDir)
+
+        let umociDestination = payloadDir.appendingPathComponent("umoci", isDirectory: false)
+        if fileManager.fileExists(atPath: umociDestination.path) {
+            try fileManager.removeItem(at: umociDestination)
+        }
+        try fileManager.copyItem(at: guestUmoci, to: umociDestination)
+        try fileManager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: umociDestination.path)
+
+        let manifest = ImagewriterExtraFilesManifest(
+            files: [
+                ImagewriterExtraFileEntry(
+                    sourceRelativePath: "payload/umoci",
+                    guestPath: "extras/umoci",
+                    mode: "0755"
+                )
+            ]
+        )
+        try writeJSON(manifest, to: bundleDir.appendingPathComponent("manifest.json", isDirectory: false))
+        return bundleDir
     }
 
     func readInstanceMetadata(at metadataURL: URL) throws -> DistributionInstanceMetadata {
@@ -867,6 +1112,27 @@ final class DistributionManager {
                     ])
                 }
             }
+            if metadata.startupMode == nil {
+                metadata.startupMode = resolveStartupMode(
+                    source: metadata.source,
+                    shellAvailable: metadata.shellAvailable ?? true
+                )
+                didMutate = true
+                logger.log("startup_mode_backfilled", fields: [
+                    "instance": metadata.name,
+                    "metadata": metadataURL.path,
+                    "startup_mode": metadata.startupMode?.rawValue ?? "interactive"
+                ])
+            }
+            if metadata.workloadKind == nil {
+                metadata.workloadKind = resolveWorkloadKind(source: metadata.source)
+                didMutate = true
+                logger.log("workload_kind_backfilled", fields: [
+                    "instance": metadata.name,
+                    "metadata": metadataURL.path,
+                    "workload_kind": metadata.workloadKind?.rawValue ?? "generic"
+                ])
+            }
             if didMutate {
                 try writeJSON(metadata, to: metadataURL)
             }
@@ -885,6 +1151,28 @@ final class DistributionManager {
             ])
             return rebuilt
         }
+    }
+
+    private func resolveStartupMode(
+        source: DistributionSourceRecord,
+        shellAvailable: Bool
+    ) -> DistributionInstanceMetadata.StartupMode {
+        if source.sourceType == "container-runtime" {
+            return .processFirst
+        }
+        if source.sourceType == "container-remote", shellAvailable == false {
+            return .processFirst
+        }
+        return .interactive
+    }
+
+    private func resolveWorkloadKind(
+        source: DistributionSourceRecord
+    ) -> DistributionInstanceMetadata.WorkloadKind {
+        if source.sourceType == "container-runtime" {
+            return .containerRuntime
+        }
+        return .generic
     }
 
     func writeBootstrapResult(
@@ -975,6 +1263,12 @@ final class DistributionManager {
         guard let targetAlias, !targetAlias.isEmpty else {
             throw MSLRuntimeError("missing distribution target. use --distro <id>, --file <path>, or --from-container <image-ref>")
         }
+        if targetAlias.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == Self.containerRuntimeAlias {
+            guard allowInternalContainerRuntimeInstallSurface() else {
+                throw MSLRuntimeError("container-runtime is internal; use `make build-container-runtime`")
+            }
+            return .containerRuntime
+        }
         guard let entry = manifestStore.resolve(alias: targetAlias) else {
             throw MSLRuntimeError("unsupported distribution '\(targetAlias)'")
         }
@@ -1056,6 +1350,7 @@ final class DistributionManager {
             throw MSLRuntimeError("failed to parse regctl inspect output for \(reference.original)")
         }
         let digest = (object["Digest"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let configObject = object["config"] as? [String: Any]
         guard !digest.isEmpty else {
             let headResult = try process.run(
                 regctl,
@@ -1079,7 +1374,12 @@ final class DistributionManager {
                 resolvedReference: "\(reference.normalizedName)@\(headDigest)",
                 digest: headDigest,
                 platform: "linux/arm64",
-                manifestDigest: headDigest
+                manifestDigest: headDigest,
+                entrypoint: sanitizeContainerStringArray(configObject?["Entrypoint"]),
+                cmd: sanitizeContainerStringArray(configObject?["Cmd"]),
+                user: sanitizeContainerString(configObject?["User"]),
+                workingDir: sanitizeContainerString(configObject?["WorkingDir"]),
+                env: sanitizeContainerStringArray(configObject?["Env"]) ?? []
             )
         }
         let architecture = ((object["Architecture"] as? String) ?? "").lowercased()
@@ -1092,17 +1392,20 @@ final class DistributionManager {
             resolvedReference: "\(reference.normalizedName)@\(digest)",
             digest: digest,
             platform: "linux/arm64",
-            manifestDigest: digest
+            manifestDigest: digest,
+            entrypoint: sanitizeContainerStringArray(configObject?["Entrypoint"]),
+            cmd: sanitizeContainerStringArray(configObject?["Cmd"]),
+            user: sanitizeContainerString(configObject?["User"]),
+            workingDir: sanitizeContainerString(configObject?["WorkingDir"]),
+            env: sanitizeContainerStringArray(configObject?["Env"]) ?? []
         )
     }
 
     private func materializeContainerRootFS(
         _ resolved: ResolvedContainerImage,
-        rootfsDir: URL,
         cleanupRoot: URL
-    ) throws -> String {
+    ) throws -> (String, URL) {
         let regctl = try resolveBundledOrInstalledContainerTool("regctl")
-        let umoci = try resolveBundledOrInstalledContainerTool("umoci")
 
         let digestKey = sanitizeDigestForPath(resolved.digest)
         let cacheBase = containerCacheBaseDirectory(
@@ -1111,7 +1414,6 @@ final class DistributionManager {
             digest: digestKey
         )
         let layoutDir = cacheBase.appendingPathComponent("oci", isDirectory: true)
-        let unpackDir = cacheBase.appendingPathComponent("bundle", isDirectory: true)
         try ensureDir(cacheBase)
 
         if !fileManager.fileExists(atPath: layoutDir.path) {
@@ -1132,32 +1434,11 @@ final class DistributionManager {
             }
         }
 
-        if fileManager.fileExists(atPath: unpackDir.path) {
-            try? fileManager.removeItem(at: unpackDir)
-        }
-        let unpackResult = try process.run(
-            umoci,
-            [
-                "unpack",
-                "--rootless",
-                "--image", "\(layoutDir.path):image",
-                unpackDir.path
-            ],
-            captureOutput: true
-        )
-        guard unpackResult.exitCode == 0 else {
-            throw MSLRuntimeError("failed to unpack container image \(resolved.reference.original): \(unpackResult.nonEmptyErrorOutput)")
-        }
-
-        let unpackedRootfsDir = unpackDir.appendingPathComponent("rootfs", isDirectory: true)
-        guard fileManager.fileExists(atPath: unpackedRootfsDir.path) else {
-            throw MSLRuntimeError("container image unpack completed without rootfs: \(resolved.reference.original)")
-        }
-        try copyDirectoryContents(from: unpackedRootfsDir, to: rootfsDir)
-        try normalizeContainerRootFSPermissions(rootfsDir: rootfsDir)
-
         let tarballFileName = "\(resolved.reference.repository.replacingOccurrences(of: "/", with: "-"))-\(digestKey).oci"
-        return tarballFileName
+        let stagedLayoutDir = cleanupRoot.appendingPathComponent("oci-layout", isDirectory: true)
+        try ensureDir(stagedLayoutDir)
+        try copyDirectoryContents(from: layoutDir, to: stagedLayoutDir)
+        return (tarballFileName, stagedLayoutDir)
     }
 
     private func buildContainerReferenceString(_ reference: ContainerImageReference) -> String {
@@ -1168,6 +1449,24 @@ final class DistributionManager {
             result += ":\(reference.tag ?? "latest")"
         }
         return result
+    }
+
+    private func sanitizeContainerString(_ value: Any?) -> String? {
+        guard let value = value as? String else {
+            return nil
+        }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private func sanitizeContainerStringArray(_ value: Any?) -> [String]? {
+        guard let values = value as? [String] else {
+            return nil
+        }
+        let cleaned = values
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        return cleaned.isEmpty ? nil : cleaned
     }
 
     internal func resolveBundledOrInstalledContainerTool(_ name: String) throws -> String {
@@ -1184,6 +1483,25 @@ final class DistributionManager {
             return pathExecutable
         }
         throw MSLRuntimeError("container helper not found: \(name). bundled helper missing and PATH fallback was not available")
+    }
+
+    private func resolveBundledContainerToolArtifact(named name: String, platform: String) throws -> URL {
+        if let package = try findBundledContainerToolPackage(),
+           let record = package.manifest.record(named: name, platform: platform) {
+            try verifyBundledToolRecord(record, root: package.root, errorContext: "bundled helper checksum mismatch")
+            return package.root.appendingPathComponent(record.relativePath, isDirectory: false)
+        }
+
+        let manifestURL = paths.bundledContainerToolsStageDir.appendingPathComponent("manifest.json", isDirectory: false)
+        if fileManager.fileExists(atPath: manifestURL.path) {
+            let manifest = try readJSON(BundledToolManifest.self, from: manifestURL)
+            if let record = manifest.record(named: name, platform: platform) {
+                try verifyBundledToolRecord(record, root: paths.bundledContainerToolsStageDir, errorContext: "bundled helper checksum mismatch")
+                return paths.bundledContainerToolsStageDir.appendingPathComponent(record.relativePath, isDirectory: false)
+            }
+        }
+
+        throw MSLRuntimeError("bundled helper missing: \(name) for platform \(platform)")
     }
 
     private func findBundledContainerToolPackage() throws -> (root: URL, manifest: BundledToolManifest)? {
@@ -1204,8 +1522,7 @@ final class DistributionManager {
             return nil
         }
         let manifest = try readJSON(BundledToolManifest.self, from: manifestURL)
-        guard manifest.platform == "darwin-arm64",
-              let record = manifest.record(named: name) else {
+        guard let record = manifest.record(named: name, platform: "darwin-arm64") else {
             return nil
         }
         try verifyBundledToolRecord(record, root: paths.bundledContainerToolsStageDir, errorContext: "bundled helper checksum mismatch")
@@ -1251,14 +1568,13 @@ final class DistributionManager {
         from package: (root: URL, manifest: BundledToolManifest)
     ) throws -> String {
         let manifest = package.manifest
-        guard manifest.platform == "darwin-arm64" else {
-            throw MSLRuntimeError("bundled helper manifest has unsupported platform: \(manifest.platform)")
-        }
-        guard let record = manifest.record(named: name) else {
+        let platform = "darwin-arm64"
+        let hostTools = manifest.records(platform: platform)
+        guard let record = manifest.record(named: name, platform: platform) else {
             throw MSLRuntimeError("bundled helper missing: \(name)")
         }
 
-        for tool in manifest.tools {
+        for tool in hostTools {
             try verifyBundledToolRecord(tool, root: package.root, errorContext: "bundled helper checksum mismatch")
         }
 
@@ -1276,7 +1592,7 @@ final class DistributionManager {
         do {
             try ensureDir(paths.mslHostContainerToolsDir)
             try ensureDir(targetDir)
-            for tool in manifest.tools {
+            for tool in hostTools {
                 let source = package.root.appendingPathComponent(tool.relativePath, isDirectory: false)
                 let destination = targetDir.appendingPathComponent(tool.name, isDirectory: false)
                 if fileManager.fileExists(atPath: destination.path) {
@@ -1320,8 +1636,7 @@ final class DistributionManager {
                 continue
             }
             let manifest = try readJSON(BundledToolManifest.self, from: manifestURL)
-            guard manifest.platform == "darwin-arm64",
-                  let record = manifest.record(named: name),
+            guard let record = manifest.record(named: name, platform: "darwin-arm64"),
                   let path = try installedToolPathIfValid(record, under: directory) else {
                 continue
             }
@@ -1435,7 +1750,7 @@ final class DistributionManager {
         switch source {
         case .manifest(let entry):
             return entry.userConvergenceTemplate ?? defaultPolicyTemplate(forManifestEntry: entry)
-        case .localFile, .containerRemote:
+        case .localFile, .containerRemote, .containerRuntime:
             return makeUseraddPolicyTemplate(
                 templateID: "generic-useradd-v1",
                 adminGroup: "sudo",
@@ -1452,7 +1767,7 @@ final class DistributionManager {
                 return defaults
             }
             return defaultCacheSharingPolicy(distroFamily: entry.distro)
-        case .localFile, .containerRemote:
+        case .localFile, .containerRemote, .containerRuntime:
             return defaultCacheSharingPolicy(distroFamily: nil)
         }
     }
@@ -1535,6 +1850,8 @@ final class DistributionManager {
             canUseServiceManaged = resolvedServiceManager != nil
         case .localFile, .containerRemote:
             canUseServiceManaged = false
+        case .containerRuntime:
+            canUseServiceManaged = true
         }
         let initMode: String
         if isReservedInternalInstanceName(instanceName) {
@@ -1572,6 +1889,12 @@ final class DistributionManager {
         instanceName: String,
         preferServiceManaged: Bool
     ) -> DistributionInstanceMetadata.RuntimeInitProfile {
+        if source.sourceType == "container-runtime" {
+            return DistributionInstanceMetadata.RuntimeInitProfile(
+                initMode: "service-managed-init",
+                serviceManager: "openrc"
+            )
+        }
         let resolvedServiceManager = resolveServiceManager(for: source)
         let manifestDefaultMode = resolveManifestDefaultInitMode(for: source)
         let serviceManager = resolvedServiceManager ?? "systemd"
@@ -1604,6 +1927,8 @@ final class DistributionManager {
             return inferServiceManagerFromDistro(entry.distro)
         case .localFile, .containerRemote:
             return nil
+        case .containerRuntime:
+            return "openrc"
         }
     }
 
@@ -1613,6 +1938,8 @@ final class DistributionManager {
             return normalizeInitMode(entry.defaultInitMode)
         case .localFile, .containerRemote:
             return nil
+        case .containerRuntime:
+            return "service-managed-init"
         }
     }
 
@@ -1625,6 +1952,9 @@ final class DistributionManager {
     }
 
     private func resolveServiceManager(for source: DistributionSourceRecord) -> String? {
+        if source.sourceType == "container-runtime" {
+            return "openrc"
+        }
         if let manifestID = source.manifestId,
            let entry = manifestStore.allEntries().first(where: { $0.id == manifestID }),
            let explicit = normalizeServiceManager(entry.serviceManager) {
@@ -1796,13 +2126,20 @@ final class DistributionManager {
         mslExecutablePath: String,
         rootfsTarballPath: String?,
         rootfsDirectoryPath: String?,
+        ociLayoutDirectoryPath: String?,
         outputDiskPath: String,
         sizeMB: Int,
         initBinaryPath: String,
+        imagewriterPackages: String? = nil,
+        extraGuestFilesBundlePath: String? = nil,
+        runtimeValidationSummaryPath: String? = nil,
+        requestedDefaultExec: DistributionInstanceMetadata.DefaultExec? = nil,
         source: DistributionSourceSelection? = nil
     ) throws {
-        if (rootfsTarballPath?.isEmpty ?? true) && (rootfsDirectoryPath?.isEmpty ?? true) {
-            throw MSLRuntimeError("imagewriter build requires a rootfs tarball or rootfs directory")
+        if (rootfsTarballPath?.isEmpty ?? true) &&
+            (rootfsDirectoryPath?.isEmpty ?? true) &&
+            (ociLayoutDirectoryPath?.isEmpty ?? true) {
+            throw MSLRuntimeError("imagewriter build requires a rootfs tarball, rootfs directory, or OCI layout")
         }
         var env: [String: String] = [
             "MSL_BIN": mslExecutablePath,
@@ -1814,13 +2151,33 @@ final class DistributionManager {
             "OUTPUT_RAW": outputDiskPath,
             "IMAGE_SIZE_MB": String(sizeMB),
             "IMAGEWRITER_INIT_BINARY": initBinaryPath,
-            "IMAGEWRITER_RUN_TIMEOUT": "900"
+            "IMAGEWRITER_RUN_TIMEOUT": "900",
+            "IMAGEWRITER_PACKAGES": imagewriterPackages ?? Self.defaultImagewriterPackages
         ]
         if let rootfsTarballPath, !rootfsTarballPath.isEmpty {
             env["ROOTFS_TARBALL"] = rootfsTarballPath
         }
         if let rootfsDirectoryPath, !rootfsDirectoryPath.isEmpty {
             env["ROOTFS_DIR"] = rootfsDirectoryPath
+        }
+        if let ociLayoutDirectoryPath, !ociLayoutDirectoryPath.isEmpty {
+            env["OCI_LAYOUT_DIR"] = ociLayoutDirectoryPath
+        }
+        if let extraGuestFilesBundlePath, !extraGuestFilesBundlePath.isEmpty {
+            env["EXTRA_GUEST_FILES_BUNDLE"] = extraGuestFilesBundlePath
+        }
+        if let runtimeValidationSummaryPath, !runtimeValidationSummaryPath.isEmpty {
+            env["IMAGEWRITER_RUNTIME_SUMMARY_PATH"] = runtimeValidationSummaryPath
+        }
+        if let requestedDefaultExec {
+            env["IMAGEWRITER_DEFAULT_EXEC_ARGV_B64"] = Data(requestedDefaultExec.argv.joined(separator: "\n").utf8).base64EncodedString()
+            env["IMAGEWRITER_DEFAULT_EXEC_ENV_B64"] = Data(requestedDefaultExec.env.joined(separator: "\n").utf8).base64EncodedString()
+            if let workingDir = requestedDefaultExec.workingDir, !workingDir.isEmpty {
+                env["IMAGEWRITER_DEFAULT_EXEC_WORKDIR"] = workingDir
+            }
+            if let user = requestedDefaultExec.user, !user.isEmpty {
+                env["IMAGEWRITER_DEFAULT_EXEC_USER"] = user
+            }
         }
         if let mslHome = ProcessInfo.processInfo.environment["MSL_HOME"], !mslHome.isEmpty {
             env["MSL_HOME"] = mslHome
@@ -1832,26 +2189,47 @@ final class DistributionManager {
             env["IMAGEWRITER_INSTANCE"] = configuredInstance
         }
 
-        let result = try process.run("/bin/sh", [scriptPath], captureOutput: false, environment: env)
+        let result = try process.run("/bin/sh", [scriptPath], captureOutput: true, environment: env)
         guard result.exitCode == 0 else {
+            var scriptDiagnostics = imagewriterFailureDiagnostics(from: result)
+            if scriptDiagnostics.stdoutLog == nil && scriptDiagnostics.stderrLog == nil {
+                scriptDiagnostics = persistImagewriterFailureLogs(result: result, existing: scriptDiagnostics)
+            }
             let stageHint: String
-            switch result.exitCode {
-            case 21:
-                stageHint = "stage=stage1_ext4"
-            case 22:
-                stageHint = "stage=btrfs_build"
-            case 23:
-                stageHint = "stage=finalize"
-            case 24:
-                stageHint = "stage=imagewriter_verify"
-            case 25:
-                stageHint = "stage=imagewriter_missing"
-            default:
-                stageHint = "stage=unknown"
+            if let guestStage = scriptDiagnostics.stage {
+                stageHint = "stage=\(guestStage)"
+            } else {
+                switch result.exitCode {
+                case 21:
+                    stageHint = "stage=stage1_ext4"
+                case 22:
+                    stageHint = "stage=btrfs_build"
+                case 23:
+                    stageHint = "stage=finalize"
+                case 24:
+                    stageHint = "stage=imagewriter_verify"
+                case 25:
+                    stageHint = "stage=imagewriter_missing"
+                case 26:
+                    stageHint = "stage=container_unpack"
+                case 1 where result.stderr.contains("init channel did not connect within"):
+                    stageHint = "stage=worker_startup"
+                case 1 where result.stderr.contains("worker did not register in time"):
+                    stageHint = "stage=worker_startup"
+                default:
+                    stageHint = "stage=unknown"
+                }
             }
             let detailHint: String
-            if result.exitCode == 22, case .containerRemote? = source {
+            if stageHint == "stage=worker_startup",
+               let workerSerialLog = imagewriterWorkerSerialLogPath() {
+                detailHint = " see guest serial log: \(workerSerialLog)"
+            } else if let stderrLog = scriptDiagnostics.stderrLog {
+                detailHint = " see guest log: \(stderrLog)"
+            } else if result.exitCode == 22, case .containerRemote? = source {
                 detailHint = " container rootfs permissions may be incompatible."
+            } else if result.exitCode == 26, case .containerRemote? = source {
+                detailHint = " guest container unpack or default-command validation failed."
             } else {
                 detailHint = ""
             }
@@ -1861,6 +2239,56 @@ final class DistributionManager {
         }
     }
 
+    private func imagewriterFailureDiagnostics(from result: ProcessResult) -> (stage: String?, stdoutLog: String?, stderrLog: String?) {
+        let lines = result.stderr
+            .split(separator: "\n", omittingEmptySubsequences: true)
+            .map(String.init)
+        guard let marker = lines.last(where: { $0.contains("imagewriter_guest_failure_detected") }) else {
+            return (nil, nil, nil)
+        }
+        let stage = value(after: "stage=", in: marker)
+        let stdoutLog = value(after: "stdout_log=", in: marker)
+        let stderrLog = value(after: "stderr_log=", in: marker)
+        return (stage, stdoutLog, stderrLog)
+    }
+
+    private func persistImagewriterFailureLogs(
+        result: ProcessResult,
+        existing: (stage: String?, stdoutLog: String?, stderrLog: String?)
+    ) -> (stage: String?, stdoutLog: String?, stderrLog: String?) {
+        let instanceName = resolveImagewriterInstanceName()
+        let logsDirectory = paths.instanceLogsDirectory(named: instanceName)
+            .appendingPathComponent("imagewriter-build", isDirectory: true)
+        do {
+            try ensureDir(logsDirectory)
+            let stamp = String(nowEpochMs())
+            let stdoutURL = logsDirectory.appendingPathComponent("imagewriter-\(stamp).stdout.log", isDirectory: false)
+            let stderrURL = logsDirectory.appendingPathComponent("imagewriter-\(stamp).stderr.log", isDirectory: false)
+            try result.stdout.write(to: stdoutURL, atomically: true, encoding: .utf8)
+            try result.stderr.write(to: stderrURL, atomically: true, encoding: .utf8)
+            return (
+                stage: existing.stage,
+                stdoutLog: stdoutURL.path,
+                stderrLog: stderrURL.path
+            )
+        } catch {
+            logger.log("imagewriter_failure_log_persist_failed", fields: [
+                "instance": instanceName,
+                "error": error.localizedDescription
+            ])
+            return existing
+        }
+    }
+
+    private func value(after prefix: String, in line: String) -> String? {
+        guard let range = line.range(of: prefix) else {
+            return nil
+        }
+        let suffix = line[range.upperBound...]
+        let token = suffix.split(separator: " ", maxSplits: 1, omittingEmptySubsequences: true).first.map(String.init)
+        return token?.isEmpty == false ? token : nil
+    }
+
     private func resolveImagewriterInstanceName() -> String {
         let envValue = ProcessInfo.processInfo.environment["MSL_IMAGEWRITER_INSTANCE"]?
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1868,6 +2296,25 @@ final class DistributionManager {
             return envValue
         }
         return "_imagewriter"
+    }
+
+    func resolveContainerRuntimeInstanceName() -> String {
+        Self.containerRuntimeInstanceName
+    }
+
+    private func allowInternalContainerRuntimeInstallSurface() -> Bool {
+        let raw = environment["MSL_ALLOW_INTERNAL_CONTAINER_RUNTIME"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        return raw == "1" || raw == "true" || raw == "yes"
+    }
+
+    private func imagewriterWorkerSerialLogPath() -> String? {
+        let path = paths
+            .workerRuntimeDirectory(named: resolveImagewriterInstanceName())
+            .appendingPathComponent("logs", isDirectory: true)
+            .appendingPathComponent("serial-console.log", isDirectory: false)
+        return fileManager.fileExists(atPath: path.path) ? path.path : nil
     }
 
     static func imagewriterStopArguments(instanceName: String) -> [String] {
@@ -2000,7 +2447,9 @@ final class DistributionManager {
             cacheSharing: defaultCacheSharingPolicy(
                 distroFamily: sourceRecord.distro ?? inferDistroFamily(from: sourceRecord.manifestId)
             ),
-            tmpStorage: nil
+            tmpStorage: nil,
+            startupMode: resolveStartupMode(source: sourceRecord, shellAvailable: true),
+            workloadKind: resolveWorkloadKind(source: sourceRecord)
         )
         try writeJSON(metadata, to: metadataURL)
         return metadata
@@ -2447,6 +2896,251 @@ final class DistributionManager {
             rootfsDir: rootfsDir,
             serviceManager: runtimeProfile.serviceManager
         )
+    }
+
+    private func configureContainerRuntimeRootFS(rootfsDir: URL) throws {
+        try ensureDir(rootfsDir.appendingPathComponent("etc/containerd", isDirectory: true))
+        try ensureDir(rootfsDir.appendingPathComponent("etc/buildkit", isDirectory: true))
+        try ensureDir(rootfsDir.appendingPathComponent("etc/nerdctl", isDirectory: true))
+        try ensureDir(rootfsDir.appendingPathComponent("etc/init.d", isDirectory: true))
+        try ensureDir(rootfsDir.appendingPathComponent("etc/runlevels/default", isDirectory: true))
+        try ensureDir(rootfsDir.appendingPathComponent("usr/local/bin", isDirectory: true))
+
+        if let bundledBuildctl = try? resolveBundledContainerToolArtifact(named: "buildctl", platform: "linux-arm64") {
+            let installedBuildctl = rootfsDir.appendingPathComponent("usr/local/bin/buildctl-real", isDirectory: false)
+            if fileManager.fileExists(atPath: installedBuildctl.path) {
+                try fileManager.removeItem(at: installedBuildctl)
+            }
+            try fileManager.copyItem(at: bundledBuildctl, to: installedBuildctl)
+            try fileManager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: installedBuildctl.path)
+        }
+        if let bundledYouki = try? resolveBundledContainerToolArtifact(named: "youki", platform: "linux-arm64") {
+            let installedYouki = rootfsDir.appendingPathComponent("usr/local/bin/youki", isDirectory: false)
+            if fileManager.fileExists(atPath: installedYouki.path) {
+                try fileManager.removeItem(at: installedYouki)
+            }
+            try fileManager.copyItem(at: bundledYouki, to: installedYouki)
+            try fileManager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: installedYouki.path)
+        }
+
+        try writeText(
+            """
+            version = 2
+            root = "/var/lib/containerd"
+            state = "/run/containerd"
+
+            [grpc]
+              address = "/run/containerd/containerd.sock"
+
+            [plugins."io.containerd.grpc.v1.cri".containerd]
+              snapshotter = "native"
+              default_runtime_name = "youki"
+
+            [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.youki]
+              runtime_type = "io.containerd.runc.v2"
+              privileged_without_host_devices = false
+              [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.youki.options]
+                BinaryName = "/usr/local/bin/msl-runtime-youki"
+                SystemdCgroup = false
+
+            [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
+              runtime_type = "io.containerd.runc.v2"
+              privileged_without_host_devices = false
+              [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
+                BinaryName = "/usr/local/bin/msl-runtime-runc"
+                SystemdCgroup = false
+            """,
+            to: rootfsDir.appendingPathComponent("etc/containerd/config.toml", isDirectory: false)
+        )
+
+        try writeText(
+            """
+            root = "/var/lib/buildkit"
+
+            [dns]
+              nameservers = ["8.8.8.8", "8.8.4.4", "2001:4860:4860::8888", "2001:4860:4860::8844"]
+
+            [worker.oci]
+              enabled = true
+              snapshotter = "native"
+            """,
+            to: rootfsDir.appendingPathComponent("etc/buildkit/buildkitd.toml", isDirectory: false)
+        )
+
+        try writeText(
+            """
+            address = "unix:///run/containerd/containerd.sock"
+            snapshotter = "native"
+            cgroup_manager = "cgroupfs"
+            """,
+            to: rootfsDir.appendingPathComponent("etc/nerdctl/nerdctl.toml", isDirectory: false)
+        )
+
+        try writeExecutableScript(
+            """
+            #!/bin/sh
+            exec /usr/bin/env CONTAINERD_ADDRESS=/run/containerd/containerd.sock CONTAINERD_SNAPSHOTTER=native BUILDKIT_HOST=unix:///run/buildkit/buildkitd.sock /usr/bin/nerdctl "$@"
+            """,
+            to: rootfsDir.appendingPathComponent("usr/local/bin/nerdctl", isDirectory: false)
+        )
+        try writeRuntimeBinaryWrapper(
+            name: "msl-runtime-containerd",
+            candidates: ["/usr/bin/containerd", "/usr/sbin/containerd"],
+            into: rootfsDir
+        )
+        try writeRuntimeBinaryWrapper(
+            name: "msl-runtime-buildkitd",
+            candidates: ["/usr/bin/buildkitd", "/usr/sbin/buildkitd"],
+            into: rootfsDir
+        )
+        try writeRuntimeBinaryWrapper(
+            name: "msl-runtime-runc",
+            candidates: ["/usr/bin/runc", "/usr/sbin/runc"],
+            into: rootfsDir
+        )
+        try writeRuntimeBinaryWrapper(
+            name: "msl-runtime-youki",
+            candidates: ["/usr/bin/youki", "/usr/local/bin/youki", "/usr/bin/runc", "/usr/sbin/runc"],
+            into: rootfsDir
+        )
+        try writeRuntimeBinaryWrapper(
+            name: "buildctl",
+            candidates: ["/usr/local/bin/buildctl-real", "/usr/bin/buildctl", "/usr/sbin/buildctl", "/sbin/buildctl"],
+            into: rootfsDir
+        )
+        try writeRuntimeBinaryWrapper(
+            name: "iptables",
+            candidates: ["/usr/sbin/iptables", "/sbin/iptables", "/usr/bin/iptables"],
+            into: rootfsDir
+        )
+        try writeRuntimeBinaryWrapper(
+            name: "ip6tables",
+            candidates: ["/usr/sbin/ip6tables", "/sbin/ip6tables", "/usr/bin/ip6tables"],
+            into: rootfsDir
+        )
+        try writeRuntimeBinaryWrapper(
+            name: "iptables-save",
+            candidates: ["/usr/sbin/iptables-save", "/sbin/iptables-save", "/usr/bin/iptables-save"],
+            into: rootfsDir
+        )
+        try writeRuntimeBinaryWrapper(
+            name: "iptables-restore",
+            candidates: ["/usr/sbin/iptables-restore", "/sbin/iptables-restore", "/usr/bin/iptables-restore"],
+            into: rootfsDir
+        )
+        try writeRuntimeBinaryWrapper(
+            name: "ip6tables-save",
+            candidates: ["/usr/sbin/ip6tables-save", "/sbin/ip6tables-save", "/usr/bin/ip6tables-save"],
+            into: rootfsDir
+        )
+        try writeRuntimeBinaryWrapper(
+            name: "ip6tables-restore",
+            candidates: ["/usr/sbin/ip6tables-restore", "/sbin/ip6tables-restore", "/usr/bin/ip6tables-restore"],
+            into: rootfsDir
+        )
+
+        try writeOpenRCService(
+            name: "containerd",
+            command: "/usr/local/bin/msl-runtime-containerd",
+            commandArgs: "--config /etc/containerd/config.toml",
+            pidfile: "/run/containerd/containerd.pid",
+            dependencies: [
+                "need localmount",
+                "after bootmisc",
+                "before buildkitd"
+            ],
+            startPre: [
+                "checkpath --directory /run/containerd",
+                "checkpath --directory /var/lib/containerd"
+            ],
+            into: rootfsDir
+        )
+        try writeOpenRCService(
+            name: "buildkitd",
+            command: "/usr/local/bin/msl-runtime-buildkitd",
+            commandArgs: "--addr unix:///run/buildkit/buildkitd.sock --config /etc/buildkit/buildkitd.toml",
+            pidfile: "/run/buildkit/buildkitd.pid",
+            dependencies: [
+                "need localmount containerd",
+                "after containerd"
+            ],
+            startPre: [
+                "checkpath --directory /run/buildkit",
+                "checkpath --directory /var/lib/buildkit"
+            ],
+            into: rootfsDir
+        )
+
+        try ensureRunlevelLink(service: "containerd", rootfsDir: rootfsDir)
+        try ensureRunlevelLink(service: "buildkitd", rootfsDir: rootfsDir)
+    }
+
+    private func writeRuntimeBinaryWrapper(name: String, candidates: [String], into rootfsDir: URL) throws {
+        let resolution = candidates.map { "  if [ -x \"\($0)\" ]; then exec \"\($0)\" \"$@\"; fi" }.joined(separator: "\n")
+        try writeExecutableScript(
+            """
+            #!/bin/sh
+            \(resolution)
+            echo "\(name): no runtime binary found" >&2
+            exit 127
+            """,
+            to: rootfsDir.appendingPathComponent("usr/local/bin/\(name)", isDirectory: false)
+        )
+    }
+
+    private func writeOpenRCService(
+        name: String,
+        command: String,
+        commandArgs: String,
+        pidfile: String,
+        dependencies: [String],
+        startPre: [String],
+        into rootfsDir: URL
+    ) throws {
+        let dependencyBody = dependencies.joined(separator: "\n    ")
+        let startPreBody = startPre.joined(separator: "\n  ")
+        try writeExecutableScript(
+            """
+            #!/sbin/openrc-run
+            name="\(name)"
+            description="\(name) service"
+            command="\(command)"
+            command_args="\(commandArgs)"
+            command_background="yes"
+            pidfile="\(pidfile)"
+            supervisor=supervise-daemon
+            respawn_delay=1
+            respawn_max=0
+            respawn_period=0
+
+            depend() {
+                \(dependencyBody)
+            }
+
+            start_pre() {
+              \(startPreBody)
+            }
+            """,
+            to: rootfsDir.appendingPathComponent("etc/init.d/\(name)", isDirectory: false)
+        )
+    }
+
+    private func ensureRunlevelLink(service: String, rootfsDir: URL) throws {
+        let runlevelLink = rootfsDir.appendingPathComponent("etc/runlevels/default/\(service)", isDirectory: false)
+        if fileManager.fileExists(atPath: runlevelLink.path) {
+            try fileManager.removeItem(at: runlevelLink)
+        }
+        try fileManager.createSymbolicLink(atPath: runlevelLink.path, withDestinationPath: "/etc/init.d/\(service)")
+    }
+
+    private func writeExecutableScript(_ text: String, to url: URL) throws {
+        try writeText(text, to: url)
+        try fileManager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+    }
+
+    private func writeText(_ text: String, to url: URL) throws {
+        try ensureDir(url.deletingLastPathComponent())
+        try Data(text.utf8).write(to: url, options: .atomic)
     }
 
     private func installGuestRuntimeServiceContracts(rootfsDir: URL, serviceManager rawServiceManager: String) throws {
