@@ -52,6 +52,43 @@ final class DistributionManagerTests: XCTestCase {
         }
     }
 
+    func testInstallableDistributionsExcludeInternalContainerRuntime() throws {
+        let ctx = try DistributionContext.make()
+        defer { ctx.cleanup() }
+        let manager = ctx.makeManager()
+        XCTAssertFalse(manager.installableDistributionNames().contains("container-runtime"))
+    }
+
+    func testResolveSourceRejectsInternalContainerRuntimeWithoutAllowFlag() throws {
+        let ctx = try DistributionContext.make()
+        defer { ctx.cleanup() }
+
+        XCTAssertThrowsError(try ctx.makeManager().resolveSource(targetAlias: "container-runtime", localFilePath: nil)) { error in
+            guard let runtime = error as? MSLRuntimeError else {
+                return XCTFail("unexpected error: \(error)")
+            }
+            XCTAssertTrue(runtime.message.contains("make build-container-runtime"))
+        }
+    }
+
+    func testResolveSourceSupportsSyntheticContainerRuntimeWhenAllowFlagIsSet() throws {
+        let ctx = try DistributionContext.make()
+        defer { ctx.cleanup() }
+
+        let manager = DistributionManager(
+            paths: ctx.paths,
+            logger: MSLLogger(logFile: ctx.paths.logs.appendingPathComponent("test.log", isDirectory: false)),
+            environment: ["MSL_ALLOW_INTERNAL_CONTAINER_RUNTIME": "1"]
+        )
+        let source = try manager.resolveSource(targetAlias: "container-runtime", localFilePath: nil)
+        switch source {
+        case .containerRuntime:
+            break
+        default:
+            XCTFail("expected synthetic container-runtime source")
+        }
+    }
+
     func testTarEntryPathSafety() {
         XCTAssertTrue(DistributionManager.isSafeTarEntryPath("etc/passwd"))
         XCTAssertTrue(DistributionManager.isSafeTarEntryPath("./usr/bin/bash"))
@@ -113,11 +150,11 @@ final class DistributionManagerTests: XCTestCase {
         try ctx.makeShellScript(at: regctl, contents: "#!/bin/sh\nexit 0\n")
         let manifest = BundledToolManifest(
             bundleVersion: "bundle-bad",
-            platform: "darwin-arm64",
             generatedAtEpochMs: 100,
             tools: [
                 BundledToolRecord(
                     name: "regctl",
+                    platform: "darwin-arm64",
                     version: "v0.11.2",
                     checksum: "deadbeef",
                     relativePath: "regctl"
@@ -574,6 +611,7 @@ final class DistributionManagerTests: XCTestCase {
         defer { ctx.cleanup() }
 
         try ctx.makeInstance(name: "_imagewriter")
+        try ctx.makeInstance(name: "_container")
         try ctx.makeInstance(name: "alpine")
 
         let names = ctx.makeManager()
@@ -587,12 +625,13 @@ final class DistributionManagerTests: XCTestCase {
         defer { ctx.cleanup() }
 
         try ctx.makeInstance(name: "_imagewriter")
+        try ctx.makeInstance(name: "_container")
         try ctx.makeInstance(name: "alpine")
 
         let names = ctx.makeManager()
             .installedInstances(includeReserved: true)
             .map(\.name)
-        XCTAssertEqual(names, ["_imagewriter", "alpine"])
+        XCTAssertEqual(names, ["_container", "_imagewriter", "alpine"])
     }
 
     func testRuntimeMetadataURLErrorsWhenNoBootableInstanceExists() throws {
@@ -676,6 +715,93 @@ final class DistributionManagerTests: XCTestCase {
                 return XCTFail("unexpected error type: \(error)")
             }
             XCTAssertTrue(runtime.message.contains("stage=btrfs_build"))
+        }
+    }
+
+    func testCreateImageWithImagewriterReportsGuestSubstageAndLogPath() throws {
+        let ctx = try DistributionContext.make()
+        defer { ctx.cleanup() }
+
+        let localTarball = try ctx.makeRootfsArchive(named: "rootfs.tar.gz")
+
+        let fakeInit = ctx.root.appendingPathComponent("msl-init-bootloader-fake-substage", isDirectory: false)
+        try Data(repeating: 0x42, count: 64).write(to: fakeInit)
+        setenv("MSL_INIT_BOOTLOADER_BINARY_PATH", fakeInit.path, 1)
+        defer { unsetenv("MSL_INIT_BOOTLOADER_BINARY_PATH") }
+
+        let fakeImagewriter = ctx.root.appendingPathComponent("imagewriter-fail-substage.sh", isDirectory: false)
+        try ctx.makeShellScript(
+            at: fakeImagewriter,
+            contents: """
+            #!/bin/sh
+            echo "imagewriter_guest_failure_detected mode=stage2 stage=rootfs_copy stdout_log=/tmp/imagewriter-stage2.stdout.log stderr_log=/tmp/imagewriter-stage2.stderr.log" >&2
+            exit 1
+            """
+        )
+        setenv("MSL_IMAGEWRITER_BUILD_SCRIPT", fakeImagewriter.path, 1)
+        defer { unsetenv("MSL_IMAGEWRITER_BUILD_SCRIPT") }
+
+        let manager = ctx.makeManager()
+        XCTAssertThrowsError(try manager.createImageWithImagewriter(
+            name: "dev",
+            targetAlias: nil,
+            localFilePath: localTarball.path,
+            rebuild: false,
+            diskSizeGB: nil,
+            mslExecutablePath: "/usr/bin/true"
+        )) { error in
+            guard let runtime = error as? MSLRuntimeError else {
+                return XCTFail("unexpected error type: \(error)")
+            }
+            XCTAssertTrue(runtime.message.contains("stage=rootfs_copy"))
+            XCTAssertTrue(runtime.message.contains("see guest log: /tmp/imagewriter-stage2.stderr.log"))
+        }
+    }
+
+    func testCreateImageWithImagewriterReportsWorkerStartupSerialLogHint() throws {
+        let ctx = try DistributionContext.make()
+        defer { ctx.cleanup() }
+
+        let localTarball = try ctx.makeRootfsArchive(named: "rootfs.tar.gz")
+
+        let fakeInit = ctx.root.appendingPathComponent("msl-init-bootloader-fake-worker-startup", isDirectory: false)
+        try Data(repeating: 0x42, count: 64).write(to: fakeInit)
+        setenv("MSL_INIT_BOOTLOADER_BINARY_PATH", fakeInit.path, 1)
+        defer { unsetenv("MSL_INIT_BOOTLOADER_BINARY_PATH") }
+
+        let fakeImagewriter = ctx.root.appendingPathComponent("imagewriter-fail-worker-startup.sh", isDirectory: false)
+        try ctx.makeShellScript(
+            at: fakeImagewriter,
+            contents: """
+            #!/bin/sh
+            echo "error: worker did not register in time for instance '_imagewriter'" >&2
+            exit 1
+            """
+        )
+        setenv("MSL_IMAGEWRITER_BUILD_SCRIPT", fakeImagewriter.path, 1)
+        defer { unsetenv("MSL_IMAGEWRITER_BUILD_SCRIPT") }
+
+        let workerSerialLog = ctx.paths
+            .workerRuntimeDirectory(named: "_imagewriter")
+            .appendingPathComponent("logs", isDirectory: true)
+            .appendingPathComponent("serial-console.log", isDirectory: false)
+        try FileManager.default.createDirectory(at: workerSerialLog.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try "panic".write(to: workerSerialLog, atomically: true, encoding: .utf8)
+
+        let manager = ctx.makeManager()
+        XCTAssertThrowsError(try manager.createImageWithImagewriter(
+            name: "python",
+            targetAlias: nil,
+            localFilePath: localTarball.path,
+            rebuild: false,
+            diskSizeGB: nil,
+            mslExecutablePath: "/usr/bin/true"
+        )) { error in
+            guard let runtime = error as? MSLRuntimeError else {
+                return XCTFail("unexpected error type: \(error)")
+            }
+            XCTAssertTrue(runtime.message.contains("stage=worker_startup"))
+            XCTAssertTrue(runtime.message.contains("see guest serial log: \(workerSerialLog.path)"))
         }
     }
 
@@ -1240,6 +1366,7 @@ private struct DistributionContext {
             tools.append(
                 BundledToolRecord(
                     name: name,
+                    platform: "darwin-arm64",
                     version: "test-version",
                     checksum: digest,
                     relativePath: url.lastPathComponent
@@ -1248,7 +1375,6 @@ private struct DistributionContext {
         }
         let manifest = BundledToolManifest(
             bundleVersion: bundleVersion,
-            platform: "darwin-arm64",
             generatedAtEpochMs: nowEpochMs(),
             tools: tools
         )

@@ -70,6 +70,14 @@ final class CLIOptionsParserTests: XCTestCase {
         XCTAssertEqual(parsed.remainingArguments, ["cp", "local.txt", "@:/tmp/remote.txt"])
     }
 
+    func testStopsParsingAtNerdctlSubcommand() throws {
+        let parsed = try MSLCLIOptionsParser.parseGlobalRuntimeOptions([
+            "--instance", "runtime", "nerdctl", "run", "--rm", "alpine", "uname", "-m"
+        ])
+        XCTAssertEqual(parsed.instanceName, "runtime")
+        XCTAssertEqual(parsed.remainingArguments, ["nerdctl", "run", "--rm", "alpine", "uname", "-m"])
+    }
+
     func testRejectsDuplicateInstanceOption() {
         XCTAssertThrowsError(
             try MSLCLIOptionsParser.parseGlobalRuntimeOptions([

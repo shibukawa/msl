@@ -63,10 +63,22 @@ make build
 Other build helpers:
 - `make build-ext4-helper`: build ext4 image helpers only
 - `make stage-container-tools`: stage `regctl` / `umoci` into `~/Library/Application Support/msl/tools/bundled/darwin-arm64` for developer/release packaging
+- `make build-container-runtime`: build/update the internal `_container` runtime VM and export a distributable artifact to `tmp/container-runtime-artifact/_container`
 - `make build-image`: run `scripts/build-msl-image.sh` (Step18 storage image build entrypoint)
 - `make reset`: legacy cleanup for old `distros/default/disk.raw` path (typically no-op on current instance-based installs)
 - `make clean-alpine`: uninstall all instances with `--keep-cache`, install fresh `alpine` (kernel selection is delegated to `msl install`), clear host logs, then launch `msl`
 - `make update-distribution-list`: refresh embedded manifest + install alias catalog
+
+Container runtime bring-up is internal-only. `msl install container-runtime` is not a public install surface; build the internal `_container` VM with `make build-container-runtime`, then use:
+
+```bash
+./.build/debug/msl nerdctl version
+./.build/debug/msl nerdctl run --rm alpine uname -m
+./.build/debug/msl nerdctl build -t test-image ./path/to/context
+./.build/debug/msl nerdctl compose -f ./compose.yaml up -d
+```
+
+`msl nerdctl` is the only supported container runtime interface in v1. `build` and `compose` operate on the current workspace and require any `-f/--file` or build-context paths to stay within that workspace.
 
 ## Step18 storage image build
 
@@ -190,7 +202,7 @@ make kernel-help
 Fetch kernel source from kernel.org:
 
 ```bash
-make kernel-fetch-source KERNEL_VERSION=6.12.4
+make kernel-fetch-source KERNEL_VERSION=7.0.1
 ```
 
 Optional:
@@ -202,7 +214,7 @@ Build artifacts:
 
 ```bash
 make kernel-build \
-  KERNEL_VERSION=6.12.4 \
+  KERNEL_VERSION=7.0.1 \
   KERNEL_PROFILE=slim
 ```
 
@@ -252,7 +264,7 @@ Rollback example (temporary compatibility path):
 
 ```bash
 make kernel-build \
-  KERNEL_VERSION=6.12.4 \
+  KERNEL_VERSION=7.0.1 \
   KERNEL_PROFILE=legacy-defconfig
 ```
 

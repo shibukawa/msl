@@ -100,6 +100,10 @@ fn main() -> Result<(), String> {
     validate_payload(&payload)?;
     install_payload(&payload)?;
 
+    // The bootloader transport is only for metadata/payload transfer.
+    // Close it before exec so the runtime init starts with a clean vsock state.
+    drop(stream);
+
     let mut command = Command::new(&exec_target);
     command.env_clear();
     command.envs(build_exec_environment(exec_env_assignments)?);

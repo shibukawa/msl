@@ -29,12 +29,12 @@ require_command id
 
 : "${KERNEL_VERSION:=}"
 if [[ -z "$KERNEL_VERSION" ]]; then
-  fail "KERNEL_VERSION is required. example: make kernel-build KERNEL_VERSION=6.12.4"
+  fail "KERNEL_VERSION is required. example: make kernel-build KERNEL_VERSION=7.0.0"
 fi
 
 KERNEL_VERSION="${KERNEL_VERSION#linux-}"
 if [[ ! "$KERNEL_VERSION" =~ '^[0-9]+\.[0-9]+(\.[0-9]+)?(-rc[0-9]+)?$' ]]; then
-  fail "unsupported KERNEL_VERSION format: $KERNEL_VERSION (expected like 6.12.4 or 6.13-rc1)"
+  fail "unsupported KERNEL_VERSION format: $KERNEL_VERSION (expected like 7.0.0 or 7.1-rc1)"
 fi
 
 if [[ -n "${KERNEL_ID:-}" && -z "${KERNEL_PROFILE:-}" ]]; then

@@ -35,9 +35,18 @@ PY
 
 rm -rf "$OUTPUT_DIR"
 mkdir -p "$OUTPUT_DIR"
-cp "$STAGE_DIR/manifest.json" "$OUTPUT_DIR/manifest.json"
-cp "$STAGE_DIR/regctl" "$OUTPUT_DIR/regctl"
-cp "$STAGE_DIR/umoci" "$OUTPUT_DIR/umoci"
-chmod 0755 "$OUTPUT_DIR/regctl" "$OUTPUT_DIR/umoci"
+python3 - "$STAGE_DIR/manifest.json" "$STAGE_DIR" "$OUTPUT_DIR" <<'PY'
+import json, os, shutil, sys
+manifest_path, root, out = sys.argv[1:]
+with open(manifest_path, "r", encoding="utf-8") as fh:
+    manifest = json.load(fh)
+shutil.copy2(manifest_path, os.path.join(out, "manifest.json"))
+for tool in manifest.get("tools", []):
+    src = os.path.join(root, tool["relativePath"])
+    dst = os.path.join(out, tool["relativePath"])
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    shutil.copy2(src, dst)
+    os.chmod(dst, 0o755)
+PY
 
 echo "packaged container helpers into: $OUTPUT_DIR"

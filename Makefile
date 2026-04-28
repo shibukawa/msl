@@ -1,4 +1,5 @@
 .PHONY: build build-init build-ext4-helper build-image build-imagewriter build-imagewriter-help imagewriter-help imagewriter-setup imagewriter \
+	build-container-runtime \
 	stage-container-tools package-container-tools install-container-tools \
 	reset reset-disk reset-full clean-alpine clean-ubuntu run \
 	test test-regression \
@@ -37,12 +38,16 @@ package-container-tools:
 
 install-container-tools: stage-container-tools
 
+build-container-runtime:
+	MSL_BIN="$(MSL)" \
+	./scripts/build-container-runtime.sh
+
 build-imagewriter-help:
 	@echo "Imagewriter (Alpine instance for storage image build)"
 	@echo ""
 	@echo "Setup builder instance only:"
 	@echo "  make imagewriter-setup"
-	@echo "    # distros は事前にクリーンされ、_imagewriter を再作成します"
+	@echo "    # _imagewriter のみを再作成し、他の distros は保持します"
 	@echo ""
 	@echo "Build _imagewriter disk (two-stage ext4 -> erofs):"
 	@echo "  make build-imagewriter"
@@ -50,7 +55,7 @@ build-imagewriter-help:
 	@echo ""
 	@echo "Optional env:"
 	@echo "  IMAGEWRITER_PACKAGES=\"btrfs-progs e2fsprogs erofs-utils util-linux tar zstd xz coreutils\""
-	@echo "  IMAGEWRITER_CLEAN_DISTROS=1   # default: 1 (cleanup before recreate)"
+	@echo "  IMAGEWRITER_CLEAN_DISTROS=1   # default: 1 (_imagewriter only)"
 	@echo "  IMAGEWRITER_FORCE_SETUP=1     # default for make build-imagewriter: 1"
 	@echo "  MSL_INIT_BOOTLOADER_BINARY_PATH=...  # default: $$HOME/.msl-system/msl-init-bootloader"
 	@echo "  MSL_BIN=./.build/debug/msl"
@@ -136,8 +141,8 @@ clean-alpine:
 	INSTANCES="$$( $(MSL) --list 2>/dev/null | sed -e 's/ \[default\]$$//' | awk '{print $$1}' )"; \
 	if [ -n "$$INSTANCES" ]; then \
 		for name in $$INSTANCES; do \
-			if [ "$$name" = "_imagewriter" ]; then \
-				echo "skip uninstall (reserved imagewriter instance): $$name"; \
+			if [ "$$name" = "_imagewriter" ] || [ "$$name" = "_container" ]; then \
+				echo "skip uninstall (reserved internal instance): $$name"; \
 				continue; \
 			fi; \
 			echo "uninstalling instance (keep cache): $$name"; \
@@ -174,8 +179,8 @@ clean-ubuntu:
 	INSTANCES="$$( $(MSL) --list 2>/dev/null | sed -e 's/ \[default\]$$//' | awk '{print $$1}' )"; \
 	if [ -n "$$INSTANCES" ]; then \
 		for name in $$INSTANCES; do \
-			if [ "$$name" = "_imagewriter" ]; then \
-				echo "skip uninstall (reserved imagewriter instance): $$name"; \
+			if [ "$$name" = "_imagewriter" ] || [ "$$name" = "_container" ]; then \
+				echo "skip uninstall (reserved internal instance): $$name"; \
 				continue; \
 			fi; \
 			echo "uninstalling instance (keep cache): $$name"; \
@@ -217,10 +222,10 @@ kernel-help:
 	@echo "Kernel build/stage"
 	@echo ""
 	@echo "Fetch kernel source from kernel.org:"
-	@echo "  make kernel-fetch-source KERNEL_VERSION=6.12.4 [KERNEL_FETCH_FORCE=1]"
+	@echo "  make kernel-fetch-source KERNEL_VERSION=7.0.1 [KERNEL_FETCH_FORCE=1]"
 	@echo ""
 	@echo "Build:"
-	@echo "  make kernel-build KERNEL_VERSION=6.12.4"
+	@echo "  make kernel-build KERNEL_VERSION=7.0.1"
 	@echo "    # default backend: Docker (Linux build env, workspace mount)"
 	@echo "    # source is fetched inside container from kernel.org"
 	@echo ""

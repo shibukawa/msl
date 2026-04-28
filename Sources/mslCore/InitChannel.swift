@@ -627,6 +627,27 @@ public final class InitChannelClient {
         return try decodeDirectAckResponse(frame, expectedOp: "pty_write")
     }
 
+    public func ptyOpen(
+        argv: [String],
+        cwd: String? = nil,
+        envAdditions: [String: String]? = nil,
+        runAsRoot: Bool? = nil,
+        rows: Int,
+        cols: Int,
+        timeoutMs: Int? = nil
+    ) throws -> InitChannelResponse {
+        try send(InitChannelRequest(
+            op: "pty_open",
+            argv: argv,
+            envAdditions: envAdditions,
+            runAsRoot: runAsRoot,
+            cwd: cwd,
+            timeoutMs: timeoutMs ?? self.timeoutMs,
+            rows: rows,
+            cols: cols
+        ))
+    }
+
     public func ptyResize(ptyId: String, rows: Int, cols: Int, timeoutMs: Int? = nil) throws -> InitChannelResponse {
         try send(InitChannelRequest(
             op: "pty_resize",
@@ -682,22 +703,12 @@ public final class InitChannelClient {
     }
 
     public func procWrite(procId: String, data: Data, timeoutMs: Int? = nil) throws -> InitChannelResponse {
-        let header = InitChannelDirectHeader(
-            version: 1,
-            requestId: UUID().uuidString,
+        try send(InitChannelRequest(
             op: "proc_write",
-            status: nil,
-            error: nil,
-            exitCode: nil,
-            durationMs: nil,
-            ptyId: nil,
-            procId: procId,
             timeoutMs: timeoutMs ?? self.timeoutMs,
-            meta: nil,
-            chunks: nil
-        )
-        let frame = try sendDirect(opcode: .procWriteRequest, header: header, payload: data)
-        return try decodeDirectAckResponse(frame, expectedOp: "proc_write")
+            procId: procId,
+            dataBase64: data.base64EncodedString()
+        ))
     }
 
     public func procStdinClose(procId: String, timeoutMs: Int? = nil) throws -> InitChannelResponse {
@@ -1196,19 +1207,92 @@ public final class InitChannelClient {
         let effectiveTimeoutMs = header.timeoutMs ?? timeoutMs
         let encodedHeader = try JSONEncoder().encode(header)
         let frame = try encodeFrame(opcode: opcode, header: encodedHeader, payload: payload)
+        if let sidebandConnector {
+            _ = sidebandConnector
+            if vsockFD != nil && persistentSidebandFD < 0 {
+                try requestSidebandConnection(role: "sideband")
+            }
+            return try withPersistentSidebandConnection { connection in
+                trace("init_transport_direct_write_started", [
+                    "op": header.op,
+                    "transport": "persistent_sideband_vsock",
+                    "fd": String(connection.fd),
+                    "opcode": String(opcode.rawValue)
+                ])
+                do {
+                    try writeFrame(frame, to: connection.fd, writeTimeoutMs: 10_000)
+                } catch {
+                    trace("init_transport_direct_write_failed", [
+                        "op": header.op,
+                        "transport": "persistent_sideband_vsock",
+                        "fd": String(connection.fd),
+                        "opcode": String(opcode.rawValue),
+                        "error": String(describing: error)
+                    ])
+                    throw error
+                }
+                let readTimeoutMs: Int32 = effectiveTimeoutMs <= 0 ? -1 : Int32(max(effectiveTimeoutMs, 30_000))
+                do {
+                    let response = try readFrame(from: connection.fd, readTimeoutMs: readTimeoutMs, op: header.op)
+                    trace("init_transport_direct_read_succeeded", [
+                        "op": header.op,
+                        "transport": "persistent_sideband_vsock",
+                        "fd": String(connection.fd),
+                        "opcode": String(opcode.rawValue)
+                    ])
+                    return response
+                } catch {
+                    trace("init_transport_direct_read_failed", [
+                        "op": header.op,
+                        "transport": "persistent_sideband_vsock",
+                        "fd": String(connection.fd),
+                        "opcode": String(opcode.rawValue),
+                        "error": String(describing: error)
+                    ])
+                    throw error
+                }
+            }
+        }
         if let fd = vsockFD {
             vsockLock.lock()
             defer { vsockLock.unlock() }
-            try writeFrame(frame, to: fd, writeTimeoutMs: 10_000)
+            trace("init_transport_direct_write_started", [
+                "op": header.op,
+                "transport": "persistent_vsock",
+                "fd": String(fd),
+                "opcode": String(opcode.rawValue)
+            ])
+            do {
+                try writeFrame(frame, to: fd, writeTimeoutMs: 10_000)
+            } catch {
+                trace("init_transport_direct_write_failed", [
+                    "op": header.op,
+                    "transport": "persistent_vsock",
+                    "fd": String(fd),
+                    "opcode": String(opcode.rawValue),
+                    "error": String(describing: error)
+                ])
+                throw error
+            }
             let readTimeoutMs: Int32 = effectiveTimeoutMs <= 0 ? -1 : Int32(max(effectiveTimeoutMs, 30_000))
-            return try readFrame(from: fd, readTimeoutMs: readTimeoutMs, op: header.op)
-        }
-        if let sidebandConnector {
-            _ = sidebandConnector
-            return try withPersistentSidebandConnection { connection in
-                try writeFrame(frame, to: connection.fd, writeTimeoutMs: 10_000)
-                let readTimeoutMs: Int32 = effectiveTimeoutMs <= 0 ? -1 : Int32(max(effectiveTimeoutMs, 30_000))
-                return try readFrame(from: connection.fd, readTimeoutMs: readTimeoutMs, op: header.op)
+            do {
+                let response = try readFrame(from: fd, readTimeoutMs: readTimeoutMs, op: header.op)
+                trace("init_transport_direct_read_succeeded", [
+                    "op": header.op,
+                    "transport": "persistent_vsock",
+                    "fd": String(fd),
+                    "opcode": String(opcode.rawValue)
+                ])
+                return response
+            } catch {
+                trace("init_transport_direct_read_failed", [
+                    "op": header.op,
+                    "transport": "persistent_vsock",
+                    "fd": String(fd),
+                    "opcode": String(opcode.rawValue),
+                    "error": String(describing: error)
+                ])
+                throw error
             }
         }
         if let handoffPath, let ackPath {
@@ -1235,16 +1319,19 @@ public final class InitChannelClient {
     }
 
     private func openDirectStream(opcode: InitChannelFrameOpcode, header: InitChannelDirectHeader, payload: Data) throws -> (fd: Int32, retainedConnection: AnyObject?) {
-        if vsockFD != nil && !allowStreamingOnVsock {
-            throw MSLRuntimeError("direct subscribe requires socket-backed init channel client")
-        }
         let encodedHeader = try JSONEncoder().encode(header)
         let frame = try encodeFrame(opcode: opcode, header: encodedHeader, payload: payload)
         let connection: SidebandConnection
-        if let fd = vsockFD {
-            connection = (fd, retainedVsockConnection)
-        } else if let sidebandConnector {
+        if let sidebandConnector {
+            if vsockFD != nil {
+                try requestSidebandConnection(role: "sideband")
+            }
             connection = try sidebandConnector()
+        } else if let fd = vsockFD {
+            if !allowStreamingOnVsock {
+                throw MSLRuntimeError("direct subscribe requires socket-backed init channel client")
+            }
+            connection = (fd, retainedVsockConnection)
         } else {
             if !allowSocketFallback {
                 throw MSLRuntimeError("sideband acquire failed: no broker-backed init channel available")

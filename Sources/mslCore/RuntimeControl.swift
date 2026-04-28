@@ -512,11 +512,19 @@ public struct RuntimeNetworkSnapshot: Codable {
     public var txBytesPerSecond: Double?
 }
 
+public struct RuntimeContainerRuntimeMetrics: Codable {
+    public var containerdHealthy: Bool?
+    public var buildkitdHealthy: Bool?
+    public var containerCount: Int?
+    public var imageCount: Int?
+}
+
 public struct RuntimeInstanceMetrics: Codable {
     public var sampledAtEpochMs: Int64
     public var memory: RuntimeMemoryBreakdown
     public var cpu: RuntimeCPUSnapshot
     public var network: RuntimeNetworkSnapshot
+    public var containerRuntime: RuntimeContainerRuntimeMetrics?
 }
 
 public struct RuntimeStorageCompressionStats: Codable {

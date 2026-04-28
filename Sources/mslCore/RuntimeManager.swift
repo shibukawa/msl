@@ -19,6 +19,57 @@ func isInterrupted() -> Bool {
 }
 
 public final class RuntimeManager {
+    private enum NerdctlTerminalMode {
+        case streamingProc
+        case displayPTY
+        case interactivePTY
+
+        var transport: String {
+            switch self {
+            case .streamingProc:
+                return "direct_init_proc_stream"
+            case .displayPTY:
+                return "direct_init_display_pty"
+            case .interactivePTY:
+                return "direct_init_interactive_pty"
+            }
+        }
+    }
+
+    private struct NerdctlExecutionResult {
+        var exitCode: Int32
+        var capturedOutput: String
+    }
+
+    private final class RollingOutputCapture {
+        private let limit: Int
+        private var data = Data()
+
+        init(limit: Int = 256 * 1024) {
+            self.limit = limit
+        }
+
+        func append(_ chunk: Data) {
+            guard !chunk.isEmpty else { return }
+            data.append(chunk)
+            if data.count > limit {
+                data.removeFirst(data.count - limit)
+            }
+        }
+
+        var stringValue: String {
+            String(data: data, encoding: .utf8) ?? ""
+        }
+    }
+
+    struct ResolvedRunInvocation: Equatable {
+        var argv: [String]
+        var cwd: String?
+        var envAdditions: [String: String]?
+        var runAsRoot: Bool
+        var startupNotice: String?
+    }
+
     private let paths: MSLPaths
     private let fileManager: FileManager
     private let lock: FileLock
@@ -124,6 +175,10 @@ public final class RuntimeManager {
             throw MSLRuntimeError("ssh-info no longer accepts runtime port overrides; the desktop manager owns listener ports")
         }
         let target = try resolveRuntimeTarget(explicitInstanceName: instanceName)
+        let metadata = try distributionManager.readOrRebuildInstanceMetadata(at: target.metadataURL)
+        if metadata.resolvedStartupMode() == .processFirst {
+            throw MSLRuntimeError("ssh is not supported for this instance mode")
+        }
         guard fileManager.fileExists(atPath: paths.managerSocketFile.path) else {
             throw MSLRuntimeError("MSLDesktop is not running. Start MSLDesktop and retry `msl ssh-info`.")
         }
@@ -379,6 +434,7 @@ public final class RuntimeManager {
         localFilePath: String?,
         rawDiskPath: String?,
         containerImageRef: String?,
+        containerEntrypointOverride: [String]?,
         rebuild: Bool,
         diskSizeGB: Int?
     ) throws -> Never {
@@ -409,6 +465,7 @@ public final class RuntimeManager {
                 targetAlias: targetAlias,
                 localFilePath: localFilePath,
                 containerImageRef: containerImageRef,
+                containerEntrypointOverride: containerEntrypointOverride,
                 rebuild: rebuild,
                 diskSizeGB: diskSizeGB,
                 mslExecutablePath: executablePath
@@ -444,7 +501,7 @@ public final class RuntimeManager {
     }
 
     private func finalizeDefaultInstanceAndKernelIfNeeded(installedName name: String) throws {
-        if name == "_imagewriter" {
+        if distributionManager.isReservedInternalInstanceName(name) {
             return
         }
         if try defaultInstanceStore.loadDefaultInstanceName() == nil {
@@ -605,11 +662,27 @@ public final class RuntimeManager {
         let commandStartMs = runtimeMonotonicMs()
         let metadataResolveStartMs = runtimeMonotonicMs()
         let target = try resolveRuntimeTarget(explicitInstanceName: instanceName)
+        let metadata = try distributionManager.readOrRebuildInstanceMetadata(at: target.metadataURL)
         logger.log("startup_phase_duration_ms", fields: [
             "phase": "runtime_metadata_resolve",
             "elapsed_ms": String(max(0, runtimeMonotonicMs() - metadataResolveStartMs)),
             "instance": target.instanceName
         ])
+        if metadata.resolvedStartupMode() == .processFirst {
+            let resolvedInvocation = try resolveRunInvocation(argv: [], metadata: metadata)
+            try runProcessFirstCommand(
+                resolvedInvocation: resolvedInvocation,
+                instanceName: target.instanceName,
+                metadataURL: target.metadataURL,
+                timeoutSec: 0,
+                attachInput: true,
+                usePTY: true,
+                startMs: commandStartMs
+            )
+        }
+        if metadata.shellAvailable == false {
+            try runCommand(argv: [], timeoutSec: 0, instanceName: target.instanceName)
+        }
         let workspacePolicy = evaluateWorkspaceStartupPolicy(instanceName: target.instanceName, metadataURL: target.metadataURL)
 
         // Ensure bootstrapped
@@ -817,11 +890,25 @@ public final class RuntimeManager {
     public func runCommand(argv: [String], timeoutSec: Int = 0, instanceName: String? = nil) throws -> Never {
         let startMs = runtimeMonotonicMs()
         let target = try resolveRuntimeTarget(explicitInstanceName: instanceName)
-        let workspacePolicy = evaluateWorkspaceStartupPolicy(instanceName: target.instanceName, metadataURL: target.metadataURL)
-        guard !argv.isEmpty else {
-            throw MSLRuntimeError("run requires at least one argument")
+        let metadata = try distributionManager.readOrRebuildInstanceMetadata(at: target.metadataURL)
+        let resolvedInvocation = try resolveRunInvocation(argv: argv, metadata: metadata)
+        if metadata.resolvedStartupMode() == .processFirst {
+            try runProcessFirstCommand(
+                resolvedInvocation: resolvedInvocation,
+                instanceName: target.instanceName,
+                metadataURL: target.metadataURL,
+                timeoutSec: timeoutSec,
+                attachInput: argv.isEmpty,
+                usePTY: argv.isEmpty,
+                startMs: startMs
+            )
         }
-        logger.log("run_command_started", fields: ["argv0": argv[0]])
+        let workspacePolicy = evaluateWorkspaceStartupPolicy(instanceName: target.instanceName, metadataURL: target.metadataURL)
+        let resolvedArgv = resolvedInvocation.argv
+        logger.log("run_command_started", fields: ["argv0": resolvedArgv[0]])
+        if let startupNotice = resolvedInvocation.startupNotice {
+            fputs("msl: \(startupNotice)\n", stderr)
+        }
 
         // Ensure bootstrapped
         try lock.withExclusiveLock {
@@ -835,7 +922,8 @@ public final class RuntimeManager {
             callerCwd: currentCallerCwd()
         )
         prepareCacheSharingIfNeeded(instanceName: target.instanceName)
-        let execCwd = prepareWorkspaceIfNeeded(policy: workspacePolicy, instanceName: target.instanceName)
+        let workspaceExecCwd = prepareWorkspaceIfNeeded(policy: workspacePolicy, instanceName: target.instanceName)
+        let execCwd = resolvedInvocation.cwd ?? workspaceExecCwd
 
         // Register session
         let regResp = try daemonClient.send(RuntimeControlRequest(
@@ -855,31 +943,34 @@ public final class RuntimeManager {
         let execTimeoutMs: Int? = timeoutSec > 0 ? timeoutSec * 1000 : nil
         let openResp = try daemonClient.send(RuntimeControlRequest(
             op: "proc_open",
-            argv: argv,
+            argv: resolvedArgv,
             timeoutMs: execTimeoutMs,
-            runAsRoot: shouldForceRootRuntimeUser(),
+            runAsRoot: resolvedInvocation.runAsRoot || shouldForceRootRuntimeUser(),
             sessionId: sessionID,
-            cwd: execCwd
+            cwd: execCwd,
+            envAdditions: resolvedInvocation.envAdditions
         ))
         guard openResp.ok, let procId = openResp.procId else {
             let errMsg = openResp.error ?? "proc_open failed"
             if shouldFallbackToLegacyExec(for: errMsg) {
                 logger.log("run_command_fallback_exec", fields: [
-                    "argv0": argv[0],
+                    "argv0": resolvedArgv[0],
                     "reason": errMsg
                 ])
                 _ = try? daemonClient.send(RuntimeControlRequest(op: "session_unregister", sessionId: sessionID))
                 daemonClient.disconnect()
                 try runCommandViaLegacyExec(
-                    argv: argv,
+                    argv: resolvedArgv,
                     timeoutSec: timeoutSec,
                     targetInstanceName: target.instanceName,
                     execCwd: execCwd,
+                    envAdditions: resolvedInvocation.envAdditions,
+                    runAsRoot: resolvedInvocation.runAsRoot || shouldForceRootRuntimeUser(),
                     startMs: startMs
                 )
             }
             logger.log("run_command_error", fields: [
-                "argv0": argv[0],
+                "argv0": resolvedArgv[0],
                 "error": errMsg,
                 "elapsed_ms": String(runtimeMonotonicMs() - startMs)
             ])
@@ -909,7 +1000,7 @@ public final class RuntimeManager {
             )
             let code = result.exitCode
             logger.log("run_command_completed", fields: [
-                "argv0": argv[0],
+                "argv0": resolvedArgv[0],
                 "exit_code": String(code),
                 "elapsed_ms": String(runtimeMonotonicMs() - startMs)
             ])
@@ -917,28 +1008,191 @@ public final class RuntimeManager {
         } catch {
             let errMsg = String(describing: error)
             logger.log("run_command_error", fields: [
-                "argv0": argv[0],
+                "argv0": resolvedArgv[0],
                 "error": errMsg,
                 "elapsed_ms": String(runtimeMonotonicMs() - startMs)
             ])
             if shouldFallbackToLegacyExec(for: errMsg) {
                 logger.log("run_command_fallback_exec", fields: [
-                    "argv0": argv[0],
+                    "argv0": resolvedArgv[0],
                     "reason": errMsg
                 ])
                 _ = try? daemonClient.send(RuntimeControlRequest(op: "session_unregister", sessionId: sessionID))
                 daemonClient.disconnect()
                 try runCommandViaLegacyExec(
-                    argv: argv,
+                    argv: resolvedArgv,
                     timeoutSec: timeoutSec,
                     targetInstanceName: target.instanceName,
                     execCwd: execCwd,
+                    envAdditions: resolvedInvocation.envAdditions,
+                    runAsRoot: resolvedInvocation.runAsRoot || shouldForceRootRuntimeUser(),
                     startMs: startMs
                 )
             }
             fputs("msl: \(errMsg)\n", stderr)
             Foundation.exit(1)
         }
+    }
+
+    public func runNerdctl(argv: [String], instanceName: String? = nil) throws -> Never {
+        let startMs = runtimeMonotonicMs()
+        let target = try resolveContainerRuntimeTarget(explicitInstanceName: instanceName)
+        let metadata = try distributionManager.readOrRebuildInstanceMetadata(at: target.metadataURL)
+        guard metadata.resolvedWorkloadKind() == .containerRuntime else {
+            throw MSLRuntimeError("msl nerdctl requires a container-runtime instance")
+        }
+        let workspacePlan = try resolveNerdctlWorkspacePlan(argv: argv)
+
+        try lock.withExclusiveLock {
+            try bootstrap.ensureBootstrapped(context: .runtime)
+        }
+
+        let runner = try makeDirectVirtualMachineRunner(metadataURL: target.metadataURL, instanceName: target.instanceName)
+        let client = try runner.startVMForDaemon()
+        defer {
+            runner.requestStopRunningVM()
+        }
+
+        try reconcileDirectRuntimeDNS(
+            client: client,
+            runner: runner,
+            instanceName: target.instanceName,
+            metadata: metadata
+        )
+
+        try ensureContainerRuntimeServiceManagerInitialized(
+            client: client,
+            instanceName: target.instanceName
+        )
+        try ensureContainerRuntimeCachePolicy(client: client, instanceName: target.instanceName)
+        try ensureContainerRuntimeService("containerd", client: client, instanceName: target.instanceName)
+        if nerdctlNeedsBuildkit(argv: argv) {
+            try ensureContainerRuntimeService("buildkitd", client: client, instanceName: target.instanceName)
+        }
+
+        let nerdctlCwd: String?
+        if workspacePlan.requiresWorkspace {
+            let workspacePolicy = evaluateNerdctlWorkspacePolicy(
+                instanceName: target.instanceName,
+                metadataURL: target.metadataURL,
+                metadata: metadata
+            )
+            guard workspacePolicy.workspaceGuestPath != nil else {
+                throw MSLRuntimeError("build context not accessible from current workspace")
+            }
+            nerdctlCwd = try prepareDirectWorkspaceIfNeeded(
+                client: client,
+                policy: workspacePolicy,
+                instanceName: target.instanceName
+            )
+            guard nerdctlCwd != nil else {
+                throw MSLRuntimeError("workspace mount failed for nerdctl")
+            }
+        } else {
+            nerdctlCwd = nil
+        }
+        let effectiveNerdctlArgs = applyDefaultNerdctlSnapshotterIfNeeded(argv)
+        let nerdctlArgv = ["/usr/local/bin/nerdctl"] + effectiveNerdctlArgs
+        let nerdctlEnv = nerdctlEnvironment()
+        let terminalMode = resolveNerdctlTerminalMode(argv: effectiveNerdctlArgs)
+
+        logger.log("nerdctl_started", fields: [
+            "instance": target.instanceName,
+            "argv0": nerdctlArgv[0],
+            "transport": terminalMode.transport
+        ])
+
+        let exitCode = try executeNerdctlDirectInit(
+            client: client,
+            instanceName: target.instanceName,
+            argv: nerdctlArgv,
+            cwd: nerdctlCwd,
+            envAdditions: nerdctlEnv,
+            terminalMode: terminalMode,
+            startMs: startMs,
+            logPrefix: "nerdctl"
+        ).exitCode
+        flushContainerRuntimeDisk(client: client, instanceName: target.instanceName)
+        runner.stopRunningVM()
+        Foundation.exit(exitCode)
+    }
+
+    func resolveRunInvocation(
+        argv: [String],
+        metadata: DistributionInstanceMetadata
+    ) throws -> ResolvedRunInvocation {
+        if !argv.isEmpty {
+            return ResolvedRunInvocation(
+                argv: argv,
+                cwd: nil,
+                envAdditions: nil,
+                runAsRoot: false,
+                startupNotice: nil
+            )
+        }
+
+        if metadata.resolvedWorkloadKind() == .containerRuntime {
+            guard let defaultExec = metadata.defaultExec, !defaultExec.argv.isEmpty else {
+                throw MSLRuntimeError("default command is not configured for this container-runtime instance")
+            }
+            return ResolvedRunInvocation(
+                argv: defaultExec.argv,
+                cwd: sanitizeOptionalPath(defaultExec.workingDir),
+                envAdditions: parseEnvAdditions(defaultExec.env),
+                runAsRoot: true,
+                startupNotice: "interactive shell is unavailable in process-first mode; starting configured default command instead"
+            )
+        }
+
+        if metadata.shellAvailable != false {
+            let shell = metadata.userConvergencePolicy?.shellFallbacks.first ?? "/bin/sh"
+            return ResolvedRunInvocation(
+                argv: [shell, "-l"],
+                cwd: nil,
+                envAdditions: nil,
+                runAsRoot: false,
+                startupNotice: nil
+            )
+        }
+
+        guard let defaultExec = metadata.defaultExec, !defaultExec.argv.isEmpty else {
+            throw MSLRuntimeError("interactive shell is unavailable for this instance and no default command is configured")
+        }
+
+        return ResolvedRunInvocation(
+            argv: defaultExec.argv,
+            cwd: sanitizeOptionalPath(defaultExec.workingDir),
+            envAdditions: parseEnvAdditions(defaultExec.env),
+            runAsRoot: shouldRunAsRoot(for: defaultExec.user),
+            startupNotice: "interactive shell is unavailable for this image; starting configured default command instead"
+        )
+    }
+
+    private func sanitizeOptionalPath(_ raw: String?) -> String? {
+        guard let raw else { return nil }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private func parseEnvAdditions(_ items: [String]) -> [String: String]? {
+        var additions: [String: String] = [:]
+        for item in items {
+            let trimmed = item.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, let separator = trimmed.firstIndex(of: "=") else {
+                continue
+            }
+            let key = String(trimmed[..<separator]).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !key.isEmpty else { continue }
+            let value = String(trimmed[trimmed.index(after: separator)...])
+            additions[key] = value
+        }
+        return additions.isEmpty ? nil : additions
+    }
+
+    private func shouldRunAsRoot(for requestedUser: String?) -> Bool {
+        guard let requestedUser else { return false }
+        let trimmed = requestedUser.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed == "root" || trimmed == "0"
     }
 
     private func shouldFallbackToLegacyExec(for errorMessage: String) -> Bool {
@@ -950,11 +1204,738 @@ public final class RuntimeManager {
             || lowered.contains("read timeout")
     }
 
+    private func runProcessFirstCommand(
+        resolvedInvocation: ResolvedRunInvocation,
+        instanceName: String,
+        metadataURL: URL,
+        timeoutSec: Int,
+        attachInput: Bool,
+        usePTY: Bool,
+        startMs: Int64
+    ) throws -> Never {
+        let resolvedArgv = resolvedInvocation.argv
+        logger.log("process_first_command_started", fields: [
+            "instance": instanceName,
+            "argv0": resolvedArgv[0],
+            "transport": usePTY ? "direct_init_pty" : "direct_init_proc"
+        ])
+        if let startupNotice = resolvedInvocation.startupNotice {
+            fputs("msl: \(startupNotice)\n", stderr)
+        }
+
+        try lock.withExclusiveLock {
+            try bootstrap.ensureBootstrapped(context: .runtime)
+        }
+
+        let runner = try makeDirectVirtualMachineRunner(metadataURL: metadataURL, instanceName: instanceName)
+        let client = try runner.startVMForDaemon()
+        defer {
+            runner.stopRunningVM()
+        }
+        do {
+            let exitCode = try executeDirectInitCommand(
+                client: client,
+                instanceName: instanceName,
+                argv: resolvedArgv,
+                cwd: resolvedInvocation.cwd,
+                envAdditions: resolvedInvocation.envAdditions,
+                runAsRoot: resolvedInvocation.runAsRoot || shouldForceRootRuntimeUser(),
+                timeoutSec: timeoutSec,
+                attachInput: attachInput,
+                usePTY: usePTY,
+                emitOutput: true,
+                startMs: startMs,
+                logPrefix: "process_first_command"
+            )
+            Foundation.exit(exitCode)
+        } catch {
+            let message = String(describing: error)
+            logger.log("process_first_command_failed", fields: [
+                "instance": instanceName,
+                "argv0": resolvedArgv[0],
+                "error": message,
+                "elapsed_ms": String(runtimeMonotonicMs() - startMs)
+            ])
+            fputs("msl: process_start_failed: \(message)\n", stderr)
+            Foundation.exit(1)
+        }
+    }
+
+    private func executeNerdctlDirectInit(
+        client: InitChannelClient,
+        instanceName: String,
+        argv: [String],
+        cwd: String?,
+        envAdditions: [String: String],
+        terminalMode: NerdctlTerminalMode,
+        startMs: Int64,
+        logPrefix: String
+    ) throws -> NerdctlExecutionResult {
+        switch terminalMode {
+        case .interactivePTY, .displayPTY:
+            return try executeDirectInitPtyCommandCapturingOutput(
+                client: client,
+                instanceName: instanceName,
+                argv: argv,
+                cwd: cwd,
+                envAdditions: envAdditions,
+                runAsRoot: true,
+                timeoutSec: 0,
+                attachInput: terminalMode == .interactivePTY,
+                emitOutput: true,
+                startMs: startMs,
+                logPrefix: logPrefix
+            )
+        case .streamingProc:
+            return try executeDirectInitStreamingProcCapturingOutput(
+                client: client,
+                instanceName: instanceName,
+                argv: argv,
+                cwd: cwd,
+                envAdditions: envAdditions,
+                runAsRoot: true,
+                startMs: startMs,
+                logPrefix: logPrefix
+            )
+        }
+    }
+
+    private func ensureContainerRuntimeCachePolicy(
+        client: InitChannelClient,
+        instanceName: String
+    ) throws {
+        let script = """
+        set -eu
+        marker_dir=/var/lib/msl
+        marker="$marker_dir/container-runtime-cache-policy"
+        policy=native-v1
+        if [ -f "$marker" ] && [ "$(cat "$marker" 2>/dev/null || true)" = "$policy" ]; then
+          exit 0
+        fi
+        rc-service buildkitd stop >/dev/null 2>&1 || true
+        rc-service containerd stop >/dev/null 2>&1 || true
+        rm -rf /var/lib/containerd /var/lib/buildkit
+        mkdir -p /var/lib/containerd /var/lib/buildkit "$marker_dir"
+        printf '%s\n' "$policy" > "$marker"
+        """
+        let exitCode = try executeDirectInitCommand(
+            client: client,
+            instanceName: instanceName,
+            argv: ["/bin/sh", "-lc", script],
+            cwd: nil,
+            envAdditions: nil,
+            runAsRoot: true,
+            timeoutSec: 30,
+            attachInput: false,
+            usePTY: false,
+            emitOutput: false,
+            startMs: runtimeMonotonicMs(),
+            logPrefix: "container_runtime_cache_policy"
+        )
+        guard exitCode == 0 else {
+            throw MSLRuntimeError("failed to initialize container-runtime native snapshotter cache policy")
+        }
+    }
+
+    private func flushContainerRuntimeDisk(
+        client: InitChannelClient,
+        instanceName: String
+    ) {
+        do {
+            let exitCode = try executeDirectInitCommand(
+                client: client,
+                instanceName: instanceName,
+                argv: ["/bin/sync"],
+                cwd: nil,
+                envAdditions: nil,
+                runAsRoot: true,
+                timeoutSec: 3,
+                attachInput: false,
+                usePTY: false,
+                emitOutput: false,
+                startMs: runtimeMonotonicMs(),
+                logPrefix: "container_runtime_flush"
+            )
+            logger.log("container_runtime_flush_completed", fields: [
+                "instance": instanceName,
+                "exit_code": String(exitCode)
+            ])
+        } catch {
+            logger.log("container_runtime_flush_failed", fields: [
+                "instance": instanceName,
+                "error": String(describing: error)
+            ])
+        }
+    }
+
+    private func ensureContainerRuntimeService(
+        _ service: String,
+        client: InitChannelClient,
+        instanceName: String
+    ) throws {
+        let socketPath = containerRuntimeSocketPath(for: service)
+        let statusCode = try executeDirectInitCommand(
+            client: client,
+            instanceName: instanceName,
+            argv: ["/sbin/rc-service", service, "status"],
+            cwd: nil,
+            envAdditions: nil,
+            runAsRoot: true,
+            timeoutSec: 15,
+            attachInput: false,
+            usePTY: false,
+            emitOutput: false,
+            startMs: runtimeMonotonicMs(),
+            logPrefix: "runtime_service_status"
+        )
+        if statusCode == 0 {
+            try waitForContainerRuntimeSocketIfNeeded(
+                service: service,
+                socketPath: socketPath,
+                client: client,
+                instanceName: instanceName
+            )
+            return
+        }
+
+        let startCode = try executeDirectInitCommand(
+            client: client,
+            instanceName: instanceName,
+            argv: ["/sbin/rc-service", service, "start"],
+            cwd: nil,
+            envAdditions: nil,
+            runAsRoot: true,
+            timeoutSec: 60,
+            attachInput: false,
+            usePTY: false,
+            emitOutput: false,
+            startMs: runtimeMonotonicMs(),
+            logPrefix: "runtime_service_start"
+        )
+        guard startCode == 0 else {
+            throw MSLRuntimeError("failed to start \(service) in container-runtime instance '\(instanceName)'")
+        }
+        try waitForContainerRuntimeSocketIfNeeded(
+            service: service,
+            socketPath: socketPath,
+            client: client,
+            instanceName: instanceName
+        )
+    }
+
+    private func ensureContainerRuntimeServiceManagerInitialized(
+        client: InitChannelClient,
+        instanceName: String
+    ) throws {
+        let initCode = try executeDirectInitCommand(
+            client: client,
+            instanceName: instanceName,
+            argv: [
+                "/bin/sh", "-lc",
+                "mkdir -p /run/openrc && [ -f /run/openrc/softlevel ] || printf 'default\\n' > /run/openrc/softlevel"
+            ],
+            cwd: nil,
+            envAdditions: nil,
+            runAsRoot: true,
+            timeoutSec: 15,
+            attachInput: false,
+            usePTY: false,
+            emitOutput: false,
+            startMs: runtimeMonotonicMs(),
+            logPrefix: "runtime_service_manager_init"
+        )
+        guard initCode == 0 else {
+            throw MSLRuntimeError("failed to initialize openrc runtime state in container-runtime instance '\(instanceName)'")
+        }
+    }
+
+    private func containerRuntimeSocketPath(for service: String) -> String? {
+        switch service {
+        case "containerd":
+            return "/run/containerd/containerd.sock"
+        case "buildkitd":
+            return "/run/buildkit/buildkitd.sock"
+        default:
+            return nil
+        }
+    }
+
+    private func waitForContainerRuntimeSocketIfNeeded(
+        service: String,
+        socketPath: String?,
+        client: InitChannelClient,
+        instanceName: String
+    ) throws {
+        guard let socketPath else { return }
+        let escapedPath = socketPath.replacingOccurrences(of: "'", with: "'\\''")
+        let script = """
+        i=0
+        while [ "$i" -lt 50 ]; do
+          [ -S '\(escapedPath)' ] && exit 0
+          sleep 0.1
+          i=$((i + 1))
+        done
+        exit 1
+        """
+        let waitCode = try executeDirectInitCommand(
+            client: client,
+            instanceName: instanceName,
+            argv: ["/bin/sh", "-lc", script],
+            cwd: nil,
+            envAdditions: nil,
+            runAsRoot: true,
+            timeoutSec: 10,
+            attachInput: false,
+            usePTY: false,
+            emitOutput: false,
+            startMs: runtimeMonotonicMs(),
+            logPrefix: "runtime_service_socket_wait"
+        )
+        guard waitCode == 0 else {
+            throw MSLRuntimeError("\(service) did not become ready in container-runtime instance '\(instanceName)' (missing socket \(socketPath))")
+        }
+    }
+
+    private func reconcileDirectRuntimeDNS(
+        client: InitChannelClient,
+        runner: VirtualMachineRunner,
+        instanceName: String,
+        metadata: DistributionInstanceMetadata
+    ) throws {
+        let config = try defaultInstanceStore.loadConfig()
+        let snapshot = HostResolverSnapshotProvider().capture()
+        let policy = try DNSPolicyResolver().resolve(
+            instancePolicy: metadata.networkPolicy?.dns,
+            globalConfig: config.network?.dns,
+            hostSnapshot: snapshot
+        )
+        if policy.mode == .unmanaged {
+            return
+        }
+
+        let apply = try client.send(InitChannelRequest(
+            op: "dns_reconcile",
+            timeoutMs: 3_000,
+            dnsMode: policy.mode.rawValue,
+            dnsNameservers: policy.nameservers,
+            dnsSearchDomains: policy.searchDomains,
+            dnsResolverBackend: policy.resolverBackend,
+            dnsSource: "runtime_direct",
+            dnsProxyUpstreams: policy.mode == .host ? policy.nameservers : nil,
+            dnsProxyListenAddress: policy.mode == .host ? "127.0.0.1" : nil,
+            dnsProxyListenPort: policy.mode == .host ? 53 : nil
+        ))
+        if !apply.ok {
+            throw MSLRuntimeError(apply.error?.message ?? "dns reconcile failed")
+        }
+
+        let transportReady = ensureGuestTransportReadyViaExec(
+            client: client,
+            topology: runner.activeNetworkTopology
+        )
+        if !transportReady.ok {
+            throw MSLRuntimeError(transportReady.error ?? "guest transport bootstrap failed")
+        }
+
+        let healthcheck = try client.send(InitChannelRequest(
+            op: "dns_healthcheck",
+            timeoutMs: 2_000,
+            dnsMode: policy.mode.rawValue,
+            dnsSource: "runtime_direct"
+        ))
+        if !healthcheck.ok {
+            throw MSLRuntimeError(healthcheck.error?.message ?? "dns healthcheck failed")
+        }
+    }
+
+    private func ensureGuestTransportReadyViaExec(
+        client: InitChannelClient,
+        topology: VMNetNetworkTopology?
+    ) -> (ok: Bool, error: String?) {
+        let script = DaemonServer.makeGuestTransportReadyScript(topology: topology)
+
+        do {
+            let response = try client.send(InitChannelRequest(
+                op: "exec",
+                argv: ["/bin/sh", "-lc", script],
+                runAsRoot: true,
+                timeoutMs: 8_000
+            ))
+            if response.ok, (response.exitCode ?? 1) == 0 {
+                return (true, nil)
+            }
+            let error = response.error?.message ?? response.stderr ?? "missing default route or global ipv4/ipv6 address"
+            return (false, "network transport unavailable: \(error)")
+        } catch {
+            return (false, "network transport bootstrap init_channel error: \(error)")
+        }
+    }
+
+    private func executeDirectInitCommand(
+        client: InitChannelClient,
+        instanceName: String,
+        argv: [String],
+        cwd: String?,
+        envAdditions: [String: String]?,
+        runAsRoot: Bool,
+        timeoutSec: Int,
+        attachInput: Bool,
+        usePTY: Bool,
+        emitOutput: Bool,
+        startMs: Int64,
+        logPrefix: String
+    ) throws -> Int32 {
+        if usePTY {
+            let size = currentWindowSize()
+            let openResp = try client.ptyOpen(
+                argv: argv,
+                cwd: cwd,
+                envAdditions: envAdditions,
+                runAsRoot: runAsRoot,
+                rows: size.rows,
+                cols: size.cols,
+                timeoutMs: timeoutSec > 0 ? timeoutSec * 1000 : nil
+            )
+            guard openResp.ok, let ptyId = openResp.ptyId else {
+                throw MSLRuntimeError(openResp.error?.message ?? "process_start_failed: pty_open failed")
+            }
+            let hostTerminal = attachInput ? HostTerminalState.capture() : nil
+            if attachInput {
+                enterRawModeForShell()
+            }
+            do {
+                let result = try SessionStreamBridge.runPty(
+                    initClient: client,
+                    ptyID: ptyId,
+                    inputFD: attachInput ? FileHandle.standardInput.fileDescriptor : nil,
+                    detachByte: 0x1d,
+                    onOutput: { data in
+                        if emitOutput {
+                            FileHandle.standardOutput.write(data)
+                        }
+                        return true
+                    },
+                    onExitObserved: { [logger] code, reason in
+                        var fields: [String: String] = [
+                            "instance": instanceName,
+                            "phase": logPrefix,
+                            "exit": String(code)
+                        ]
+                        if let reason {
+                            fields["exit_reason"] = reason
+                        }
+                        logger.log("\(logPrefix)_exit_observed", fields: fields)
+                    },
+                    resizeProvider: { [self] in currentWindowSize() }
+                )
+                hostTerminal?.restore()
+                logger.log("\(logPrefix)_completed", fields: [
+                    "instance": instanceName,
+                    "argv0": argv[0],
+                    "exit_code": String(result.exitCode),
+                    "elapsed_ms": String(runtimeMonotonicMs() - startMs),
+                    "transport": attachInput ? "direct_init_interactive_pty" : "direct_init_display_pty"
+                ])
+                return result.exitCode
+            } catch {
+                hostTerminal?.restore()
+                throw error
+            }
+        }
+
+        if !attachInput {
+            let response = try client.send(InitChannelRequest(
+                op: "exec",
+                argv: argv,
+                envAdditions: envAdditions,
+                runAsRoot: runAsRoot,
+                cwd: cwd,
+                timeoutMs: timeoutSec > 0 ? timeoutSec * 1000 : nil
+            ))
+            guard response.ok else {
+                throw MSLRuntimeError(response.error?.message ?? "process_start_failed: exec failed")
+            }
+            if emitOutput {
+                if let stdout = response.rawStdout ?? response.stdout.map({ Data($0.utf8) }), !stdout.isEmpty {
+                    FileHandle.standardOutput.write(stdout)
+                }
+                if let stderr = response.rawStderr ?? response.stderr.map({ Data($0.utf8) }), !stderr.isEmpty {
+                    FileHandle.standardError.write(stderr)
+                }
+            }
+            let exitCode = response.exitCode ?? 0
+            logger.log("\(logPrefix)_completed", fields: [
+                "instance": instanceName,
+                "argv0": argv[0],
+                "exit_code": String(exitCode),
+                "elapsed_ms": String(runtimeMonotonicMs() - startMs),
+                "transport": "direct_init_exec"
+            ])
+            return exitCode
+        }
+
+        let openResp = try client.procOpen(
+            argv: argv,
+            cwd: cwd,
+            envAdditions: envAdditions,
+            runAsRoot: runAsRoot,
+            timeoutMs: timeoutSec > 0 ? timeoutSec * 1000 : nil
+        )
+        guard openResp.ok, let procId = openResp.procId else {
+            throw MSLRuntimeError(openResp.error?.message ?? "process_start_failed: proc_open failed")
+        }
+
+        let result = try SessionStreamBridge.runProc(
+            initClient: client,
+            procID: procId,
+            inputFD: attachInput ? FileHandle.standardInput.fileDescriptor : nil,
+            attachInput: attachInput,
+            onOutput: { event in
+                guard emitOutput else { return true }
+                switch event.kind {
+                case .stdout:
+                    FileHandle.standardOutput.write(event.data)
+                case .stderr:
+                    FileHandle.standardError.write(event.data)
+                }
+                return true
+            }
+        )
+        logger.log("\(logPrefix)_completed", fields: [
+            "instance": instanceName,
+            "argv0": argv[0],
+            "exit_code": String(result.exitCode),
+            "elapsed_ms": String(runtimeMonotonicMs() - startMs),
+            "transport": "direct_init_proc"
+        ])
+        return result.exitCode
+    }
+
+    private func executeDirectInitStreamingProc(
+        client: InitChannelClient,
+        instanceName: String,
+        argv: [String],
+        cwd: String?,
+        envAdditions: [String: String]?,
+        runAsRoot: Bool,
+        startMs: Int64,
+        logPrefix: String
+    ) throws -> Int32 {
+        let openResp = try client.procOpen(
+            argv: argv,
+            cwd: cwd,
+            envAdditions: envAdditions,
+            runAsRoot: runAsRoot,
+            timeoutMs: nil
+        )
+        guard openResp.ok, let procId = openResp.procId else {
+            throw MSLRuntimeError(openResp.error?.message ?? "process_start_failed: proc_open failed")
+        }
+
+        let result = try SessionStreamBridge.runProc(
+            initClient: client,
+            procID: procId,
+            inputFD: nil,
+            attachInput: false,
+            onOutput: { event in
+                switch event.kind {
+                case .stdout:
+                    FileHandle.standardOutput.write(event.data)
+                case .stderr:
+                    FileHandle.standardError.write(event.data)
+                }
+                return true
+            },
+            onExitObserved: { [logger] code, reason in
+                var fields: [String: String] = [
+                    "instance": instanceName,
+                    "phase": logPrefix,
+                    "exit": String(code)
+                ]
+                if let reason {
+                    fields["exit_reason"] = reason
+                }
+                logger.log("\(logPrefix)_exit_observed", fields: fields)
+            }
+        )
+        logger.log("\(logPrefix)_completed", fields: [
+            "instance": instanceName,
+            "argv0": argv[0],
+            "exit_code": String(result.exitCode),
+            "elapsed_ms": String(runtimeMonotonicMs() - startMs),
+            "transport": "direct_init_proc_stream"
+        ])
+        return result.exitCode
+    }
+
+    private func executeDirectInitPtyCommandCapturingOutput(
+        client: InitChannelClient,
+        instanceName: String,
+        argv: [String],
+        cwd: String?,
+        envAdditions: [String: String]?,
+        runAsRoot: Bool,
+        timeoutSec: Int,
+        attachInput: Bool,
+        emitOutput: Bool,
+        startMs: Int64,
+        logPrefix: String
+    ) throws -> NerdctlExecutionResult {
+        let size = currentWindowSize()
+        let openResp = try client.ptyOpen(
+            argv: argv,
+            cwd: cwd,
+            envAdditions: envAdditions,
+            runAsRoot: runAsRoot,
+            rows: size.rows,
+            cols: size.cols,
+            timeoutMs: timeoutSec > 0 ? timeoutSec * 1000 : nil
+        )
+        guard openResp.ok, let ptyId = openResp.ptyId else {
+            throw MSLRuntimeError(openResp.error?.message ?? "process_start_failed: pty_open failed")
+        }
+        let capture = RollingOutputCapture()
+        let hostTerminal = attachInput ? HostTerminalState.capture() : nil
+        if attachInput {
+            enterRawModeForShell()
+        }
+        do {
+            let result = try SessionStreamBridge.runPty(
+                initClient: client,
+                ptyID: ptyId,
+                inputFD: attachInput ? FileHandle.standardInput.fileDescriptor : nil,
+                detachByte: 0x1d,
+                onOutput: { data in
+                    capture.append(data)
+                    if emitOutput {
+                        FileHandle.standardOutput.write(data)
+                    }
+                    return true
+                },
+                onExitObserved: { [logger] code, reason in
+                    var fields: [String: String] = [
+                        "instance": instanceName,
+                        "phase": logPrefix,
+                        "exit": String(code)
+                    ]
+                    if let reason {
+                        fields["exit_reason"] = reason
+                    }
+                    logger.log("\(logPrefix)_exit_observed", fields: fields)
+                },
+                resizeProvider: { [self] in currentWindowSize() }
+            )
+            hostTerminal?.restore()
+            logger.log("\(logPrefix)_completed", fields: [
+                "instance": instanceName,
+                "argv0": argv[0],
+                "exit_code": String(result.exitCode),
+                "elapsed_ms": String(runtimeMonotonicMs() - startMs),
+                "transport": attachInput ? "direct_init_interactive_pty" : "direct_init_display_pty"
+            ])
+            return NerdctlExecutionResult(exitCode: result.exitCode, capturedOutput: capture.stringValue)
+        } catch {
+            hostTerminal?.restore()
+            throw error
+        }
+    }
+
+    private func executeDirectInitStreamingProcCapturingOutput(
+        client: InitChannelClient,
+        instanceName: String,
+        argv: [String],
+        cwd: String?,
+        envAdditions: [String: String]?,
+        runAsRoot: Bool,
+        startMs: Int64,
+        logPrefix: String
+    ) throws -> NerdctlExecutionResult {
+        let openResp = try client.procOpen(
+            argv: argv,
+            cwd: cwd,
+            envAdditions: envAdditions,
+            runAsRoot: runAsRoot,
+            timeoutMs: nil
+        )
+        guard openResp.ok, let procId = openResp.procId else {
+            throw MSLRuntimeError(openResp.error?.message ?? "process_start_failed: proc_open failed")
+        }
+
+        let capture = RollingOutputCapture()
+        let result = try SessionStreamBridge.runProc(
+            initClient: client,
+            procID: procId,
+            inputFD: nil,
+            attachInput: false,
+            onOutput: { event in
+                capture.append(event.data)
+                switch event.kind {
+                case .stdout:
+                    FileHandle.standardOutput.write(event.data)
+                case .stderr:
+                    FileHandle.standardError.write(event.data)
+                }
+                return true
+            },
+            onExitObserved: { [logger] code, reason in
+                var fields: [String: String] = [
+                    "instance": instanceName,
+                    "phase": logPrefix,
+                    "exit": String(code)
+                ]
+                if let reason {
+                    fields["exit_reason"] = reason
+                }
+                logger.log("\(logPrefix)_exit_observed", fields: fields)
+            }
+        )
+        logger.log("\(logPrefix)_completed", fields: [
+            "instance": instanceName,
+            "argv0": argv[0],
+            "exit_code": String(result.exitCode),
+            "elapsed_ms": String(runtimeMonotonicMs() - startMs),
+            "transport": "direct_init_proc_stream"
+        ])
+        return NerdctlExecutionResult(exitCode: result.exitCode, capturedOutput: capture.stringValue)
+    }
+
+    private func makeDirectVirtualMachineRunner(
+        metadataURL: URL,
+        instanceName: String
+    ) throws -> VirtualMachineRunner {
+        let configKernel = try defaultInstanceStore.loadDefaultKernelProfileRef()
+        let bootProfile = try RuntimeBootProfileResolver(
+            paths: paths,
+            logger: logger,
+            environment: ProcessInfo.processInfo.environment
+        ).resolve(
+            metadataURL: metadataURL,
+            instanceName: instanceName,
+            defaultKernelProfileRef: configKernel
+        )
+        let resolvedNetworkMode = NetworkModeResolver.resolve(
+            configured: NetworkModeResolver.configuredMode(from: try? defaultInstanceStore.loadConfig()),
+            executablePath: executablePath
+        )
+        return VirtualMachineRunner(
+            paths: paths,
+            metadataURL: metadataURL,
+            bootProfile: bootProfile,
+            logger: logger,
+            initProbeHandler: { [weak self] probe in
+                self?.updateInitChannelState(probe)
+            },
+            networkMode: resolvedNetworkMode.effective
+        )
+    }
+
     private func runCommandViaLegacyExec(
         argv: [String],
         timeoutSec: Int,
         targetInstanceName: String,
         execCwd: String?,
+        envAdditions: [String: String]?,
+        runAsRoot: Bool,
         startMs: Int64
     ) throws -> Never {
         try daemonClient.ensureConnected(
@@ -981,9 +1962,10 @@ public final class RuntimeManager {
             op: "exec",
             argv: argv,
             timeoutMs: execTimeoutMs,
-            runAsRoot: shouldForceRootRuntimeUser(),
+            runAsRoot: runAsRoot,
             sessionId: sessionID,
-            cwd: execCwd
+            cwd: execCwd,
+            envAdditions: envAdditions
         ))
         if let stdout = response.stdout, !stdout.isEmpty {
             FileHandle.standardOutput.write(Data(stdout.utf8))
@@ -1074,13 +2056,19 @@ public final class RuntimeManager {
         let statusEntries = managerMapped.isEmpty ? instances : managerMapped.sorted { $0.instance < $1.instance }
 
         if all {
-            print("INSTANCE\tSTATE\tLIFECYCLE\tSTEP\tSESSIONS\tIDLE\tPID\tLAST_ERROR")
+            print("INSTANCE\tMODE\tSTATE\tLIFECYCLE\tSTEP\tSESSIONS\tIDLE\tPID\tLAST_ERROR")
             for entry in statusEntries {
                 let idle = entry.idleTimer.armed ? "armed" : "not-armed"
                 let pid = entry.runtimeHostPid.map(String.init) ?? "-"
                 let lastError = (entry.lastErrorMessage ?? entry.lastError)?.replacingOccurrences(of: "\n", with: " ") ?? "-"
                 let step = entry.startupStep.map { "\($0) \(entry.startupStepName ?? "-")" } ?? "-"
-                print("\(entry.instance)\t\(entry.vmState.rawValue)\t\(entry.lifecycleState.rawValue)\t\(step)\t\(entry.activeSessionCount)\t\(idle)\t\(pid)\t\(lastError)")
+                let mode = (try? distributionManager.readOrRebuildInstanceMetadata(at: paths.distroMetadataFile(named: entry.instance)))?
+                    .resolvedStartupMode()
+                    .rawValue ?? DistributionInstanceMetadata.StartupMode.interactive.rawValue
+                let workload = (try? distributionManager.readOrRebuildInstanceMetadata(at: paths.distroMetadataFile(named: entry.instance)))?
+                    .resolvedWorkloadKind()
+                    .rawValue ?? DistributionInstanceMetadata.WorkloadKind.generic.rawValue
+                print("\(entry.instance)\t\(mode)/\(workload)\t\(entry.vmState.rawValue)\t\(entry.lifecycleState.rawValue)\t\(step)\t\(entry.activeSessionCount)\t\(idle)\t\(pid)\t\(lastError)")
             }
             return
         }
@@ -1090,6 +2078,11 @@ public final class RuntimeManager {
             throw MSLRuntimeError("instance '\(targetInstance)' not found")
         }
         print("instance: \(selected.instance)")
+        let selectedMetadata = try distributionManager.readOrRebuildInstanceMetadata(
+            at: paths.distroMetadataFile(named: selected.instance)
+        )
+        print("startupMode: \(selectedMetadata.resolvedStartupMode().rawValue)")
+        print("workloadKind: \(selectedMetadata.resolvedWorkloadKind().rawValue)")
         print("state: \(selected.vmState.rawValue)")
         print("lifecycle: \(selected.lifecycleState.rawValue)")
         print("activeSessions: \(selected.activeSessionCount)")
@@ -1624,10 +2617,136 @@ public final class RuntimeManager {
 
     private func currentWindowSize() -> (rows: Int?, cols: Int?) {
         var size = winsize()
-        if ioctl(FileHandle.standardInput.fileDescriptor, TIOCGWINSZ, &size) != 0 {
-            return (nil, nil)
+        if ioctl(FileHandle.standardOutput.fileDescriptor, TIOCGWINSZ, &size) == 0 {
+            return (Int(size.ws_row), Int(size.ws_col))
         }
-        return (Int(size.ws_row), Int(size.ws_col))
+        if ioctl(FileHandle.standardInput.fileDescriptor, TIOCGWINSZ, &size) == 0 {
+            return (Int(size.ws_row), Int(size.ws_col))
+        }
+        return (nil, nil)
+    }
+
+    private func hostHasOutputTTY() -> Bool {
+        isatty(FileHandle.standardOutput.fileDescriptor) == 1 &&
+        isatty(FileHandle.standardError.fileDescriptor) == 1
+    }
+
+    private func hostHasInteractiveTTY() -> Bool {
+        isatty(FileHandle.standardInput.fileDescriptor) == 1 && hostHasOutputTTY()
+    }
+
+    private func nerdctlEnvironment() -> [String: String] {
+        var env = [
+            "CONTAINERD_ADDRESS": "/run/containerd/containerd.sock",
+            "BUILDKIT_HOST": "unix:///run/buildkit/buildkitd.sock",
+            "CONTAINERD_SNAPSHOTTER": "native",
+            "TERM": ProcessInfo.processInfo.environment["TERM"].flatMap { $0.isEmpty ? nil : $0 } ?? "xterm-256color"
+        ]
+        if let colorTerm = ProcessInfo.processInfo.environment["COLORTERM"], !colorTerm.isEmpty {
+            env["COLORTERM"] = colorTerm
+        }
+        return env
+    }
+
+    private func applyDefaultNerdctlSnapshotterIfNeeded(_ argv: [String]) -> [String] {
+        guard !nerdctlArgumentsSpecifySnapshotter(argv) else {
+            return argv
+        }
+        return ["--snapshotter", "native"] + argv
+    }
+
+    private func nerdctlArgumentsSpecifySnapshotter(_ argv: [String]) -> Bool {
+        var index = 0
+        while index < argv.count {
+            let arg = argv[index]
+            if arg == "--" {
+                return false
+            }
+            if arg == "--snapshotter" || arg.hasPrefix("--snapshotter=") {
+                return true
+            }
+            if arg.hasPrefix("-"), !arg.contains("="), index + 1 < argv.count,
+               ["-n", "--namespace", "--address", "--cgroup-manager", "--data-root", "--host"].contains(arg) {
+                index += 2
+            } else {
+                index += 1
+            }
+        }
+        return false
+    }
+
+    private func resolveNerdctlTerminalMode(argv: [String]) -> NerdctlTerminalMode {
+        guard hostHasOutputTTY() else { return .streamingProc }
+        if nerdctlHasInteractiveTTYFlag(argv: argv) {
+            return hostHasInteractiveTTY() ? .interactivePTY : .displayPTY
+        }
+        return nerdctlNeedsDisplayPTY(argv: argv) ? .displayPTY : .streamingProc
+    }
+
+    private func nerdctlHasInteractiveTTYFlag(argv: [String]) -> Bool {
+        argv.contains { arg in
+            arg == "-i" || arg == "-t" || arg == "-it" || arg == "-ti"
+                || arg == "--interactive" || arg == "--tty"
+        }
+    }
+
+    private func nerdctlNeedsDisplayPTY(argv: [String]) -> Bool {
+        let commandIndex = firstNerdctlCommandIndex(in: argv)
+        let command = commandIndex.map { argv[$0] }
+        switch command {
+        case "run", "pull", "push", "build":
+            return true
+        case "compose":
+            guard let commandIndex,
+                  let composeCommandIndex = firstNerdctlCommandIndex(in: Array(argv.dropFirst(commandIndex + 1))) else {
+                return false
+            }
+            let composeCommand = Array(argv.dropFirst(commandIndex + 1))[composeCommandIndex]
+            return composeCommand == "up" || composeCommand == "build" || composeCommand == "pull"
+        default:
+            return false
+        }
+    }
+
+    private func nerdctlNeedsBuildkit(argv: [String]) -> Bool {
+        guard let commandIndex = firstNerdctlCommandIndex(in: argv) else {
+            return false
+        }
+        let command = argv[commandIndex]
+        if command == "build" || command == "builder" {
+            return true
+        }
+        if command == "compose" {
+            let rest = Array(argv.dropFirst(commandIndex + 1))
+            guard let composeCommandIndex = firstNerdctlCommandIndex(in: rest) else {
+                return false
+            }
+            let composeCommand = rest[composeCommandIndex]
+            return composeCommand == "build" || composeCommand == "up"
+        }
+        return false
+    }
+
+    private func firstNerdctlCommandIndex(in argv: [String]) -> Int? {
+        var index = 0
+        while index < argv.count {
+            let arg = argv[index]
+            if arg == "--" {
+                index += 1
+                continue
+            }
+            if arg.hasPrefix("-") {
+                if ["--namespace", "--address", "--snapshotter", "--cgroup-manager", "--data-root", "--host", "--file", "-n", "-f"].contains(arg),
+                   index + 1 < argv.count {
+                    index += 2
+                } else {
+                    index += 1
+                }
+                continue
+            }
+            return index
+        }
+        return nil
     }
 
     private func enterRawModeForShell() {
@@ -2061,6 +3180,44 @@ public final class RuntimeManager {
         }
     }
 
+    private func evaluateNerdctlWorkspacePolicy(
+        instanceName: String,
+        metadataURL: URL,
+        metadata: DistributionInstanceMetadata
+    ) -> WorkspaceStartupPolicyDecision {
+        let resolved = evaluateWorkspaceStartupPolicy(instanceName: instanceName, metadataURL: metadataURL)
+        if resolved.workspaceGuestPath != nil {
+            return resolved
+        }
+        guard metadata.resolvedWorkloadKind() == .containerRuntime else {
+            return resolved
+        }
+
+        let launchDirectory = URL(fileURLWithPath: fileManager.currentDirectoryPath, isDirectory: true)
+        let resolvedPath = launchDirectory.resolvingSymlinksInPath().path
+        let hostShareRoot = resolveWorkspaceHostShareRoot()
+        guard WorkspaceHostSharePolicy.isPathAllowed(resolvedPath, withinRoot: hostShareRoot) else {
+            return resolved
+        }
+        let protectedPrefixes = metadata.workspacePolicy?.protectedGuestPathPrefixes ?? WorkspaceActivationResolver.defaultProtectedGuestPathPrefixes
+        for prefix in protectedPrefixes {
+            let normalized = prefix.trimmingCharacters(in: .whitespacesAndNewlines)
+            if normalized.isEmpty || !normalized.hasPrefix("/") {
+                continue
+            }
+            if resolvedPath == normalized || resolvedPath.hasPrefix(normalized + "/") {
+                return resolved
+            }
+        }
+
+        logger.log("workspace_runtime_fallback_enabled", fields: [
+            "instance": instanceName,
+            "cwd": resolvedPath,
+            "reason": "container_runtime_direct_mount"
+        ])
+        return WorkspaceStartupPolicyDecision(workspaceGuestPath: resolvedPath, overlays: [])
+    }
+
     private func resolveWorkspaceHostShareRoot() -> String {
         let config = try? defaultInstanceStore.loadConfig()
         return WorkspaceHostSharePolicy.resolveRoot(
@@ -2138,6 +3295,40 @@ public final class RuntimeManager {
         }
     }
 
+    private func prepareDirectWorkspaceIfNeeded(
+        client: InitChannelClient,
+        policy: WorkspaceStartupPolicyDecision,
+        instanceName: String
+    ) throws -> String? {
+        guard let workspaceGuestPath = policy.workspaceGuestPath else {
+            return nil
+        }
+        let hostShareRoot = resolveWorkspaceHostShareRoot()
+
+        let response = try client.send(InitChannelRequest(
+            op: "host_share_prepare",
+            cwd: workspaceGuestPath,
+            hostShareRoot: hostShareRoot,
+            timeoutMs: 4_000
+        ))
+        guard response.ok else {
+            logger.log("workspace_fallback_home", fields: [
+                "instance": instanceName,
+                "workspace_guest_path": workspaceGuestPath,
+                "reason": "direct_workspace_prepare_failed",
+                "error": response.error?.message ?? "unknown"
+            ])
+            return nil
+        }
+        logger.log("workspace_resolve_succeeded", fields: [
+            "instance": instanceName,
+            "workspace_guest_path": workspaceGuestPath,
+            "exclude_overlay_count": String(policy.overlays.count),
+            "mount_status": response.meta?["status"] ?? "applied"
+        ])
+        return workspaceGuestPath
+    }
+
     private func resolveRuntimeTarget(explicitInstanceName: String?) throws -> (instanceName: String, metadataURL: URL) {
         let configured = try defaultInstanceStore.loadDefaultInstanceName()
         let metadataURL = try distributionManager.runtimeMetadataURL(
@@ -2146,6 +3337,193 @@ public final class RuntimeManager {
         )
         let instanceName = metadataURL.deletingLastPathComponent().lastPathComponent
         return (instanceName, metadataURL)
+    }
+
+    private func resolveContainerRuntimeTarget(explicitInstanceName: String?) throws -> (instanceName: String, metadataURL: URL) {
+        let trimmedExplicit = explicitInstanceName?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let resolvedName = (trimmedExplicit?.isEmpty == false)
+            ? trimmedExplicit!
+            : distributionManager.resolveContainerRuntimeInstanceName()
+        let metadataURL = paths.distroMetadataFile(named: resolvedName)
+        let diskURL = paths.distroDiskFile(named: resolvedName)
+        guard fileManager.fileExists(atPath: metadataURL.path), fileManager.fileExists(atPath: diskURL.path) else {
+            throw MSLRuntimeError("container runtime artifact is not installed; use `make build-container-runtime`")
+        }
+        return (resolvedName, metadataURL)
+    }
+
+    struct NerdctlWorkspacePlan: Equatable {
+        var requiresWorkspace: Bool
+    }
+
+    enum NerdctlPrimaryCommand: Equatable {
+        case build
+        case compose
+        case other(String?)
+    }
+
+    func resolveNerdctlWorkspacePlan(argv: [String]) throws -> NerdctlWorkspacePlan {
+        let command = try parseNerdctlPrimaryCommand(argv: argv)
+        switch command {
+        case .build:
+            try validateNerdctlBuildArguments(argv)
+            return NerdctlWorkspacePlan(requiresWorkspace: true)
+        case .compose:
+            try validateNerdctlComposeArguments(argv)
+            return NerdctlWorkspacePlan(requiresWorkspace: true)
+        default:
+            return NerdctlWorkspacePlan(requiresWorkspace: false)
+        }
+    }
+
+    func parseNerdctlPrimaryCommand(argv: [String]) throws -> NerdctlPrimaryCommand {
+        let globalOptionsWithValues: Set<String> = [
+            "--address", "-a",
+            "--namespace", "-n",
+            "--host", "-H",
+            "--snapshotter",
+            "--data-root",
+            "--cni-path",
+            "--cni-netconfpath"
+        ]
+        var index = 0
+        while index < argv.count {
+            let token = argv[index]
+            if token == "--" {
+                break
+            }
+            if globalOptionsWithValues.contains(token) {
+                index += 2
+                continue
+            }
+            if token.hasPrefix("-") {
+                index += 1
+                continue
+            }
+            if token == "build" {
+                return .build
+            }
+            if token == "compose" {
+                return .compose
+            }
+            return .other(token)
+        }
+        return .other(nil)
+    }
+
+    private func validateNerdctlBuildArguments(_ argv: [String]) throws {
+        let cwd = URL(fileURLWithPath: fileManager.currentDirectoryPath, isDirectory: true).resolvingSymlinksInPath()
+        let hostShareRoot = resolveWorkspaceHostShareRoot()
+        var dockerfilePath: String?
+        var contextPath: String?
+        var seenBuild = false
+        var expectDockerfileValue = false
+
+        for token in argv {
+            if expectDockerfileValue {
+                dockerfilePath = token
+                expectDockerfileValue = false
+                continue
+            }
+            if !seenBuild {
+                if token == "build" {
+                    seenBuild = true
+                }
+                continue
+            }
+            if token == "--" { continue }
+            if token == "-f" || token == "--file" {
+                expectDockerfileValue = true
+                continue
+            }
+            if token.hasPrefix("--file=") {
+                dockerfilePath = String(token.dropFirst("--file=".count))
+                continue
+            }
+            if token.hasPrefix("-") {
+                continue
+            }
+            contextPath = token
+        }
+
+        if let dockerfilePath {
+            try validateNerdctlWorkspacePathArgument(
+                dockerfilePath,
+                cwd: cwd,
+                hostShareRoot: hostShareRoot,
+                label: "Dockerfile path"
+            )
+        }
+        if let contextPath {
+            try validateNerdctlWorkspacePathArgument(
+                contextPath,
+                cwd: cwd,
+                hostShareRoot: hostShareRoot,
+                label: "build context"
+            )
+        }
+    }
+
+    private func validateNerdctlComposeArguments(_ argv: [String]) throws {
+        let cwd = URL(fileURLWithPath: fileManager.currentDirectoryPath, isDirectory: true).resolvingSymlinksInPath()
+        let hostShareRoot = resolveWorkspaceHostShareRoot()
+        var seenCompose = false
+        var expectFileValue = false
+
+        for token in argv {
+            if expectFileValue {
+                try validateNerdctlWorkspacePathArgument(
+                    token,
+                    cwd: cwd,
+                    hostShareRoot: hostShareRoot,
+                    label: "compose file"
+                )
+                expectFileValue = false
+                continue
+            }
+            if !seenCompose {
+                if token == "compose" {
+                    seenCompose = true
+                }
+                continue
+            }
+            if token == "-f" || token == "--file" {
+                expectFileValue = true
+                continue
+            }
+            if token.hasPrefix("--file=") {
+                try validateNerdctlWorkspacePathArgument(
+                    String(token.dropFirst("--file=".count)),
+                    cwd: cwd,
+                    hostShareRoot: hostShareRoot,
+                    label: "compose file"
+                )
+            }
+        }
+    }
+
+    private func validateNerdctlWorkspacePathArgument(
+        _ rawPath: String,
+        cwd: URL,
+        hostShareRoot: String,
+        label: String
+    ) throws {
+        let trimmed = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        let resolved: URL
+        if trimmed.hasPrefix("/") {
+            resolved = URL(fileURLWithPath: trimmed, isDirectory: false).resolvingSymlinksInPath()
+        } else {
+            resolved = cwd.appendingPathComponent(trimmed).resolvingSymlinksInPath()
+        }
+        let resolvedPath = resolved.path
+        let cwdPath = cwd.path
+        guard resolvedPath == cwdPath || resolvedPath.hasPrefix(cwdPath + "/") else {
+            throw MSLRuntimeError("\(label) must stay within the current workspace: \(trimmed)")
+        }
+        guard WorkspaceHostSharePolicy.isPathAllowed(cwdPath, withinRoot: hostShareRoot) else {
+            throw MSLRuntimeError("current workspace is outside workspace host share root")
+        }
     }
 
     private func shouldForceRootRuntimeUser() -> Bool {

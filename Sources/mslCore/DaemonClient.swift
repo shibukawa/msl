@@ -245,6 +245,7 @@ public final class DaemonClient {
         guard FileManager.default.fileExists(atPath: appBundlePath) else {
             throw MSLRuntimeError("MSLDesktop.app was not found at \(appBundlePath). Build the desktop app first.")
         }
+        try terminateStaleDesktopApps(appBundlePath: appBundlePath)
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
         process.arguments = ["-gj", appBundlePath]
@@ -265,6 +266,48 @@ public final class DaemonClient {
             return executableDir.deletingLastPathComponent().deletingLastPathComponent().path
         }
         return executableDir.appendingPathComponent("MSLDesktop.app", isDirectory: true).path
+    }
+
+    private func terminateStaleDesktopApps(appBundlePath: String) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+        let appName = URL(fileURLWithPath: appBundlePath).lastPathComponent
+        let executableMarker = "\(appName)/Contents/MacOS/MSLDesktop"
+        process.arguments = ["-f", executableMarker]
+        let stdout = Pipe()
+        process.standardOutput = stdout
+        process.standardError = Pipe()
+        try process.run()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 || process.terminationStatus == 1 else {
+            return
+        }
+        let outputData = stdout.fileHandleForReading.readDataToEndOfFile()
+        guard let output = String(data: outputData, encoding: .utf8) else {
+            return
+        }
+
+        let pids = output
+            .split(separator: "\n", omittingEmptySubsequences: true)
+            .compactMap { Int32($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+
+        guard !pids.isEmpty else {
+            return
+        }
+
+        for pid in pids {
+            _ = kill(pid, SIGTERM)
+        }
+        let deadline = Date().addingTimeInterval(2.0)
+        while Date() < deadline {
+            if pids.allSatisfy({ !isDaemonAlive(pid: $0) }) {
+                return
+            }
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+        for pid in pids where isDaemonAlive(pid: pid) {
+            _ = kill(pid, SIGKILL)
+        }
     }
 
     // MARK: - Daemon Startup

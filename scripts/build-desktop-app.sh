@@ -17,10 +17,19 @@ cp "$ROOT_DIR/.build/debug/msl" "$MACOS_DIR/msl"
 rm -rf "$CONTAINER_TOOLS_DEST_DIR"
 if [[ -f "$CONTAINER_TOOLS_SOURCE_DIR/manifest.json" ]]; then
   mkdir -p "$CONTAINER_TOOLS_DEST_DIR"
-  cp "$CONTAINER_TOOLS_SOURCE_DIR/manifest.json" "$CONTAINER_TOOLS_DEST_DIR/manifest.json"
-  cp "$CONTAINER_TOOLS_SOURCE_DIR/regctl" "$CONTAINER_TOOLS_DEST_DIR/regctl"
-  cp "$CONTAINER_TOOLS_SOURCE_DIR/umoci" "$CONTAINER_TOOLS_DEST_DIR/umoci"
-  chmod 0755 "$CONTAINER_TOOLS_DEST_DIR/regctl" "$CONTAINER_TOOLS_DEST_DIR/umoci"
+  python3 - "$CONTAINER_TOOLS_SOURCE_DIR/manifest.json" "$CONTAINER_TOOLS_SOURCE_DIR" "$CONTAINER_TOOLS_DEST_DIR" <<'PY'
+import json, os, shutil, sys
+manifest_path, source_root, dest_root = sys.argv[1:]
+with open(manifest_path, "r", encoding="utf-8") as fh:
+    manifest = json.load(fh)
+shutil.copy2(manifest_path, os.path.join(dest_root, "manifest.json"))
+for tool in manifest.get("tools", []):
+    src = os.path.join(source_root, tool["relativePath"])
+    dst = os.path.join(dest_root, tool["relativePath"])
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    shutil.copy2(src, dst)
+    os.chmod(dst, 0o755)
+PY
 fi
 
 cat > "$CONTENTS_DIR/Info.plist" <<'PLIST'

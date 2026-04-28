@@ -3,12 +3,19 @@ import Foundation
 enum MSLInitBootTransferProtocol {
     static let magic = "MSLB2"
     static let helloOp = "HELLO"
+    static let controlRole = "control"
+    static let sidebandRolePrefix = "sideband:"
     static let metadataVersion: UInt32 = 1
     static let requiredFlag: UInt8 = 0x01
 
     struct Hello: Equatable {
         var version: String
-        var initMode: String
+        var role: String
+        var detail: String?
+
+        var initMode: String? {
+            role == "bootloader" ? detail : nil
+        }
     }
 
     enum TargetKind: UInt8, Equatable {
@@ -34,7 +41,18 @@ enum MSLInitBootTransferProtocol {
               parts[1] == helloOp else {
             return nil
         }
-        return Hello(version: parts[2], initMode: parts[3])
+        let payload = parts[3]
+        if payload == controlRole {
+            return Hello(version: parts[2], role: controlRole, detail: nil)
+        }
+        if payload.hasPrefix(sidebandRolePrefix) {
+            return Hello(
+                version: parts[2],
+                role: "sideband",
+                detail: String(payload.dropFirst(sidebandRolePrefix.count))
+            )
+        }
+        return Hello(version: parts[2], role: "bootloader", detail: payload)
     }
 
     static func encodeMetadataBlock(version: UInt32 = metadataVersion, records: [MetadataRecord]) throws -> Data {

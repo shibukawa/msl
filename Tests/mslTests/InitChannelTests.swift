@@ -196,6 +196,23 @@ final class InitChannelTests: XCTestCase {
         XCTAssertEqual(decoded.chunks?.last?.dataBase64, "YmFy")
     }
 
+    func testProcReadUsesDirectFrameTransport() throws {
+        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+        let source = try String(contentsOf: root.appendingPathComponent("Sources/mslCore/InitChannel.swift"), encoding: .utf8)
+
+        XCTAssertTrue(source.contains("public func procRead(procId: String, timeoutMs: Int? = nil) throws -> InitChannelResponse {"))
+        XCTAssertTrue(source.contains("sendDirect(opcode: .procReadRequest"))
+        XCTAssertTrue(source.contains("decodeDirectProcReadResponse(frame)"))
+    }
+
+    func testDirectRequestsReusePersistentSidebandConnection() throws {
+        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+        let source = try String(contentsOf: root.appendingPathComponent("Sources/mslCore/InitChannel.swift"), encoding: .utf8)
+
+        XCTAssertTrue(source.contains("if vsockFD != nil && persistentSidebandFD < 0 {"))
+        XCTAssertTrue(source.contains("try withPersistentSidebandConnection { connection in"))
+    }
+
     func testSendFallsBackToFileHandoff() throws {
         let root = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("msl-init-handoff-tests-\(UUID().uuidString)", isDirectory: true)
@@ -272,19 +289,24 @@ final class InitChannelTests: XCTestCase {
                 for _ in 0..<2 {
                     let frame = try helper.readFrameForTest(from: serverFD, op: "proc_write")
                     let decoded = try helper.decodeFrame(frame)
-                    XCTAssertEqual(decoded.opcode, .procWriteRequest)
-                    let requestHeader = try JSONSerialization.jsonObject(with: decoded.header) as? [String: Any]
-                    let requestId = requestHeader?["requestId"] as? String ?? ""
-                    let procId = requestHeader?["procId"] as? String ?? ""
-                    let header = """
-                    {"version":1,"requestId":"\(requestId)","op":"proc_write","status":"ok","procId":"\(procId)"}
-                    """
-                    let response = try helper.encodeFrame(
-                        opcode: .procWriteResponse,
-                        header: Data(header.utf8),
-                        payload: Data()
+                    XCTAssertEqual(decoded.opcode, .jsonRPCRequest)
+                    let request = try JSONDecoder().decode(InitChannelRequest.self, from: decoded.payload)
+                    XCTAssertEqual(request.op, "proc_write")
+                    XCTAssertEqual(request.procId, "proc-1")
+                    XCTAssertNotNil(request.dataBase64)
+                    let response = InitChannelResponse(
+                        requestId: request.requestId,
+                        op: "proc_write",
+                        status: "ok",
+                        procId: request.procId
                     )
-                    response.withUnsafeBytes { raw in
+                    let payload = try JSONEncoder().encode(response)
+                    let responseFrame = try helper.encodeFrame(
+                        opcode: .jsonRPCResponse,
+                        header: Data(),
+                        payload: payload
+                    )
+                    responseFrame.withUnsafeBytes { raw in
                         guard let base = raw.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
                         var offset = 0
                         while offset < raw.count {
@@ -318,5 +340,84 @@ final class InitChannelTests: XCTestCase {
         XCTAssertTrue(response2.ok)
         XCTAssertEqual(connectorCalls, 1)
         wait(for: [serverReady], timeout: 2)
+    }
+
+    func testProcSubscribePrefersSidebandOverPersistentVsock() throws {
+        var controlFDs: [Int32] = [0, 0]
+        var sidebandFDs: [Int32] = [0, 0]
+        XCTAssertEqual(socketpair(AF_UNIX, SOCK_STREAM, 0, &controlFDs), 0)
+        XCTAssertEqual(socketpair(AF_UNIX, SOCK_STREAM, 0, &sidebandFDs), 0)
+        defer {
+            _ = close(controlFDs[0])
+            _ = close(controlFDs[1])
+            _ = close(sidebandFDs[0])
+            _ = close(sidebandFDs[1])
+        }
+
+        let helper = InitChannelClient(socketPath: "/tmp/does-not-exist.sock")
+        let controlReady = expectation(description: "control received sideband_open request")
+        let sidebandReady = expectation(description: "sideband received proc_subscribe frame")
+        DispatchQueue.global().async {
+            defer { controlReady.fulfill() }
+            do {
+                let frame = try helper.readFrameForTest(from: controlFDs[1], op: "sideband_open")
+                let decoded = try helper.decodeFrame(frame)
+                XCTAssertEqual(decoded.opcode, .jsonRPCRequest)
+                let request = try JSONDecoder().decode(InitChannelRequest.self, from: decoded.payload)
+                XCTAssertEqual(request.op, "sideband_open")
+                XCTAssertEqual(request.sidebandRole, "sideband")
+
+                let response = InitChannelResponse(
+                    requestId: request.requestId,
+                    op: "sideband_open",
+                    status: "ok",
+                    meta: ["role": "sideband"]
+                )
+                let payload = try JSONEncoder().encode(response)
+                let responseFrame = try helper.encodeFrame(opcode: .jsonRPCResponse, header: Data(), payload: payload)
+                responseFrame.withUnsafeBytes { raw in
+                    guard let base = raw.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
+                    var offset = 0
+                    while offset < raw.count {
+                        let written = write(controlFDs[1], base.advanced(by: offset), raw.count - offset)
+                        XCTAssertGreaterThanOrEqual(written, 0)
+                        offset += written
+                    }
+                }
+            } catch {
+                XCTFail("control read failed: \(error)")
+            }
+        }
+        DispatchQueue.global().async {
+            defer { sidebandReady.fulfill() }
+            do {
+                let frame = try helper.readFrameForTest(from: sidebandFDs[1], op: "proc_subscribe")
+                let decoded = try helper.decodeFrame(frame)
+                XCTAssertEqual(decoded.opcode, .procSubscribeRequest)
+            } catch {
+                XCTFail("sideband read failed: \(error)")
+            }
+        }
+
+        var connectorCalls = 0
+        do {
+            let client = InitChannelClient(
+                socketPath: "/tmp/does-not-exist.sock",
+                vsockFD: controlFDs[0],
+                retainedVsockConnection: nil,
+                sidebandConnector: {
+                    connectorCalls += 1
+                    return (sidebandFDs[0], nil)
+                },
+                sidebandSupported: true,
+                allowSocketFallback: false,
+                allowStreamingOnVsock: false
+            )
+            let stream = try client.procSubscribe(procId: "proc-subscribe-1")
+            _ = stream
+        }
+
+        XCTAssertEqual(connectorCalls, 1)
+        wait(for: [controlReady, sidebandReady], timeout: 2)
     }
 }

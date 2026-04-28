@@ -17,6 +17,7 @@ struct InstallInvocation {
     let localFilePath: String?
     let rawDiskPath: String?
     let containerImageRef: String?
+    let containerEntrypointOverride: [String]?
     let rebuild: Bool
     let diskSizeGB: Int?
 }
@@ -116,6 +117,13 @@ struct InstallOptions: ParsableArguments {
     @Option(name: [.customLong("from-container")], help: "Remote container image reference.")
     var containerImageRef: String?
 
+    @Option(
+        name: [.customLong("entrypoint")],
+        parsing: .remaining,
+        help: "Override container default command argv. Only valid with --from-container; place this option last."
+    )
+    var entrypointOverride: [String] = []
+
     @Flag(name: [.customLong("rebuild")], help: "Force rebuild even if cached image exists.")
     var rebuild = false
 
@@ -144,6 +152,9 @@ struct InstallOptions: ParsableArguments {
         if rawDiskPath != nil, diskSizeGB != nil {
             throw ValidationError("--disk-size-gb cannot be used with --raw")
         }
+        if !entrypointOverride.isEmpty, containerImageRef == nil {
+            throw ValidationError("--entrypoint is only valid with --from-container")
+        }
 
         return InstallInvocation(
             name: name ?? defaultInstallName(
@@ -156,6 +167,7 @@ struct InstallOptions: ParsableArguments {
             localFilePath: localFilePath,
             rawDiskPath: rawDiskPath,
             containerImageRef: containerImageRef,
+            containerEntrypointOverride: entrypointOverride.isEmpty ? nil : entrypointOverride,
             rebuild: rebuild,
             diskSizeGB: diskSizeGB
         )
@@ -170,6 +182,7 @@ struct MSLCommand: ParsableCommand {
         version: "dev",
         subcommands: [
             RunCommand.self,
+            NerdctlCommand.self,
             CpCommand.self,
             ListCommand.self,
             StatusCommand.self,
@@ -237,9 +250,6 @@ struct RunCommand: ParsableCommand {
         if let timeout, timeout <= 0 {
             throw ValidationError("--timeout must be a positive integer")
         }
-        if command.isEmpty {
-            throw ValidationError("Missing command. See `msl run --help`.")
-        }
     }
 
     mutating func run() throws {
@@ -292,6 +302,25 @@ struct CpCommand: ParsableCommand {
                 recursive: recursive,
                 instanceName: CLIInvocationContext.instanceName
             )
+        }
+    }
+}
+
+struct NerdctlCommand: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "nerdctl",
+        abstract: "Run nerdctl inside the internal _container runtime VM."
+    )
+
+    @Option(name: [.customLong("instance")], help: .hidden)
+    var instance: String?
+
+    @Argument(parsing: .captureForPassthrough, help: "Arguments passed through to guest nerdctl.")
+    var command: [String] = []
+
+    mutating func run() throws {
+        withRuntimeManager { manager in
+            try manager.runNerdctl(argv: command, instanceName: instance ?? CLIInvocationContext.instanceName)
         }
     }
 }
@@ -387,7 +416,7 @@ struct StopCommand: ParsableCommand {
 struct InstallCommand: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "install",
-        abstract: "Install an instance from distro, rootfs, or raw disk."
+        abstract: "Install an instance from distro, rootfs, raw disk, or container image."
     )
 
     @Flag(name: [.customLong("list")], help: "List installable distributions.")
@@ -401,6 +430,9 @@ struct InstallCommand: ParsableCommand {
             if options.name != nil ||
                 options.distroAlias != nil ||
                 options.localFilePath != nil ||
+                options.rawDiskPath != nil ||
+                options.containerImageRef != nil ||
+                !options.entrypointOverride.isEmpty ||
                 options.rebuild ||
                 options.diskSizeGB != nil ||
                 options.targetAlias != nil {
@@ -423,6 +455,7 @@ struct InstallCommand: ParsableCommand {
                 localFilePath: invocation.localFilePath,
                 rawDiskPath: invocation.rawDiskPath,
                 containerImageRef: invocation.containerImageRef,
+                containerEntrypointOverride: invocation.containerEntrypointOverride,
                 rebuild: invocation.rebuild,
                 diskSizeGB: invocation.diskSizeGB
             )
