@@ -27,6 +27,31 @@ final class PortForwardingTests: XCTestCase {
         XCTAssertEqual(reply, "pong")
     }
 
+    func testMappingUsesUpdatedGuestIPWithoutRestartingListener() throws {
+        let tempRoot = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("msl-port-forwarding-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tempRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempRoot) }
+
+        let guestPort = try startIPv4EchoServer()
+        let hostPort = try findDualStackLoopbackPort()
+        let logger = MSLLogger(logFile: tempRoot.appendingPathComponent("msl.log", isDirectory: false))
+        let manager = PortForwardingManager(
+            logger: logger,
+            guestIPResolver: GuestIPResolver(explicitIP: "192.0.2.1"),
+            exposeVMNetEndpoints: false
+        )
+        defer { manager.stopAll() }
+
+        let response = manager.add(PortMapping(hostPort: hostPort, guestPort: guestPort))
+        XCTAssertTrue(response.ok, response.error ?? "port mapping failed")
+
+        manager.updateGuestIP("127.0.0.1")
+
+        let reply = try connectIPv6Loopback(port: hostPort, payload: "ping")
+        XCTAssertEqual(reply, "pong")
+    }
+
     private func startIPv4EchoServer() throws -> Int {
         let fd = socket(AF_INET, SOCK_STREAM, 0)
         XCTAssertGreaterThanOrEqual(fd, 0)
