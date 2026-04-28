@@ -1,27 +1,34 @@
 import Foundation
 
 final class GuestIPResolver {
-    private let explicitIP: String?
+    private let initialExplicitIP: String?
     private let lock = NSLock()
+    private var currentGuestIP: String?
     private var lastSuccessfulIP: String?
 
     init(explicitIP: String?) {
         if let explicitIP, !explicitIP.isEmpty {
-            self.explicitIP = explicitIP
+            self.initialExplicitIP = explicitIP
+            self.currentGuestIP = explicitIP
         } else {
-            self.explicitIP = nil
+            self.initialExplicitIP = nil
+            self.currentGuestIP = nil
         }
     }
 
     func candidateIPs() -> [String] {
         var result: [String] = []
-        if let explicitIP {
-            result.append(explicitIP)
-        }
-
         lock.lock()
+        let current = currentGuestIP
         let cached = lastSuccessfulIP
         lock.unlock()
+
+        if let current {
+            result.append(current)
+        }
+        if let initialExplicitIP, !result.contains(initialExplicitIP) {
+            result.append(initialExplicitIP)
+        }
         if let cached, !result.contains(cached) {
             result.append(cached)
         }
@@ -39,6 +46,15 @@ final class GuestIPResolver {
             result.append("127.0.0.1")
         }
         return result
+    }
+
+    func updateGuestIP(_ ip: String?) {
+        let normalized = ip?.trimmingCharacters(in: .whitespacesAndNewlines)
+        lock.lock()
+        if let normalized, !normalized.isEmpty, normalized != "-" {
+            currentGuestIP = normalized
+        }
+        lock.unlock()
     }
 
     func reportSuccess(ip: String) {

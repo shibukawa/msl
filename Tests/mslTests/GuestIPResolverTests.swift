@@ -2,6 +2,24 @@ import XCTest
 @testable import mslCore
 
 final class GuestIPResolverTests: XCTestCase {
+    func testUpdateGuestIPTakesPriorityOverFallbacks() {
+        let resolver = GuestIPResolver(explicitIP: nil)
+
+        resolver.updateGuestIP("192.168.64.6")
+
+        XCTAssertEqual(resolver.candidateIPs().first, "192.168.64.6")
+    }
+
+    func testUpdateGuestIPKeepsInitialExplicitIPAsFallback() {
+        let resolver = GuestIPResolver(explicitIP: "192.168.64.2")
+
+        resolver.updateGuestIP("192.168.64.6")
+
+        let candidates = resolver.candidateIPs()
+        XCTAssertEqual(candidates.first, "192.168.64.6")
+        XCTAssertTrue(candidates.contains("192.168.64.2"))
+    }
+
     func testParseArpOutputFiltersPrivateVmnetEntries() {
         let sample = """
         ? (192.168.64.8) at aa:bb:cc:dd:ee:ff on bridge100 ifscope [bridge]

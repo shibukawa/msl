@@ -20,6 +20,10 @@ final class PortForwardingManager {
         self.exposeVMNetEndpoints = exposeVMNetEndpoints
     }
 
+    func updateGuestIP(_ ip: String?) {
+        guestIPResolver.updateGuestIP(ip)
+    }
+
     func add(_ mapping: PortMapping) -> RuntimeControlResponse {
         lock.lock()
         defer { lock.unlock() }

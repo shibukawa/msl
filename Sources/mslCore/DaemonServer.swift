@@ -6643,6 +6643,11 @@ public final class DaemonServer {
             return
         }
 
+        let context = instanceRegistry.context(for: instanceName)
+        if let guestIPv4 = forwardingGuestIPHint(for: context) {
+            fw.updateGuestIP(guestIPv4)
+        }
+
         let previous = currentEffectivePortMappingsSnapshot()
         let effective = AutoPortForwardingPlanner.merge(
             manualMappings: manualMappings,
