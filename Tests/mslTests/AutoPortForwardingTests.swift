@@ -45,4 +45,41 @@ final class AutoPortForwardingTests: XCTestCase {
         XCTAssertEqual(effective.mappings.first(where: { $0.hostPort == 3000 })?.instance, "ubuntu")
         XCTAssertEqual(effective.mappings.first(where: { $0.hostPort == 8080 })?.guestPort, 80)
     }
+
+    func testNerdctlRunPublishMappingsForwardHostPortToGuestPublishedPort() {
+        let mappings = NerdctlPortPublishing.directForwardMappings(
+            from: ["run", "-p", "8080:80", "--publish=127.0.0.1:9090:90/tcp", "-p3000:3000", "nginx"],
+            instanceName: "_container"
+        )
+
+        XCTAssertEqual(mappings.map(\.hostPort), [8080, 9090, 3000])
+        XCTAssertEqual(mappings.map(\.guestPort), [8080, 9090, 3000])
+        XCTAssertEqual(mappings.map(\.bindAddress), ["127.0.0.1", "127.0.0.1", "127.0.0.1"])
+        XCTAssertEqual(mappings.map(\.instance), ["_container", "_container", "_container"])
+        XCTAssertEqual(mappings.map(\.source), ["nerdctl", "nerdctl", "nerdctl"])
+    }
+
+    func testNerdctlPublishMappingsIgnoreUnsupportedSpecsAndNonRunCommands() {
+        let unsupported = NerdctlPortPublishing.directForwardMappings(
+            from: ["run", "-p", "80", "-p", "127.0.0.1::80", "--publish", "bad:80"],
+            instanceName: "_container"
+        )
+        let pull = NerdctlPortPublishing.directForwardMappings(
+            from: ["pull", "-p", "8080:80", "nginx"],
+            instanceName: "_container"
+        )
+
+        XCTAssertTrue(unsupported.isEmpty)
+        XCTAssertTrue(pull.isEmpty)
+    }
+
+    func testNerdctlPublishMappingsOnlyParseRunOptionsBeforeImage() {
+        let mappings = NerdctlPortPublishing.directForwardMappings(
+            from: ["--namespace", "default", "run", "--name", "web", "-p", "8080:80", "nginx", "echo", "-p", "9000:90"],
+            instanceName: "_container"
+        )
+
+        XCTAssertEqual(mappings.map(\.hostPort), [8080])
+        XCTAssertEqual(mappings.map(\.guestPort), [8080])
+    }
 }

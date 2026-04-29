@@ -413,6 +413,17 @@ Port forwarding and vmnet networking:
 ./.build/debug/msl network status
 ```
 
+For containers published with `nerdctl -p`, `msl nerdctl run` automatically adds an
+MSL host mapping for the internal container-runtime VM:
+
+```bash
+./.build/debug/msl nerdctl run -p 8080:80 nginx
+```
+
+In this example, `nerdctl -p 8080:80` publishes container port 80 on VM port 8080.
+MSL forwards macOS `localhost:8080` to VM port 8080. `msl port add` remains
+available for explicit VM service forwarding outside `msl nerdctl run`.
+
 `msl port` is a shortcut for `msl port ls`.
 
 Run default command (interactive shell attach path):

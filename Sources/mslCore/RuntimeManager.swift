@@ -1042,33 +1042,19 @@ public final class RuntimeManager {
             throw MSLRuntimeError("msl nerdctl requires a container-runtime instance")
         }
         let workspacePlan = try resolveNerdctlWorkspacePlan(argv: argv)
+        let effectiveNerdctlArgs = applyDefaultNerdctlSnapshotterIfNeeded(argv)
+        let terminalMode = try resolveNerdctlTerminalModeForExecution(argv: effectiveNerdctlArgs)
 
         try lock.withExclusiveLock {
             try bootstrap.ensureBootstrapped(context: .runtime)
         }
 
-        let runner = try makeDirectVirtualMachineRunner(metadataURL: target.metadataURL, instanceName: target.instanceName)
-        let client = try runner.startVMForDaemon()
-        defer {
-            runner.requestStopRunningVM()
-        }
-
-        try reconcileDirectRuntimeDNS(
-            client: client,
-            runner: runner,
-            instanceName: target.instanceName,
-            metadata: metadata
+        try daemonClient.ensureConnected(
+            expectedInstanceName: target.instanceName,
+            hostShareRoot: resolveWorkspaceHostShareRoot(),
+            callerCwd: currentCallerCwd()
         )
-
-        try ensureContainerRuntimeServiceManagerInitialized(
-            client: client,
-            instanceName: target.instanceName
-        )
-        try ensureContainerRuntimeCachePolicy(client: client, instanceName: target.instanceName)
-        try ensureContainerRuntimeService("containerd", client: client, instanceName: target.instanceName)
-        if nerdctlNeedsBuildkit(argv: argv) {
-            try ensureContainerRuntimeService("buildkitd", client: client, instanceName: target.instanceName)
-        }
+        prepareCacheSharingIfNeeded(instanceName: target.instanceName)
 
         let nerdctlCwd: String?
         if workspacePlan.requiresWorkspace {
@@ -1080,21 +1066,20 @@ public final class RuntimeManager {
             guard workspacePolicy.workspaceGuestPath != nil else {
                 throw MSLRuntimeError("build context not accessible from current workspace")
             }
-            nerdctlCwd = try prepareDirectWorkspaceIfNeeded(
-                client: client,
-                policy: workspacePolicy,
-                instanceName: target.instanceName
-            )
+            nerdctlCwd = prepareWorkspaceIfNeeded(policy: workspacePolicy, instanceName: target.instanceName)
             guard nerdctlCwd != nil else {
                 throw MSLRuntimeError("workspace mount failed for nerdctl")
             }
         } else {
             nerdctlCwd = nil
         }
-        let effectiveNerdctlArgs = applyDefaultNerdctlSnapshotterIfNeeded(argv)
         let nerdctlArgv = ["/usr/local/bin/nerdctl"] + effectiveNerdctlArgs
         let nerdctlEnv = nerdctlEnvironment()
-        let terminalMode = resolveNerdctlTerminalMode(argv: effectiveNerdctlArgs)
+        applyNerdctlPublishedPortMappingsIfNeeded(
+            argv: argv,
+            instanceName: target.instanceName,
+            daemonClient: daemonClient
+        )
 
         logger.log("nerdctl_started", fields: [
             "instance": target.instanceName,
@@ -1102,8 +1087,8 @@ public final class RuntimeManager {
             "transport": terminalMode.transport
         ])
 
-        let exitCode = try executeNerdctlDirectInit(
-            client: client,
+        let exitCode = try executeNerdctlViaDaemon(
+            daemonClient: daemonClient,
             instanceName: target.instanceName,
             argv: nerdctlArgv,
             cwd: nerdctlCwd,
@@ -1112,9 +1097,109 @@ public final class RuntimeManager {
             startMs: startMs,
             logPrefix: "nerdctl"
         ).exitCode
-        flushContainerRuntimeDisk(client: client, instanceName: target.instanceName)
-        runner.stopRunningVM()
         Foundation.exit(exitCode)
+    }
+
+    private func applyNerdctlPublishedPortMappingsIfNeeded(
+        argv: [String],
+        instanceName: String,
+        daemonClient: DaemonClient
+    ) {
+        let mappings = NerdctlPortPublishing.directForwardMappings(from: argv, instanceName: instanceName)
+        guard !mappings.isEmpty else {
+            return
+        }
+
+        persistNerdctlPublishedPortMappings(mappings, instanceName: instanceName, daemonClient: daemonClient)
+    }
+
+    private func logNerdctlPortForwardApplyResult(
+        response: RuntimeControlResponse,
+        mappings: [PortMapping],
+        instanceName: String,
+        backend: String
+    ) {
+        if let failed = response.items?.first(where: { $0.active == false || $0.error != nil }) {
+            logger.log("nerdctl_port_forward_apply_failed", fields: [
+                "instance": instanceName,
+                "backend": backend,
+                "hostPort": String(failed.hostPort),
+                "guestPort": String(failed.guestPort),
+                "error": failed.error ?? "inactive"
+            ])
+        } else {
+            logger.log("nerdctl_port_forward_applied", fields: [
+                "instance": instanceName,
+                "backend": backend,
+                "ports": mappings.map { "\($0.hostPort):\($0.guestPort)" }.joined(separator: ",")
+            ])
+        }
+    }
+
+    private func persistNerdctlPublishedPortMappings(
+        _ mappings: [PortMapping],
+        instanceName: String,
+        daemonClient: DaemonClient
+    ) {
+        do {
+            var applied: [PortMapping] = []
+            try lock.withExclusiveLock {
+                var state = try store.loadPortMappings()
+                var changed = false
+                for mapping in mappings {
+                    if let existingIndex = state.mappings.firstIndex(where: { $0.hostPort == mapping.hostPort }) {
+                        let existing = state.mappings[existingIndex]
+                        if existing.instance == instanceName {
+                            if existing != mapping {
+                                state.mappings[existingIndex] = mapping
+                                changed = true
+                            }
+                            applied.append(mapping)
+                        } else {
+                            logger.log("nerdctl_port_forward_conflict", fields: [
+                                "instance": instanceName,
+                                "hostPort": String(mapping.hostPort),
+                                "ownerInstance": existing.instance
+                            ])
+                        }
+                        continue
+                    }
+                    state.mappings.append(mapping)
+                    applied.append(mapping)
+                    changed = true
+                }
+                if changed {
+                    state.mappings.sort { lhs, rhs in
+                        if lhs.hostPort == rhs.hostPort {
+                            return lhs.instance < rhs.instance
+                        }
+                        return lhs.hostPort < rhs.hostPort
+                    }
+                    try store.savePortMappings(state)
+                }
+            }
+
+            for mapping in applied {
+                let response = try? daemonClient.send(RuntimeControlRequest(
+                    op: "port_add",
+                    instance: instanceName,
+                    hostPort: mapping.hostPort,
+                    guestPort: mapping.guestPort
+                ))
+                if response?.ok == false {
+                    logger.log("nerdctl_port_forward_control_failed", fields: [
+                        "instance": instanceName,
+                        "hostPort": String(mapping.hostPort),
+                        "error": response?.error ?? "unknown"
+                    ])
+                }
+            }
+        } catch {
+            logger.log("nerdctl_port_forward_persist_failed", fields: [
+                "instance": instanceName,
+                "error": String(describing: error)
+            ])
+        }
     }
 
     func resolveRunInvocation(
@@ -1298,6 +1383,187 @@ public final class RuntimeManager {
                 logPrefix: logPrefix
             )
         }
+    }
+
+    private func executeNerdctlViaDaemon(
+        daemonClient: DaemonClient,
+        instanceName: String,
+        argv: [String],
+        cwd: String?,
+        envAdditions: [String: String],
+        terminalMode: NerdctlTerminalMode,
+        startMs: Int64,
+        logPrefix: String
+    ) throws -> NerdctlExecutionResult {
+        let regResp = try daemonClient.send(RuntimeControlRequest(
+            op: "session_register",
+            instance: instanceName,
+            callerCwd: currentCallerCwd()
+        ))
+        guard regResp.ok, let sessionID = regResp.sessionId else {
+            throw MSLRuntimeError("failed to register nerdctl session: \(regResp.error ?? "unknown")")
+        }
+        defer {
+            _ = try? daemonClient.send(RuntimeControlRequest(op: "session_unregister", sessionId: sessionID))
+        }
+
+        switch terminalMode {
+        case .interactivePTY, .displayPTY:
+            return try executeNerdctlDaemonPTY(
+                daemonClient: daemonClient,
+                sessionID: sessionID,
+                instanceName: instanceName,
+                argv: argv,
+                cwd: cwd,
+                envAdditions: envAdditions,
+                attachInput: terminalMode == .interactivePTY,
+                startMs: startMs,
+                logPrefix: logPrefix
+            )
+        case .streamingProc:
+            return try executeNerdctlDaemonProc(
+                daemonClient: daemonClient,
+                sessionID: sessionID,
+                instanceName: instanceName,
+                argv: argv,
+                cwd: cwd,
+                envAdditions: envAdditions,
+                startMs: startMs,
+                logPrefix: logPrefix
+            )
+        }
+    }
+
+    private func executeNerdctlDaemonPTY(
+        daemonClient: DaemonClient,
+        sessionID: String,
+        instanceName: String,
+        argv: [String],
+        cwd: String?,
+        envAdditions: [String: String],
+        attachInput: Bool,
+        startMs: Int64,
+        logPrefix: String
+    ) throws -> NerdctlExecutionResult {
+        let size = currentWindowSize()
+        let openResp = try daemonClient.send(RuntimeControlRequest(
+            op: "pty_open",
+            argv: argv,
+            runAsRoot: true,
+            rows: size.rows,
+            cols: size.cols,
+            sessionId: sessionID,
+            cwd: cwd,
+            envAdditions: envAdditions
+        ))
+        guard openResp.ok, let ptyId = openResp.ptyId else {
+            throw MSLRuntimeError("failed to open nerdctl PTY: \(openResp.error ?? "unknown")")
+        }
+
+        let capture = RollingOutputCapture()
+        let hostTerminal = attachInput ? HostTerminalState.capture() : nil
+        if attachInput {
+            enterRawModeForShell()
+        }
+        do {
+            let result = try SessionStreamBridge.runPty(
+                daemonClient: daemonClient,
+                ptyID: ptyId,
+                sessionID: sessionID,
+                inputFD: attachInput ? FileHandle.standardInput.fileDescriptor : nil,
+                detachByte: 0x1d,
+                onOutput: { data in
+                    capture.append(data)
+                    FileHandle.standardOutput.write(data)
+                    return true
+                },
+                onExitObserved: { [logger] code, reason in
+                    var fields: [String: String] = [
+                        "instance": instanceName,
+                        "phase": logPrefix,
+                        "exit": String(code)
+                    ]
+                    if let reason {
+                        fields["exit_reason"] = reason
+                    }
+                    logger.log("\(logPrefix)_exit_observed", fields: fields)
+                },
+                resizeProvider: { [self] in currentWindowSize() }
+            )
+            hostTerminal?.restore()
+            logger.log("\(logPrefix)_completed", fields: [
+                "instance": instanceName,
+                "argv0": argv[0],
+                "exit_code": String(result.exitCode),
+                "elapsed_ms": String(runtimeMonotonicMs() - startMs),
+                "transport": attachInput ? "daemon_interactive_pty" : "daemon_display_pty"
+            ])
+            return NerdctlExecutionResult(exitCode: result.exitCode, capturedOutput: capture.stringValue)
+        } catch {
+            hostTerminal?.restore()
+            throw error
+        }
+    }
+
+    private func executeNerdctlDaemonProc(
+        daemonClient: DaemonClient,
+        sessionID: String,
+        instanceName: String,
+        argv: [String],
+        cwd: String?,
+        envAdditions: [String: String],
+        startMs: Int64,
+        logPrefix: String
+    ) throws -> NerdctlExecutionResult {
+        let openResp = try daemonClient.send(RuntimeControlRequest(
+            op: "proc_open",
+            argv: argv,
+            runAsRoot: true,
+            sessionId: sessionID,
+            cwd: cwd,
+            envAdditions: envAdditions
+        ))
+        guard openResp.ok, let procId = openResp.procId else {
+            throw MSLRuntimeError("failed to open nerdctl process: \(openResp.error ?? "unknown")")
+        }
+
+        let capture = RollingOutputCapture()
+        let result = try SessionStreamBridge.runProc(
+            daemonClient: daemonClient,
+            procID: procId,
+            sessionID: sessionID,
+            inputFD: nil,
+            attachInput: false,
+            onOutput: { event in
+                capture.append(event.data)
+                switch event.kind {
+                case .stdout:
+                    FileHandle.standardOutput.write(event.data)
+                case .stderr:
+                    FileHandle.standardError.write(event.data)
+                }
+                return true
+            },
+            onExitObserved: { [logger] code, reason in
+                var fields: [String: String] = [
+                    "instance": instanceName,
+                    "phase": logPrefix,
+                    "exit": String(code)
+                ]
+                if let reason {
+                    fields["exit_reason"] = reason
+                }
+                logger.log("\(logPrefix)_exit_observed", fields: fields)
+            }
+        )
+        logger.log("\(logPrefix)_completed", fields: [
+            "instance": instanceName,
+            "argv0": argv[0],
+            "exit_code": String(result.exitCode),
+            "elapsed_ms": String(runtimeMonotonicMs() - startMs),
+            "transport": "daemon_proc_stream"
+        ])
+        return NerdctlExecutionResult(exitCode: result.exitCode, capturedOutput: capture.stringValue)
     }
 
     private func ensureContainerRuntimeCachePolicy(
@@ -2683,6 +2949,16 @@ public final class RuntimeManager {
         return nerdctlNeedsDisplayPTY(argv: argv) ? .displayPTY : .streamingProc
     }
 
+    private func resolveNerdctlTerminalModeForExecution(argv: [String]) throws -> NerdctlTerminalMode {
+        if nerdctlNeedsConfirmationPrompt(argv: argv) && !nerdctlHasForceFlag(argv: argv) {
+            guard hostHasInteractiveTTY() else {
+                throw MSLRuntimeError("nerdctl prune requires an interactive terminal; rerun with --force to skip confirmation")
+            }
+            return .interactivePTY
+        }
+        return resolveNerdctlTerminalMode(argv: argv)
+    }
+
     private func nerdctlHasInteractiveTTYFlag(argv: [String]) -> Bool {
         argv.contains { arg in
             arg == "-i" || arg == "-t" || arg == "-it" || arg == "-ti"
@@ -2705,6 +2981,28 @@ public final class RuntimeManager {
             return composeCommand == "up" || composeCommand == "build" || composeCommand == "pull"
         default:
             return false
+        }
+    }
+
+    private func nerdctlNeedsConfirmationPrompt(argv: [String]) -> Bool {
+        guard let commandIndex = firstNerdctlCommandIndex(in: argv) else {
+            return false
+        }
+        let command = argv[commandIndex]
+        if command == "system" {
+            let remaining = Array(argv.dropFirst(commandIndex + 1))
+            return firstNerdctlCommandIndex(in: remaining).map { remaining[$0] } == "prune"
+        }
+        if ["container", "image", "network", "volume"].contains(command) {
+            let remaining = Array(argv.dropFirst(commandIndex + 1))
+            return firstNerdctlCommandIndex(in: remaining).map { remaining[$0] } == "prune"
+        }
+        return command == "prune"
+    }
+
+    private func nerdctlHasForceFlag(argv: [String]) -> Bool {
+        argv.contains { token in
+            token == "-f" || token == "--force" || token.hasPrefix("--force=")
         }
     }
 
@@ -3377,6 +3675,17 @@ public final class RuntimeManager {
     }
 
     func parseNerdctlPrimaryCommand(argv: [String]) throws -> NerdctlPrimaryCommand {
+        switch try Self.parseNerdctlPrimaryCommandForPorts(argv: argv) {
+        case "build":
+            return .build
+        case "compose":
+            return .compose
+        case let command:
+            return .other(command)
+        }
+    }
+
+    static func parseNerdctlPrimaryCommandForPorts(argv: [String]) throws -> String? {
         let globalOptionsWithValues: Set<String> = [
             "--address", "-a",
             "--namespace", "-n",
@@ -3400,15 +3709,9 @@ public final class RuntimeManager {
                 index += 1
                 continue
             }
-            if token == "build" {
-                return .build
-            }
-            if token == "compose" {
-                return .compose
-            }
-            return .other(token)
+            return token
         }
-        return .other(nil)
+        return nil
     }
 
     private func validateNerdctlBuildArguments(_ argv: [String]) throws {
