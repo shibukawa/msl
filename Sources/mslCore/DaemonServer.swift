@@ -275,7 +275,7 @@ public final class DaemonServer {
     private var sshListener: LocalhostSSHServer?
     private var sshInfo: LocalhostSSHInfo?
     private var attachedContainerDaemons: [String: AttachedContainerDaemon] = [:]
-    private var forwarder: PortForwardingManager?
+    private var forwarder: PortForwardingBackend?
     private var runtimeMetadataURL: URL?
     private let dnsStateLock = NSLock()
     private let dnsReconcileLock = NSLock()
@@ -1074,76 +1074,101 @@ public final class DaemonServer {
             "instance": instanceName
         ])
 
+        let isContainerRuntime = initialMetadata.resolvedWorkloadKind() == .containerRuntime
+
         // 3. Converge runtime user (Step9)
         logger.log("daemon_startup_step_started", fields: [
             "instance": instanceName,
             "step": "user_converge"
         ])
         updateStateStarting(step: .userConverge, instanceName: instanceName)
-        do {
-            let firstBootPending = initialMetadata.bootstrap?.firstBootPending ?? true
-            logger.log("su_bootstrap_started", fields: [
-                "instance": instanceName,
-                "first_boot": firstBootPending ? "true" : "false",
-                "bootstrap_version": String(initialMetadata.bootstrap?.privilegeBootstrapVersion ?? 1)
-            ])
-
-            let resolved = try convergeRuntimeUser(
-                client: client,
-                metadataURL: metadataURL,
-                instanceName: instanceName
-            )
-            instanceContext.runtimeUser = resolved.runtimeUser
-            try distributionManager.writeBootstrapResult(
-                metadataURL: metadataURL,
-                result: "success",
-                runtimeUser: resolved.runtimeUser,
-                fallbackAdminGroup: resolved.adminGroup
-            )
-            logger.log("su_bootstrap_validation_passed", fields: [
-                "instance": instanceName,
-                "user": resolved.runtimeUser.name,
-                "uid": String(resolved.runtimeUser.uid),
-                "gid": String(resolved.runtimeUser.gid)
-            ])
-        } catch {
-            updateStateBootFailed(
-                step: .userConverge,
-                instanceName: instanceName,
-                code: "user_converge_failed",
-                message: String(describing: error)
-            )
-            logger.log("user_convergence_failed", fields: [
-                "instance": instanceName,
-                "metadata": metadataURL.path,
-                "error": String(describing: error)
-            ])
+        if isContainerRuntime {
+            let rootUser = containerRuntimeRootUserState()
+            instanceContext.runtimeUser = rootUser
             try? distributionManager.writeBootstrapResult(
                 metadataURL: metadataURL,
-                result: "failed",
-                runtimeUser: nil,
+                result: "success",
+                runtimeUser: rootUser,
                 fallbackAdminGroup: nil
             )
-            logger.log("su_bootstrap_failed", fields: [
+            logger.log("container_runtime_user_converge_skipped", fields: [
                 "instance": instanceName,
-                "error": String(describing: error)
+                "reason": "internal_root_runtime"
             ])
-            logRouter.logVM(
-                instance: instanceName,
-                event: "daemon_instance_boot_failed",
-                fields: ["op": "user_converge", "result": "failed", "error": String(describing: error)]
-            )
-            publishInstanceStateEvent(
-                instance: instanceName,
-                state: "Error",
-                reason: "user_converge_failed",
-                error: String(describing: error)
-            )
-            instanceContext.lifecycleState = .error
-            instanceContext.lastError = String(describing: error)
-            runner.stopRunningVM()
-            updateStateStopped()
-            Foundation.exit(1)
+            logger.log("runtime_user_selected", fields: [
+                "instance": instanceName,
+                "username": rootUser.name,
+                "uid": String(rootUser.uid),
+                "gid": String(rootUser.gid),
+                "home": rootUser.home,
+                "shell": rootUser.shell
+            ])
+        } else {
+            do {
+                let firstBootPending = initialMetadata.bootstrap?.firstBootPending ?? true
+                logger.log("su_bootstrap_started", fields: [
+                    "instance": instanceName,
+                    "first_boot": firstBootPending ? "true" : "false",
+                    "bootstrap_version": String(initialMetadata.bootstrap?.privilegeBootstrapVersion ?? 1)
+                ])
+
+                let resolved = try convergeRuntimeUser(
+                    client: client,
+                    metadataURL: metadataURL,
+                    instanceName: instanceName
+                )
+                instanceContext.runtimeUser = resolved.runtimeUser
+                try distributionManager.writeBootstrapResult(
+                    metadataURL: metadataURL,
+                    result: "success",
+                    runtimeUser: resolved.runtimeUser,
+                    fallbackAdminGroup: resolved.adminGroup
+                )
+                logger.log("su_bootstrap_validation_passed", fields: [
+                    "instance": instanceName,
+                    "user": resolved.runtimeUser.name,
+                    "uid": String(resolved.runtimeUser.uid),
+                    "gid": String(resolved.runtimeUser.gid)
+                ])
+            } catch {
+                updateStateBootFailed(
+                    step: .userConverge,
+                    instanceName: instanceName,
+                    code: "user_converge_failed",
+                    message: String(describing: error)
+                )
+                logger.log("user_convergence_failed", fields: [
+                    "instance": instanceName,
+                    "metadata": metadataURL.path,
+                    "error": String(describing: error)
+                ])
+                try? distributionManager.writeBootstrapResult(
+                    metadataURL: metadataURL,
+                    result: "failed",
+                    runtimeUser: nil,
+                    fallbackAdminGroup: nil
+                )
+                logger.log("su_bootstrap_failed", fields: [
+                    "instance": instanceName,
+                    "error": String(describing: error)
+                ])
+                logRouter.logVM(
+                    instance: instanceName,
+                    event: "daemon_instance_boot_failed",
+                    fields: ["op": "user_converge", "result": "failed", "error": String(describing: error)]
+                )
+                publishInstanceStateEvent(
+                    instance: instanceName,
+                    state: "Error",
+                    reason: "user_converge_failed",
+                    error: String(describing: error)
+                )
+                instanceContext.lifecycleState = .error
+                instanceContext.lastError = String(describing: error)
+                runner.stopRunningVM()
+                updateStateStopped()
+                Foundation.exit(1)
+            }
         }
         updateStateStepCompleted(step: .userConverge, instanceName: instanceName)
         logger.log("daemon_startup_step_completed", fields: [
@@ -1151,18 +1176,51 @@ public final class DaemonServer {
             "step": "user_converge"
         ])
         configureMemoryReclaimPolicy()
-        ensureGuestMSLCommandAlias(client: client)
-        logger.log("daemon_startup_step_started", fields: [
-            "instance": instanceName,
-            "step": "vscode_root_state"
-        ])
-        updateStateStarting(step: .vscodeRootState, instanceName: instanceName)
-        ensureRootVSCodeServerDirectories(client: client, instanceName: instanceName)
-        updateStateStepCompleted(step: .vscodeRootState, instanceName: instanceName)
-        logger.log("daemon_startup_step_completed", fields: [
-            "instance": instanceName,
-            "step": "vscode_root_state"
-        ])
+        if isContainerRuntime {
+            do {
+                try prepareContainerRuntimeServicesOnStartup(client: client, instanceName: instanceName)
+            } catch {
+                updateStateBootFailed(
+                    step: .userConverge,
+                    instanceName: instanceName,
+                    code: "container_runtime_services_failed",
+                    message: String(describing: error)
+                )
+                logger.log("container_runtime_services_failed", fields: [
+                    "instance": instanceName,
+                    "error": String(describing: error)
+                ])
+                logRouter.logVM(
+                    instance: instanceName,
+                    event: "daemon_instance_boot_failed",
+                    fields: ["op": "container_runtime_services", "result": "failed", "error": String(describing: error)]
+                )
+                publishInstanceStateEvent(
+                    instance: instanceName,
+                    state: "Error",
+                    reason: "container_runtime_services_failed",
+                    error: String(describing: error)
+                )
+                instanceContext.lifecycleState = .error
+                instanceContext.lastError = String(describing: error)
+                runner.stopRunningVM()
+                updateStateStopped(lastError: String(describing: error))
+                Foundation.exit(1)
+            }
+        } else {
+            ensureGuestMSLCommandAlias(client: client)
+            logger.log("daemon_startup_step_started", fields: [
+                "instance": instanceName,
+                "step": "vscode_root_state"
+            ])
+            updateStateStarting(step: .vscodeRootState, instanceName: instanceName)
+            ensureRootVSCodeServerDirectories(client: client, instanceName: instanceName)
+            updateStateStepCompleted(step: .vscodeRootState, instanceName: instanceName)
+            logger.log("daemon_startup_step_completed", fields: [
+                "instance": instanceName,
+                "step": "vscode_root_state"
+            ])
+        }
         updateStateStarting(step: .dnsReconcile, instanceName: instanceName)
         scheduleBackgroundDNSReconcile(instanceName: instanceName, source: "startup")
         updateStateStepCompleted(step: .dnsReconcile, instanceName: instanceName)
@@ -1171,12 +1229,18 @@ public final class DaemonServer {
         // 4. Set up port forwarding
         let guestIPHint = forwardingGuestIPHint(for: instanceContext)
             ?? ProcessInfo.processInfo.environment["MSL_GUEST_IP"]
-        let guestIPResolver = GuestIPResolver(explicitIP: guestIPHint)
-        let portForwarder = PortForwardingManager(
-            logger: logger,
-            guestIPResolver: guestIPResolver,
-            exposeVMNetEndpoints: instanceContext.resolvedNetworkMode.effective == .vmnetShared
-        )
+        let portForwarder: PortForwardingBackend
+        if isContainerRuntime,
+           instanceContext.resolvedNetworkMode.effective != .vmnetShared {
+            portForwarder = InitRelayPortForwardingManager(logger: logger, initClient: client)
+        } else {
+            let guestIPResolver = GuestIPResolver(explicitIP: guestIPHint)
+            portForwarder = PortForwardingManager(
+                logger: logger,
+                guestIPResolver: guestIPResolver,
+                exposeVMNetEndpoints: instanceContext.resolvedNetworkMode.effective == .vmnetShared
+            )
+        }
         self.forwarder = portForwarder
 
         syncEffectivePortMappings(autoHostPorts: [], reason: "startup")
@@ -1217,27 +1281,29 @@ public final class DaemonServer {
             try bus.start()
             logger.log("daemon_event_socket_started", fields: ["path": eventSocketPath])
             updateStateStepCompleted(step: .eventSocketStart, instanceName: instanceName)
-            let runtimeUser = instanceContext.runtimeUser?.name ?? "root"
-            let sshManager = LocalhostSSHManager(
-                paths: paths,
-                lock: lock,
-                store: store,
-                logger: logger,
-                executablePath: executablePath,
-                fileManager: fileManager
-            )
-            let listener = try sshManager.start(
-                instanceName: instanceName,
-                requestedPort: nil,
-                runtimeUser: runtimeUser
-            )
-            sshListener = listener.server
-            sshInfo = listener.info
+            if !isContainerRuntime {
+                let runtimeUser = instanceContext.runtimeUser?.name ?? "root"
+                let sshManager = LocalhostSSHManager(
+                    paths: paths,
+                    lock: lock,
+                    store: store,
+                    logger: logger,
+                    executablePath: executablePath,
+                    fileManager: fileManager
+                )
+                let listener = try sshManager.start(
+                    instanceName: instanceName,
+                    requestedPort: nil,
+                    runtimeUser: runtimeUser
+                )
+                sshListener = listener.server
+                sshInfo = listener.info
+            }
             registerWorkerWithManagerIfNeeded(
                 instanceName: instanceName,
                 controlSocketPath: controlSocketPath,
                 eventSocketPath: eventSocketPath,
-                sshInfo: listener.info
+                sshInfo: sshInfo
             )
         } catch {
             updateStateBootFailed(
@@ -6502,6 +6568,184 @@ public final class DaemonServer {
             lastConvergedEpochMs: nowEpochMs()
         )
         return ConvergedRuntimeUserResult(runtimeUser: runtimeUser, adminGroup: policy.adminGroup)
+    }
+
+    private func containerRuntimeRootUserState() -> RuntimeUserState {
+        RuntimeUserState(
+            name: "root",
+            uid: 0,
+            gid: 0,
+            home: "/root",
+            shell: "/bin/sh",
+            policyTemplateID: "container-runtime-root-v1",
+            lastConvergedEpochMs: nowEpochMs()
+        )
+    }
+
+    private func prepareContainerRuntimeServicesOnStartup(
+        client: InitChannelClient,
+        instanceName: String
+    ) throws {
+        logger.log("daemon_startup_step_started", fields: [
+            "instance": instanceName,
+            "step": "container_runtime_services"
+        ])
+        try ensureContainerRuntimeServiceManagerInitialized(client: client, instanceName: instanceName)
+        try ensureContainerRuntimeCachePolicy(client: client, instanceName: instanceName)
+        try ensureContainerRuntimeService("containerd", client: client, instanceName: instanceName)
+        try ensureContainerRuntimeService("buildkitd", client: client, instanceName: instanceName)
+        logger.log("daemon_startup_step_completed", fields: [
+            "instance": instanceName,
+            "step": "container_runtime_services"
+        ])
+    }
+
+    private func ensureContainerRuntimeCachePolicy(
+        client: InitChannelClient,
+        instanceName: String
+    ) throws {
+        let script = """
+        set -eu
+        marker_dir=/var/lib/msl
+        marker="$marker_dir/container-runtime-cache-policy"
+        policy=native-v1
+        if [ -f "$marker" ] && [ "$(cat "$marker" 2>/dev/null || true)" = "$policy" ]; then
+          exit 0
+        fi
+        rc-service buildkitd stop >/dev/null 2>&1 || true
+        rc-service containerd stop >/dev/null 2>&1 || true
+        rm -rf /var/lib/containerd /var/lib/buildkit
+        mkdir -p /var/lib/containerd /var/lib/buildkit "$marker_dir"
+        printf '%s\n' "$policy" > "$marker"
+        """
+        let exitCode = try executeContainerRuntimeStartupCommand(
+            client: client,
+            instanceName: instanceName,
+            argv: ["/bin/sh", "-lc", script],
+            timeoutMs: 30_000,
+            logPrefix: "container_runtime_cache_policy"
+        )
+        guard exitCode == 0 else {
+            throw MSLRuntimeError("failed to initialize container-runtime native snapshotter cache policy")
+        }
+    }
+
+    private func ensureContainerRuntimeService(
+        _ service: String,
+        client: InitChannelClient,
+        instanceName: String
+    ) throws {
+        let statusCode = try executeContainerRuntimeStartupCommand(
+            client: client,
+            instanceName: instanceName,
+            argv: ["/sbin/rc-service", service, "status"],
+            timeoutMs: 15_000,
+            logPrefix: "runtime_service_status"
+        )
+        if statusCode != 0 {
+            let startCode = try executeContainerRuntimeStartupCommand(
+                client: client,
+                instanceName: instanceName,
+                argv: ["/sbin/rc-service", service, "start"],
+                timeoutMs: 60_000,
+                logPrefix: "runtime_service_start"
+            )
+            guard startCode == 0 else {
+                throw MSLRuntimeError("failed to start \(service) in container-runtime instance '\(instanceName)'")
+            }
+        }
+        try waitForContainerRuntimeSocketIfNeeded(
+            service: service,
+            socketPath: containerRuntimeSocketPath(for: service),
+            client: client,
+            instanceName: instanceName
+        )
+    }
+
+    private func ensureContainerRuntimeServiceManagerInitialized(
+        client: InitChannelClient,
+        instanceName: String
+    ) throws {
+        let exitCode = try executeContainerRuntimeStartupCommand(
+            client: client,
+            instanceName: instanceName,
+            argv: [
+                "/bin/sh", "-lc",
+                "mkdir -p /run/openrc && [ -f /run/openrc/softlevel ] || printf 'default\\n' > /run/openrc/softlevel"
+            ],
+            timeoutMs: 15_000,
+            logPrefix: "runtime_service_manager_init"
+        )
+        guard exitCode == 0 else {
+            throw MSLRuntimeError("failed to initialize openrc runtime state in container-runtime instance '\(instanceName)'")
+        }
+    }
+
+    private func containerRuntimeSocketPath(for service: String) -> String? {
+        switch service {
+        case "containerd":
+            return "/run/containerd/containerd.sock"
+        case "buildkitd":
+            return "/run/buildkit/buildkitd.sock"
+        default:
+            return nil
+        }
+    }
+
+    private func waitForContainerRuntimeSocketIfNeeded(
+        service: String,
+        socketPath: String?,
+        client: InitChannelClient,
+        instanceName: String
+    ) throws {
+        guard let socketPath else { return }
+        let escapedPath = socketPath.replacingOccurrences(of: "'", with: "'\\''")
+        let script = """
+        i=0
+        while [ "$i" -lt 50 ]; do
+          [ -S '\(escapedPath)' ] && exit 0
+          sleep 0.1
+          i=$((i + 1))
+        done
+        exit 1
+        """
+        let exitCode = try executeContainerRuntimeStartupCommand(
+            client: client,
+            instanceName: instanceName,
+            argv: ["/bin/sh", "-lc", script],
+            timeoutMs: 10_000,
+            logPrefix: "runtime_service_socket_wait"
+        )
+        guard exitCode == 0 else {
+            throw MSLRuntimeError("\(service) did not become ready in container-runtime instance '\(instanceName)' (missing socket \(socketPath))")
+        }
+    }
+
+    private func executeContainerRuntimeStartupCommand(
+        client: InitChannelClient,
+        instanceName: String,
+        argv: [String],
+        timeoutMs: Int,
+        logPrefix: String
+    ) throws -> Int32 {
+        let startMs = daemonMonotonicMs()
+        let response = try client.send(InitChannelRequest(
+            op: "exec",
+            argv: argv,
+            runAsRoot: true,
+            timeoutMs: timeoutMs
+        ))
+        guard response.ok else {
+            throw MSLRuntimeError(response.error?.message ?? "\(logPrefix) failed")
+        }
+        let exitCode = response.exitCode ?? 0
+        logger.log("\(logPrefix)_completed", fields: [
+            "instance": instanceName,
+            "argv0": argv.first ?? "",
+            "exit_code": String(exitCode),
+            "elapsed_ms": String(daemonMonotonicMs() - startMs)
+        ])
+        return exitCode
     }
 
     private func resolveHostUserContext(

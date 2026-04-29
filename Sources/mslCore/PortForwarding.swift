@@ -1,6 +1,19 @@
 import Foundation
 import Darwin
 
+protocol PortForwardingBackend: AnyObject {
+    func sync(mappings: [PortMapping]) -> RuntimeControlResponse
+    func add(_ mapping: PortMapping) -> RuntimeControlResponse
+    func remove(hostPort: Int, ownerInstance: String) -> RuntimeControlResponse
+    func list(mappings: [PortMapping]) -> RuntimeControlResponse
+    func updateGuestIP(_ ip: String?)
+    func stopAll()
+}
+
+extension PortForwardingBackend {
+    func updateGuestIP(_: String?) {}
+}
+
 final class PortForwardingManager {
     private struct ActiveListener {
         var listener: PortListener
@@ -249,6 +262,8 @@ final class PortForwardingManager {
     }
 }
 
+extension PortForwardingManager: PortForwardingBackend {}
+
 private final class PortListener {
     private struct BoundListener {
         var fd: Int32
@@ -326,6 +341,7 @@ private final class PortListener {
     private func handleClient(clientFD: Int32) {
         let (targetFD, selectedIP) = connectTarget()
         if targetFD < 0 {
+            lingerReset(fd: clientFD)
             return
         }
         if let selectedIP {
@@ -336,16 +352,25 @@ private final class PortListener {
     }
 
     private func connectTarget() -> (Int32, String?) {
-        let candidates = guestIPResolver.candidateIPs()
-        for ip in candidates {
-            let fd = socket(AF_INET, SOCK_STREAM, 0)
-            if fd < 0 { continue }
-            if connectWithTimeout(fd: fd, host: ip, port: targetPort, timeoutMs: 150) {
-                return (fd, ip)
+        let deadline = Date().addingTimeInterval(5)
+        repeat {
+            let candidates = guestIPResolver.candidateIPs()
+            for ip in candidates {
+                let fd = socket(AF_INET, SOCK_STREAM, 0)
+                if fd < 0 { continue }
+                if connectWithTimeout(fd: fd, host: ip, port: targetPort, timeoutMs: 150) {
+                    return (fd, ip)
+                }
+                _ = close(fd)
             }
-            _ = close(fd)
-        }
+            usleep(100_000)
+        } while Date() < deadline
         return (-1, nil)
+    }
+
+    private func lingerReset(fd: Int32) {
+        var linger = linger(l_onoff: 1, l_linger: 0)
+        _ = setsockopt(fd, SOL_SOCKET, SO_LINGER, &linger, socklen_t(MemoryLayout<linger>.size))
     }
 
     private func connectWithTimeout(fd: Int32, host: String, port: Int, timeoutMs: Int32) -> Bool {

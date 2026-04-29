@@ -29,6 +29,22 @@ final class KernelBuildScriptTests: XCTestCase {
         XCTAssertFalse(result.combinedOutput.contains("unsupported KERNEL_PROFILE"), result.combinedOutput)
     }
 
+    func testSlimKernelFragmentKeepsContainerPortPublishingNAT() throws {
+        let fragment = try readKernelConfigFragment("msl-slim-defconfig.fragment")
+        for symbol in [
+            "CONFIG_NETFILTER=y",
+            "CONFIG_NF_NAT=y",
+            "CONFIG_NETFILTER_XT_MATCH_MULTIPORT=y",
+            "CONFIG_NETFILTER_XT_NAT=y",
+            "CONFIG_NETFILTER_XT_TARGET_MASQUERADE=y",
+            "CONFIG_NFT_CHAIN_NAT=y",
+            "CONFIG_NFT_NAT=y",
+            "CONFIG_IP_NF_NAT=y",
+        ] {
+            XCTAssertTrue(fragment.contains(symbol), "missing \(symbol)")
+        }
+    }
+
     private func runBuildKernelScript(env: [String: String]) throws -> CommandResult {
         let script = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
             .appendingPathComponent("scripts/build-kernel.sh").path
@@ -54,6 +70,13 @@ final class KernelBuildScriptTests: XCTestCase {
         let out = String(data: outPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
         let err = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
         return CommandResult(exitCode: process.terminationStatus, combinedOutput: out + err)
+    }
+
+    private func readKernelConfigFragment(_ name: String) throws -> String {
+        let url = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent("Support/kernel/config")
+            .appendingPathComponent(name)
+        return try String(contentsOf: url, encoding: .utf8)
     }
 }
 
