@@ -43,6 +43,24 @@ final class RuntimeBootProfileResolverTests: XCTestCase {
         XCTAssertEqual(profile.kernelID, "meta-kernel")
     }
 
+    func testReadonlyBaseCowStateUsesEmbeddedEarlyInitPath() throws {
+        let ctx = try RuntimeBootProfileResolverContext.make()
+        defer { ctx.cleanup() }
+
+        try ctx.writeMetadata(instanceName: "dev", kernelProfileRef: "slim", rootMode: .readonlyBaseCowState)
+        try ctx.makeKernelProfile("slim")
+
+        let resolver = RuntimeBootProfileResolver(paths: ctx.paths, logger: nil, environment: [:])
+        let profile = try resolver.resolve(
+            metadataURL: ctx.metadataURL(instanceName: "dev"),
+            instanceName: "dev",
+            defaultKernelProfileRef: nil
+        )
+
+        XCTAssertEqual(profile.rootMode, .readonlyBaseCowState)
+        XCTAssertEqual(profile.commandLine, "root=/dev/vda ro console=hvc0 init=/init")
+    }
+
     func testResolvesKernelProfileFromConfigWhenMetadataIsMissing() throws {
         let ctx = try RuntimeBootProfileResolverContext.make()
         defer { ctx.cleanup() }
@@ -145,7 +163,11 @@ private struct RuntimeBootProfileResolverContext {
         paths.distroMetadataFile(named: instanceName)
     }
 
-    func writeMetadata(instanceName: String, kernelProfileRef: String?) throws {
+    func writeMetadata(
+        instanceName: String,
+        kernelProfileRef: String?,
+        rootMode: DistributionInstanceMetadata.RootMode? = nil
+    ) throws {
         let instanceDir = paths.distroDirectory(named: instanceName)
         try FileManager.default.createDirectory(at: instanceDir, withIntermediateDirectories: true)
         let diskURL = paths.distroDiskFile(named: instanceName)
@@ -166,6 +188,9 @@ private struct RuntimeBootProfileResolverContext {
             createdAtEpochMs: nowEpochMs(),
             source: source,
             diskPath: diskURL.path,
+            baseDiskPath: rootMode == .readonlyBaseCowState ? diskURL.path : nil,
+            stateDiskPath: rootMode == .readonlyBaseCowState ? instanceDir.appendingPathComponent("state.btrfs.raw").path : nil,
+            rootMode: rootMode,
             kernelProfileRef: kernelProfileRef,
             userConvergencePolicy: nil
         )

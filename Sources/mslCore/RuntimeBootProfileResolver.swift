@@ -46,10 +46,15 @@ struct RuntimeBootProfileResolver {
         } else {
             let rootRaw = environment["MSL_KERNEL_ROOT"]?.trimmingCharacters(in: .whitespacesAndNewlines)
             let root = ((rootRaw?.isEmpty == false) ? rootRaw : nil) ?? "/dev/vda"
-            let initPathRaw = environment["MSL_KERNEL_INIT_PATH"]?.trimmingCharacters(in: .whitespacesAndNewlines)
-            let defaultInitPath = resolvedMode == "service-managed-init" ? "/sbin/init" : "/sbin/msl-init-bootloader"
-            let initPath = ((initPathRaw?.isEmpty == false) ? initPathRaw : nil) ?? defaultInitPath
-            commandLine = "root=\(root) rw console=hvc0 init=\(initPath)"
+            let rootMode = metadata.resolvedRootMode()
+            if rootMode == .readonlyBaseCowState {
+                commandLine = "root=\(root) ro console=hvc0 init=/init"
+            } else {
+                let initPathRaw = environment["MSL_KERNEL_INIT_PATH"]?.trimmingCharacters(in: .whitespacesAndNewlines)
+                let defaultInitPath = resolvedMode == "service-managed-init" ? "/sbin/init" : "/sbin/msl-init-bootloader"
+                let initPath = ((initPathRaw?.isEmpty == false) ? initPathRaw : nil) ?? defaultInitPath
+                commandLine = "root=\(root) rw console=hvc0 init=\(initPath)"
+            }
         }
 
         logger?.log("kernel_profile_resolved", fields: [
@@ -66,6 +71,7 @@ struct RuntimeBootProfileResolver {
             kernelID: kernelID,
             kernelURL: kernelURL,
             commandLine: commandLine,
+            rootMode: metadata.resolvedRootMode(),
             initMode: resolvedMode,
             serviceManager: resolvedServiceManager,
             profileSource: "metadata"

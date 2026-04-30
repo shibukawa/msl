@@ -2,6 +2,11 @@ import XCTest
 @testable import msl
 
 final class InstallCommandTests: XCTestCase {
+    func testContainerResetCommandParsesOptionalInstanceName() throws {
+        let parsed = try ContainerResetCommand.parse(["--instance", "_container_alt"])
+        XCTAssertEqual(parsed.instance, "_container_alt")
+    }
+
     func testInstallParsesContainerEntrypointOverrideAsRemainingArguments() throws {
         let parsed = try InstallCommand.parse([
             "--from-container", "cgr.dev/chainguard/python:latest",

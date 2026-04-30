@@ -12,6 +12,7 @@ ROOTFS_DIR="${ROOTFS_DIR:-}"
 OCI_LAYOUT_DIR="${OCI_LAYOUT_DIR:-}"
 EXTRA_GUEST_FILES_BUNDLE="${EXTRA_GUEST_FILES_BUNDLE:-}"
 INIT_BINARY_PATH="${IMAGEWRITER_INIT_BINARY:-}"
+EARLY_INIT_BINARY_PATH="${IMAGEWRITER_EARLY_INIT_BINARY:-}"
 RUN_TIMEOUT="${IMAGEWRITER_RUN_TIMEOUT:-900}"
 IMAGEWRITER_PACKAGES="${IMAGEWRITER_PACKAGES:-btrfs-progs e2fsprogs erofs-utils util-linux tar zstd xz coreutils}"
 IMAGEWRITER_APK_CACHE_DIR="${IMAGEWRITER_APK_CACHE_DIR:-}"
@@ -350,6 +351,10 @@ if [ -n "$INIT_BINARY_PATH" ] && [ ! -f "$INIT_BINARY_PATH" ]; then
   echo "error: IMAGEWRITER_INIT_BINARY not found: $INIT_BINARY_PATH" >&2
   exit 1
 fi
+if [ -n "$EARLY_INIT_BINARY_PATH" ] && [ ! -f "$EARLY_INIT_BINARY_PATH" ]; then
+  echo "error: IMAGEWRITER_EARLY_INIT_BINARY not found: $EARLY_INIT_BINARY_PATH" >&2
+  exit 1
+fi
 
 case "$IMAGE_FS" in
   btrfs|ext4|erofs) ;;
@@ -360,8 +365,18 @@ case "$IMAGE_FS" in
 esac
 
 OUTPUT_RAW="${OUTPUT_RAW:-$APP_SUPPORT/images/imagewriter-${IMAGE_FS}.raw}"
+OUTPUT_STATE_RAW="${OUTPUT_STATE_RAW:-}"
+OUTPUT_STATE_TEMPLATE_RAW="${OUTPUT_STATE_TEMPLATE_RAW:-}"
 IMAGE_SIZE_MB="${IMAGE_SIZE_MB:-}"
+STATE_IMAGE_SIZE_MB="${STATE_IMAGE_SIZE_MB:-$IMAGE_SIZE_MB}"
 TWO_STAGE_IMAGEWRITER=0
+
+if [ -z "$EARLY_INIT_BINARY_PATH" ] && [ "$IMAGE_FS" = "erofs" ] && { [ -n "$OUTPUT_STATE_RAW" ] || [ -n "$OUTPUT_STATE_TEMPLATE_RAW" ]; }; then
+  DEFAULT_EARLY_INIT="$HOME/.msl-system/msl-early-init"
+  if [ -f "$DEFAULT_EARLY_INIT" ]; then
+    EARLY_INIT_BINARY_PATH="$DEFAULT_EARLY_INIT"
+  fi
+fi
 
 case "$OUTPUT_RAW" in
   */distros/_imagewriter/disk.raw)
@@ -466,10 +481,12 @@ if [ -n "$EXTRA_GUEST_FILES_BUNDLE" ]; then
   STAGE_EXTRA_GUEST_FILES="$STAGE_IN_DIR/extra-guest-files"
 fi
 STAGE_OUTPUT="$STAGE_OUT_DIR/imagewriter-${IMAGE_FS}.raw"
+STAGE_STATE_OUTPUT="$STAGE_OUT_DIR/state-btrfs.raw"
 STAGE1_OUTPUT="$STAGE_OUT_DIR/stage1-ext4.raw"
 STAGE2_OUTPUT="$STAGE_OUT_DIR/stage2-${IMAGE_FS}.raw"
 STAGE_TMP_IMAGE="$STAGE_TMP_DIR/guest-tmp-work.raw"
 STAGE_INIT=""
+STAGE_EARLY_INIT=""
 STAGE_RUNTIME_SUMMARY=""
 progress_step "preparing staging area"
 copy_if_needed() {
@@ -517,10 +534,14 @@ with open(output_path, "w", encoding="utf-8") as fh:
 PY
   fi
 fi
-rm -f "$STAGE_OUTPUT" "$STAGE1_OUTPUT" "$STAGE2_OUTPUT" "$STAGE_TMP_IMAGE"
+rm -f "$STAGE_OUTPUT" "$STAGE_STATE_OUTPUT" "$STAGE1_OUTPUT" "$STAGE2_OUTPUT" "$STAGE_TMP_IMAGE"
 if [ -n "$INIT_BINARY_PATH" ]; then
   STAGE_INIT="$STAGE_IN_DIR/$(basename "$INIT_BINARY_PATH")"
   copy_if_needed "$INIT_BINARY_PATH" "$STAGE_INIT"
+fi
+if [ -n "$EARLY_INIT_BINARY_PATH" ]; then
+  STAGE_EARLY_INIT="$STAGE_IN_DIR/$(basename "$EARLY_INIT_BINARY_PATH")"
+  copy_if_needed "$EARLY_INIT_BINARY_PATH" "$STAGE_EARLY_INIT"
 fi
 if [ -n "$IMAGEWRITER_RUNTIME_SUMMARY_PATH" ]; then
   STAGE_RUNTIME_SUMMARY="$STAGE_OUT_DIR/$(basename "$IMAGEWRITER_RUNTIME_SUMMARY_PATH")"
@@ -542,6 +563,13 @@ GUEST_INIT=""
 if [ -n "$STAGE_INIT" ]; then
   if ! GUEST_INIT="$(host_to_guest_path "$STAGE_INIT" "$SHARE_ROOT")"; then
     echo "error: staging init path is outside host share root: $STAGE_INIT (share_root=$SHARE_ROOT)" >&2
+    exit 1
+  fi
+fi
+GUEST_EARLY_INIT=""
+if [ -n "$STAGE_EARLY_INIT" ]; then
+  if ! GUEST_EARLY_INIT="$(host_to_guest_path "$STAGE_EARLY_INIT" "$SHARE_ROOT")"; then
+    echo "error: staging early init path is outside host share root: $STAGE_EARLY_INIT (share_root=$SHARE_ROOT)" >&2
     exit 1
   fi
 fi
@@ -600,11 +628,13 @@ default_exec_argv_b64="${13}"
 default_exec_env_b64="${14}"
 default_exec_workdir="${15}"
 default_exec_user="${16}"
+early_init_bin=""
+early_init_bin="${MSL_IMAGEWRITER_EARLY_INIT_BIN:-}"
 stdout_log="$(guest_stdout_log_for_mode "$mode")"
 stderr_log="$(guest_stderr_log_for_mode "$mode")"
 rm -f "$stdout_log" "$stderr_log"
 
-if MSL_RUNTIME_USER_ROOT=1 "$MSL_BIN" --instance "$INSTANCE" run --timeout "$RUN_TIMEOUT" -- sh -lc '
+if MSL_RUNTIME_USER_ROOT=1 "$MSL_BIN" --instance "$INSTANCE" run --timeout "$RUN_TIMEOUT" -- env MSL_IMAGEWRITER_EARLY_INIT_BIN="$GUEST_EARLY_INIT" sh -lc '
 set -eu
 worker_b64="$1"
 mode="$2"
@@ -685,7 +715,7 @@ cleanup_guest_artifacts() {
   sync >/dev/null 2>&1 || true
   fstrim -v / >/dev/null 2>&1 || true
 }
-trap cleanup_guest_artifacts EXIT INT TERM
+trap "cleanup_status=\$?; cleanup_guest_artifacts; exit \$cleanup_status" EXIT INT TERM
 
 if [ -z "$tmp_image" ]; then
   echo "error: temporary work image path is empty" >&2
@@ -719,7 +749,10 @@ mkdir -p "$tmp_work_dir"
 printf "%s" "$worker_b64" | base64 -d > "$worker"
 chmod 0700 "$worker"
 rm -f "$local_output"
-case "$mode" in
+  case "$mode" in
+  state)
+    MSL_IMAGEWRITER_WORK_DIR="$tmp_work_dir" sh "$worker" --mode state --output "$local_output" --size-mb "$size_mb"
+    ;;
   stage1)
     if [ -n "$init_bin" ]; then
       if [ -d "$input_path" ]; then
@@ -739,22 +772,22 @@ case "$mode" in
     if [ -n "$init_bin" ]; then
       if [ -d "$input_path" ]; then
         if [ -f "$input_path/index.json" ]; then
-          MSL_IMAGEWRITER_WORK_DIR="$tmp_work_dir" sh "$worker" --mode stage2 --fs-type "$fs_type" --oci-layout-dir "$input_path" --extra-files-bundle "$extra_files_bundle" --output "$local_output" --size-mb "$size_mb" --init-binary "$init_bin" --packages "$packages" --apk-cache-dir "$apk_cache" --retry-limit "$apk_retry_limit" --runtime-summary "$runtime_summary" --default-exec-argv-b64 "$default_exec_argv_b64" --default-exec-env-b64 "$default_exec_env_b64" --default-exec-workdir "$default_exec_workdir" --default-exec-user "$default_exec_user"
+          MSL_IMAGEWRITER_WORK_DIR="$tmp_work_dir" sh "$worker" --mode stage2 --fs-type "$fs_type" --oci-layout-dir "$input_path" --extra-files-bundle "$extra_files_bundle" --output "$local_output" --size-mb "$size_mb" --init-binary "$init_bin" --early-init-binary "${early_init_bin:-}" --packages "$packages" --apk-cache-dir "$apk_cache" --retry-limit "$apk_retry_limit" --runtime-summary "$runtime_summary" --default-exec-argv-b64 "$default_exec_argv_b64" --default-exec-env-b64 "$default_exec_env_b64" --default-exec-workdir "$default_exec_workdir" --default-exec-user "$default_exec_user"
         else
-          MSL_IMAGEWRITER_WORK_DIR="$tmp_work_dir" sh "$worker" --mode stage2 --fs-type "$fs_type" --rootfs-dir "$input_path" --output "$local_output" --size-mb "$size_mb" --init-binary "$init_bin" --packages "$packages" --apk-cache-dir "$apk_cache" --retry-limit "$apk_retry_limit"
+          MSL_IMAGEWRITER_WORK_DIR="$tmp_work_dir" sh "$worker" --mode stage2 --fs-type "$fs_type" --rootfs-dir "$input_path" --output "$local_output" --size-mb "$size_mb" --init-binary "$init_bin" --early-init-binary "${early_init_bin:-}" --packages "$packages" --apk-cache-dir "$apk_cache" --retry-limit "$apk_retry_limit"
         fi
       else
-        MSL_IMAGEWRITER_WORK_DIR="$tmp_work_dir" sh "$worker" --mode stage2 --fs-type "$fs_type" --rootfs "$input_path" --output "$local_output" --size-mb "$size_mb" --init-binary "$init_bin" --packages "$packages" --apk-cache-dir "$apk_cache" --retry-limit "$apk_retry_limit"
+        MSL_IMAGEWRITER_WORK_DIR="$tmp_work_dir" sh "$worker" --mode stage2 --fs-type "$fs_type" --rootfs "$input_path" --output "$local_output" --size-mb "$size_mb" --init-binary "$init_bin" --early-init-binary "${early_init_bin:-}" --packages "$packages" --apk-cache-dir "$apk_cache" --retry-limit "$apk_retry_limit"
       fi
     else
       if [ -d "$input_path" ]; then
         if [ -f "$input_path/index.json" ]; then
-          MSL_IMAGEWRITER_WORK_DIR="$tmp_work_dir" sh "$worker" --mode stage2 --fs-type "$fs_type" --oci-layout-dir "$input_path" --extra-files-bundle "$extra_files_bundle" --output "$local_output" --size-mb "$size_mb" --packages "$packages" --apk-cache-dir "$apk_cache" --retry-limit "$apk_retry_limit" --runtime-summary "$runtime_summary" --default-exec-argv-b64 "$default_exec_argv_b64" --default-exec-env-b64 "$default_exec_env_b64" --default-exec-workdir "$default_exec_workdir" --default-exec-user "$default_exec_user"
+          MSL_IMAGEWRITER_WORK_DIR="$tmp_work_dir" sh "$worker" --mode stage2 --fs-type "$fs_type" --oci-layout-dir "$input_path" --extra-files-bundle "$extra_files_bundle" --output "$local_output" --size-mb "$size_mb" --early-init-binary "${early_init_bin:-}" --packages "$packages" --apk-cache-dir "$apk_cache" --retry-limit "$apk_retry_limit" --runtime-summary "$runtime_summary" --default-exec-argv-b64 "$default_exec_argv_b64" --default-exec-env-b64 "$default_exec_env_b64" --default-exec-workdir "$default_exec_workdir" --default-exec-user "$default_exec_user"
         else
-          MSL_IMAGEWRITER_WORK_DIR="$tmp_work_dir" sh "$worker" --mode stage2 --fs-type "$fs_type" --rootfs-dir "$input_path" --output "$local_output" --size-mb "$size_mb" --packages "$packages" --apk-cache-dir "$apk_cache" --retry-limit "$apk_retry_limit"
+          MSL_IMAGEWRITER_WORK_DIR="$tmp_work_dir" sh "$worker" --mode stage2 --fs-type "$fs_type" --rootfs-dir "$input_path" --output "$local_output" --size-mb "$size_mb" --early-init-binary "${early_init_bin:-}" --packages "$packages" --apk-cache-dir "$apk_cache" --retry-limit "$apk_retry_limit"
         fi
       else
-        MSL_IMAGEWRITER_WORK_DIR="$tmp_work_dir" sh "$worker" --mode stage2 --fs-type "$fs_type" --rootfs "$input_path" --output "$local_output" --size-mb "$size_mb" --packages "$packages" --apk-cache-dir "$apk_cache" --retry-limit "$apk_retry_limit"
+        MSL_IMAGEWRITER_WORK_DIR="$tmp_work_dir" sh "$worker" --mode stage2 --fs-type "$fs_type" --rootfs "$input_path" --output "$local_output" --size-mb "$size_mb" --early-init-binary "${early_init_bin:-}" --packages "$packages" --apk-cache-dir "$apk_cache" --retry-limit "$apk_retry_limit"
       fi
     fi
     ;;
@@ -826,14 +859,15 @@ run_guest_worker_with_retry() {
   guest_init="$6"
   packages="$7"
   apk_cache="$8"
+  early_init="${9:-$GUEST_EARLY_INIT}"
 
-  if run_guest_worker "$mode" "$guest_input" "$guest_output" "$fs_type" "$size_mb" "$guest_init" "$packages" "$apk_cache" "$GUEST_TMP_IMAGE" "$IMAGEWRITER_APK_RETRY_LIMIT" "$GUEST_RUNTIME_SUMMARY" "$GUEST_EXTRA_GUEST_FILES" "$IMAGEWRITER_DEFAULT_EXEC_ARGV_B64" "$IMAGEWRITER_DEFAULT_EXEC_ENV_B64" "$IMAGEWRITER_DEFAULT_EXEC_WORKDIR" "$IMAGEWRITER_DEFAULT_EXEC_USER"; then
+  if run_guest_worker "$mode" "$guest_input" "$guest_output" "$fs_type" "$size_mb" "$guest_init" "$packages" "$apk_cache" "$GUEST_TMP_IMAGE" "$IMAGEWRITER_APK_RETRY_LIMIT" "$GUEST_RUNTIME_SUMMARY" "$GUEST_EXTRA_GUEST_FILES" "$IMAGEWRITER_DEFAULT_EXEC_ARGV_B64" "$IMAGEWRITER_DEFAULT_EXEC_ENV_B64" "$IMAGEWRITER_DEFAULT_EXEC_WORKDIR" "$IMAGEWRITER_DEFAULT_EXEC_USER" "$early_init"; then
     return 0
   fi
 
   echo "imagewriter: first guest run failed for mode=$mode; stopping instance and retrying once..." >&2
   "$MSL_BIN" --instance "$INSTANCE" stop >/dev/null 2>&1 || true
-  run_guest_worker "$mode" "$guest_input" "$guest_output" "$fs_type" "$size_mb" "$guest_init" "$packages" "$apk_cache" "$GUEST_TMP_IMAGE" "$IMAGEWRITER_APK_RETRY_LIMIT" "$GUEST_RUNTIME_SUMMARY" "$GUEST_EXTRA_GUEST_FILES" "$IMAGEWRITER_DEFAULT_EXEC_ARGV_B64" "$IMAGEWRITER_DEFAULT_EXEC_ENV_B64" "$IMAGEWRITER_DEFAULT_EXEC_WORKDIR" "$IMAGEWRITER_DEFAULT_EXEC_USER"
+  run_guest_worker "$mode" "$guest_input" "$guest_output" "$fs_type" "$size_mb" "$guest_init" "$packages" "$apk_cache" "$GUEST_TMP_IMAGE" "$IMAGEWRITER_APK_RETRY_LIMIT" "$GUEST_RUNTIME_SUMMARY" "$GUEST_EXTRA_GUEST_FILES" "$IMAGEWRITER_DEFAULT_EXEC_ARGV_B64" "$IMAGEWRITER_DEFAULT_EXEC_ENV_B64" "$IMAGEWRITER_DEFAULT_EXEC_WORKDIR" "$IMAGEWRITER_DEFAULT_EXEC_USER" "$early_init"
 }
 
 if [ "$TWO_STAGE_IMAGEWRITER" -eq 1 ]; then
@@ -947,6 +981,50 @@ else
   fi
 fi
 
+copy_sparse_file() {
+  src="$1"
+  dst="$2"
+  if cp --help 2>/dev/null | grep -q -- '--sparse'; then
+    cp --sparse=always -f "$src" "$dst"
+  else
+    cp -f "$src" "$dst"
+  fi
+}
+
+if [ -n "$OUTPUT_STATE_RAW" ] || [ -n "$OUTPUT_STATE_TEMPLATE_RAW" ]; then
+  STATE_TEMPLATE_RAW="$OUTPUT_STATE_TEMPLATE_RAW"
+  if [ -z "$STATE_TEMPLATE_RAW" ]; then
+    STATE_TEMPLATE_RAW="$OUTPUT_STATE_RAW"
+  fi
+  echo "imagewriter_pipeline state=enabled template=$STATE_TEMPLATE_RAW output=$OUTPUT_STATE_RAW"
+  mkdir -p "$(dirname "$STATE_TEMPLATE_RAW")"
+  if [ -n "$OUTPUT_STATE_RAW" ]; then
+    mkdir -p "$(dirname "$OUTPUT_STATE_RAW")"
+  fi
+  if ! GUEST_STATE_OUTPUT="$(host_to_guest_path "$STAGE_STATE_OUTPUT" "$SHARE_ROOT")"; then
+    echo "error: state staging output path is outside host share root: $STAGE_STATE_OUTPUT (share_root=$SHARE_ROOT)" >&2
+    exit 1
+  fi
+  mark_stage_start "state_btrfs" "$GUEST_ROOTFS" "$GUEST_STATE_OUTPUT"
+  if run_guest_worker_with_retry state "$GUEST_ROOTFS" "$GUEST_STATE_OUTPUT" "btrfs" "$STATE_IMAGE_SIZE_MB" "" "" "$GUEST_APK_CACHE"; then
+    mark_stage_complete "state_btrfs"
+  else
+    stage_code=$?
+    mark_stage_failed "state_btrfs" "$stage_code"
+    exit 22
+  fi
+  verify_expected_fs_type "$STAGE_STATE_OUTPUT" "btrfs" "state_btrfs"
+  if ! mv -f "$STAGE_STATE_OUTPUT" "$STATE_TEMPLATE_RAW"; then
+    echo "error: failed to move built state template image to output path: $STATE_TEMPLATE_RAW" >&2
+    exit 23
+  fi
+  progress_step "moved state template image to output path"
+  if [ -n "$OUTPUT_STATE_RAW" ] && [ "$OUTPUT_STATE_RAW" != "$STATE_TEMPLATE_RAW" ]; then
+    copy_sparse_file "$STATE_TEMPLATE_RAW" "$OUTPUT_STATE_RAW"
+    progress_step "copied state template to writable state image"
+  fi
+fi
+
 echo "imagewriter build completed"
 echo "instance: $INSTANCE"
 echo "fs: $IMAGE_FS"
@@ -961,4 +1039,10 @@ else
   echo "rootfs: $ROOTFS_TARBALL"
 fi
 echo "output: $OUTPUT_RAW"
+if [ -n "$OUTPUT_STATE_RAW" ]; then
+  echo "state_output: $OUTPUT_STATE_RAW"
+fi
+if [ -n "$OUTPUT_STATE_TEMPLATE_RAW" ]; then
+  echo "state_template_output: $OUTPUT_STATE_TEMPLATE_RAW"
+fi
 progress_step "done"

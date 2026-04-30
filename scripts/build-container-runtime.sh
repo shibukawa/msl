@@ -18,14 +18,21 @@ ARTIFACT_DIR="$ARTIFACT_ROOT/$INSTANCE_NAME"
 mkdir -p "$ARTIFACT_ROOT"
 
 echo "building internal container runtime instance: $INSTANCE_NAME"
-MSL_ALLOW_INTERNAL_CONTAINER_RUNTIME=1 "$MSL_BIN" install --rebuild --name "$INSTANCE_NAME" container-runtime
+"$MSL_BIN" stop --app >/dev/null 2>&1 || true
+MSL_ALLOW_INTERNAL_CONTAINER_RUNTIME=1 \
+MSL_IMAGEWRITER_BUILD_SCRIPT="$PWD/scripts/imagewriter-build.sh" \
+MSL_EARLY_INIT_BINARY_PATH="${MSL_EARLY_INIT_BINARY_PATH:-$HOME/.msl-system/msl-early-init}" \
+IMAGEWRITER_EARLY_INIT_BINARY="${MSL_EARLY_INIT_BINARY_PATH:-$HOME/.msl-system/msl-early-init}" \
+"$MSL_BIN" install --rebuild --name "$INSTANCE_NAME" container-runtime
 
 mkdir -p "$ARTIFACT_DIR"
-cp "$INSTANCE_DIR/disk.raw" "$ARTIFACT_DIR/disk.raw"
+cp "$INSTANCE_DIR/base.erofs.raw" "$ARTIFACT_DIR/base.erofs.raw"
+cp "$INSTANCE_DIR/state.btrfs.template.raw" "$ARTIFACT_DIR/state.btrfs.template.raw"
 cp "$INSTANCE_DIR/metadata.json" "$ARTIFACT_DIR/metadata.json"
 cp "$INSTANCE_DIR/source.json" "$ARTIFACT_DIR/source.json"
 
 echo "container runtime artifact ready: $ARTIFACT_DIR"
-echo "  disk:     $ARTIFACT_DIR/disk.raw"
-echo "  metadata: $ARTIFACT_DIR/metadata.json"
-echo "  source:   $ARTIFACT_DIR/source.json"
+echo "  base:           $ARTIFACT_DIR/base.erofs.raw"
+echo "  state template: $ARTIFACT_DIR/state.btrfs.template.raw"
+echo "  metadata:       $ARTIFACT_DIR/metadata.json"
+echo "  source:         $ARTIFACT_DIR/source.json"

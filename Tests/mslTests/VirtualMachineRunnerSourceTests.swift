@@ -18,7 +18,7 @@ final class VirtualMachineRunnerSourceTests: XCTestCase {
         XCTAssertTrue(source.contains("MSL_EPHEMERAL_TMP_DEVICE="))
         XCTAssertTrue(source.contains("MSL_EPHEMERAL_TMP_SIZE_MIB="))
         XCTAssertTrue(source.contains("MSL_EPHEMERAL_TMP_RESET_ON_STOP="))
-        XCTAssertTrue(source.contains("ephemeralTmpDevicePath = \"/dev/vdb\""))
+        XCTAssertTrue(source.contains("ephemeralTmpDevicePath = rootMode == .readonlyBaseCowState ? \"/dev/vdc\" : \"/dev/vdb\""))
     }
 
     func testEphemeralTmpDiskRequiresHostMkfsHelper() throws {
@@ -27,6 +27,17 @@ final class VirtualMachineRunnerSourceTests: XCTestCase {
 
         XCTAssertTrue(source.contains("tmp ext4 mkfs helper not found"))
         XCTAssertFalse(source.contains("failed to create tmp image file"))
+    }
+
+    func testReadonlyBaseCowStateAttachesBaseReadonlyAndStateWritable() throws {
+        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+        let source = try String(contentsOf: root.appendingPathComponent("Sources/mslCore/VirtualMachineRunner.swift"), encoding: .utf8)
+
+        XCTAssertTrue(source.contains("diskReadOnly: metadata.rootMode == .readonlyBaseCowState"))
+        XCTAssertTrue(source.contains("VZDiskImageStorageDeviceAttachment(url: diskURL, readOnly: diskReadOnly)"))
+        XCTAssertTrue(source.contains("VZDiskImageStorageDeviceAttachment(url: stateDiskURL, readOnly: false)"))
+        XCTAssertFalse(source.contains("initialRamdiskURL"))
+        XCTAssertFalse(source.contains("makeOverlayRootInitramfs"))
     }
 
     func testInitialInitHandshakeRetriesAfterFirstPingFailure() throws {

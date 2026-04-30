@@ -105,6 +105,34 @@ final class DistributionModelsTests: XCTestCase {
         XCTAssertEqual(decoded.resolvedStartupMode(), .interactive)
         XCTAssertNil(decoded.workloadKind)
         XCTAssertEqual(decoded.resolvedWorkloadKind(), .generic)
+        XCTAssertNil(decoded.rootMode)
+        XCTAssertEqual(decoded.resolvedRootMode(), .singleDisk)
+    }
+
+    func testDistributionMetadataRoundTripsReadonlyBaseCowState() throws {
+        let metadata = DistributionInstanceMetadata(
+            name: "python",
+            createdAtEpochMs: 100,
+            source: DistributionSourceRecord(
+                sourceType: "container-remote",
+                tarballFileName: "rootfs.oci",
+                sha256: "abc",
+                verifiedAtEpochMs: 100
+            ),
+            diskPath: "/tmp/disk.raw",
+            baseDiskPath: "/tmp/base.erofs.raw",
+            stateDiskPath: "/tmp/state.btrfs.raw",
+            rootMode: .readonlyBaseCowState,
+            kernelProfileRef: nil,
+            userConvergencePolicy: nil
+        )
+
+        let data = try JSONEncoder().encode(metadata)
+        let decoded = try JSONDecoder().decode(DistributionInstanceMetadata.self, from: data)
+        XCTAssertEqual(decoded.baseDiskPath, "/tmp/base.erofs.raw")
+        XCTAssertEqual(decoded.stateDiskPath, "/tmp/state.btrfs.raw")
+        XCTAssertEqual(decoded.rootMode, .readonlyBaseCowState)
+        XCTAssertEqual(decoded.resolvedRootMode(), .readonlyBaseCowState)
     }
 
     func testDistributionInstanceMetadataDecodesWithoutWorkspacePolicy() throws {

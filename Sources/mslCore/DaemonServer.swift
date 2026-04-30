@@ -2099,6 +2099,8 @@ public final class DaemonServer {
             return handleImageList(request)
         case "image_inspect":
             return handleImageInspect(request)
+        case "image_storage_summary":
+            return handleImageStorageSummary(request)
         case "image_rm":
             return handleNerdctlImageRemove(request)
         case "container_prune":
@@ -5643,10 +5645,13 @@ public final class DaemonServer {
             let guestStorage = try readGuestStorageSnapshot(client: client)
             let metadataURL = try context.metadataURL ?? distributionManager.runtimeMetadataURL(defaultInstanceName: instanceName)
             let metadata = try distributionManager.readOrRebuildInstanceMetadata(at: metadataURL)
-            let diskURL = URL(fileURLWithPath: metadata.diskPath)
-
-            let hostLogical = logicalBytes(of: diskURL).flatMap(UInt64.init)
-            let hostAllocated = allocatedBytes(of: diskURL).flatMap(UInt64.init)
+            let diskURLs = [metadata.baseDiskPath, metadata.stateDiskPath, Optional(metadata.diskPath)]
+                .compactMap { $0 }
+                .map { URL(fileURLWithPath: $0) }
+            let hostLogicalValues = diskURLs.compactMap { logicalBytes(of: $0).flatMap(UInt64.init) }
+            let hostAllocatedValues = diskURLs.compactMap { allocatedBytes(of: $0).flatMap(UInt64.init) }
+            let hostLogical = hostLogicalValues.isEmpty ? nil : hostLogicalValues.reduce(0, +)
+            let hostAllocated = hostAllocatedValues.isEmpty ? nil : hostAllocatedValues.reduce(0, +)
             let hostApparent = hostLogical
             let spaceSavingBytes: UInt64? = {
                 guard let logical = hostLogical, let allocated = hostAllocated, logical >= allocated else {
@@ -5684,6 +5689,26 @@ public final class DaemonServer {
         } catch {
             return RuntimeControlResponse(ok: false, error: String(describing: error))
         }
+    }
+
+    private func readContainerRuntimeHostImageStorageSummary(_ request: RuntimeControlRequest) throws -> (logical: UInt64?, allocated: UInt64?) {
+        let instanceName = resolveTargetInstanceName(request)
+        let metadataURL = try distributionManager.runtimeMetadataURL(defaultInstanceName: instanceName)
+        let metadata = try distributionManager.readOrRebuildInstanceMetadata(at: metadataURL)
+        var diskURLs = [metadata.baseDiskPath, metadata.stateDiskPath, Optional(metadata.diskPath)]
+            .compactMap { $0 }
+            .map { URL(fileURLWithPath: $0) }
+        let templateURL = paths.distroStateTemplateDiskFile(named: instanceName)
+        if FileManager.default.fileExists(atPath: templateURL.path) {
+            diskURLs.append(templateURL)
+        }
+        diskURLs = Array(Set(diskURLs.map(\.standardizedFileURL))).sorted { $0.path < $1.path }
+        let hostLogicalValues = diskURLs.compactMap { logicalBytes(of: $0).flatMap(UInt64.init) }
+        let hostAllocatedValues = diskURLs.compactMap { allocatedBytes(of: $0).flatMap(UInt64.init) }
+        return (
+            logical: hostLogicalValues.isEmpty ? nil : hostLogicalValues.reduce(0, +),
+            allocated: hostAllocatedValues.isEmpty ? nil : hostAllocatedValues.reduce(0, +)
+        )
     }
 
     private func handleInstanceProcesses(_ request: RuntimeControlRequest) -> RuntimeControlResponse {
@@ -5969,12 +5994,19 @@ public final class DaemonServer {
             argv: [
                 "/bin/sh", "-lc",
                 """
-                c_status=0; b_status=0
+                c_status=0; b_status=0; d_status=127
                 rc-service containerd status >/dev/null 2>&1 || c_status=$?
                 rc-service buildkitd status >/dev/null 2>&1 || b_status=$?
+                if [ -x /etc/init.d/msl-btrfs-dedupe ]; then
+                  rc-service msl-btrfs-dedupe status >/dev/null 2>&1 || d_status=$?
+                fi
+                d_detail=disabled
+                if [ -x /etc/init.d/msl-btrfs-dedupe ]; then
+                  d_detail=$([ "$d_status" -eq 0 ] && printf running || printf unavailable)
+                fi
                 c_count=$(/usr/local/bin/nerdctl container ls -a -q 2>/dev/null | wc -l | tr -d ' ')
                 i_count=$(/usr/local/bin/nerdctl images -q 2>/dev/null | wc -l | tr -d ' ')
-                printf '%s\\n%s\\n%s\\n%s\\n' "$c_status" "$b_status" "${c_count:-}" "${i_count:-}"
+                printf '%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n' "$c_status" "$b_status" "$d_status" "$d_detail" "${c_count:-}" "${i_count:-}"
                 """
             ],
             runAsRoot: true,
@@ -5987,17 +6019,22 @@ public final class DaemonServer {
         let lines = stdout
             .split(separator: "\n", omittingEmptySubsequences: false)
             .map(String.init)
-        guard lines.count >= 4 else {
+        guard lines.count >= 6 else {
             return nil
         }
         let trimSet = CharacterSet.whitespacesAndNewlines
         let containerdHealthy = Int(lines[0].trimmingCharacters(in: trimSet)) == 0
         let buildkitdHealthy = Int(lines[1].trimmingCharacters(in: trimSet)) == 0
-        let containerCount = Int(lines[2].trimmingCharacters(in: trimSet))
-        let imageCount = Int(lines[3].trimmingCharacters(in: trimSet))
+        let dedupeStatus = Int(lines[2].trimmingCharacters(in: trimSet))
+        let dedupeDetail = lines[3].trimmingCharacters(in: trimSet)
+        let containerCount = Int(lines[4].trimmingCharacters(in: trimSet))
+        let imageCount = Int(lines[5].trimmingCharacters(in: trimSet))
         return RuntimeContainerRuntimeMetrics(
             containerdHealthy: containerdHealthy,
             buildkitdHealthy: buildkitdHealthy,
+            dedupeEnabled: dedupeStatus != 127,
+            dedupeHealthy: dedupeStatus == 0,
+            dedupeDetail: dedupeDetail.isEmpty ? nil : dedupeDetail,
             containerCount: containerCount,
             imageCount: imageCount
         )
@@ -6016,6 +6053,9 @@ public final class DaemonServer {
             containerRuntimeSummary: RuntimeContainerRuntimeSummary(
                 containerdHealthy: metrics.containerdHealthy,
                 buildkitdHealthy: metrics.buildkitdHealthy,
+                dedupeEnabled: metrics.dedupeEnabled,
+                dedupeHealthy: metrics.dedupeHealthy,
+                dedupeDetail: metrics.dedupeDetail,
                 containerCount: metrics.containerCount,
                 imageCount: metrics.imageCount,
                 sampledAtEpochMs: nowEpochMs()
@@ -6060,6 +6100,32 @@ public final class DaemonServer {
         do {
             let stdout = try runNerdctlSnapshot(request, args: ["image", "inspect", id])
             return RuntimeControlResponse(ok: true, imageDetail: try parseNerdctlImageInspect(stdout, fallbackID: id))
+        } catch {
+            return RuntimeControlResponse(ok: false, error: String(describing: error))
+        }
+    }
+
+    private func handleImageStorageSummary(_ request: RuntimeControlRequest) -> RuntimeControlResponse {
+        do {
+            let imageListOutput = try runNerdctlSnapshot(request, args: ["images", "--format", "json"], timeoutMs: 8_000)
+            let imageIDs = Array(Set(try parseNerdctlImageList(imageListOutput).map(\.id))).filter { !$0.isEmpty }.sorted()
+            let guestTotal: UInt64
+            if imageIDs.isEmpty {
+                guestTotal = 0
+            } else {
+                let inspectOutput = try runNerdctlSnapshot(request, args: ["image", "inspect"] + imageIDs, timeoutMs: 20_000)
+                guestTotal = try parseNerdctlImageInspectList(inspectOutput).compactMap(\.sizeBytes).reduce(0, +)
+            }
+            let hostStorage = try readContainerRuntimeHostImageStorageSummary(request)
+            return RuntimeControlResponse(
+                ok: true,
+                imageStorageSummary: RuntimeImageStorageSummary(
+                    guestImageTotalBytes: guestTotal,
+                    hostLogicalBytes: hostStorage.logical,
+                    hostAllocatedBytes: hostStorage.allocated,
+                    sampledAtEpochMs: nowEpochMs()
+                )
+            )
         } catch {
             return RuntimeControlResponse(ok: false, error: String(describing: error))
         }
@@ -6266,6 +6332,29 @@ public final class DaemonServer {
             sizeBytes: uint64Value(object["Size"]),
             labels: dictionaryStringValue(config["Labels"])
         )
+    }
+
+    private func parseNerdctlImageInspectList(_ text: String) throws -> [RuntimeImageDetail] {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+        let data = Data(trimmed.utf8)
+        if let array = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
+            return array.compactMap { object in
+                guard let id = stringValue(object, ["Id", "ID"]) else { return nil }
+                let config = object["Config"] as? [String: Any] ?? [:]
+                return RuntimeImageDetail(
+                    id: id,
+                    repoTags: stringArrayValue(object["RepoTags"]),
+                    repoDigests: stringArrayValue(object["RepoDigests"]),
+                    architecture: stringValue(object, ["Architecture"]),
+                    os: stringValue(object, ["Os", "OS"]),
+                    created: stringValue(object, ["Created"]),
+                    sizeBytes: uint64Value(object["Size"]),
+                    labels: dictionaryStringValue(config["Labels"])
+                )
+            }
+        }
+        return [try parseNerdctlImageInspect(text, fallbackID: "")]
     }
 
     private func parseNerdctlContainerStats(_ text: String, fallbackID: String) throws -> RuntimeContainerStats {
@@ -7147,6 +7236,7 @@ public final class DaemonServer {
         ])
         try ensureContainerRuntimeServiceManagerInitialized(client: client, instanceName: instanceName)
         try ensureContainerRuntimeCachePolicy(client: client, instanceName: instanceName)
+        startContainerRuntimeDedupeIfAvailable(client: client, instanceName: instanceName)
         try ensureContainerRuntimeService("containerd", client: client, instanceName: instanceName)
         try ensureContainerRuntimeService("buildkitd", client: client, instanceName: instanceName)
         logger.log("daemon_startup_step_completed", fields: [
@@ -7182,6 +7272,37 @@ public final class DaemonServer {
         )
         guard exitCode == 0 else {
             throw MSLRuntimeError("failed to initialize container-runtime native snapshotter cache policy")
+        }
+    }
+
+    private func startContainerRuntimeDedupeIfAvailable(
+        client: InitChannelClient,
+        instanceName: String
+    ) {
+        let script = """
+        if [ -x /etc/init.d/msl-btrfs-dedupe ]; then
+          rc-service msl-btrfs-dedupe status >/dev/null 2>&1 || rc-service msl-btrfs-dedupe start >/dev/null 2>&1
+        fi
+        """
+        do {
+            let exitCode = try executeContainerRuntimeStartupCommand(
+                client: client,
+                instanceName: instanceName,
+                argv: ["/bin/sh", "-lc", script],
+                timeoutMs: 10_000,
+                logPrefix: "container_runtime_dedupe_start"
+            )
+            if exitCode != 0 {
+                logger.log("container_runtime_dedupe_start_failed", fields: [
+                    "instance": instanceName,
+                    "exit_code": String(exitCode)
+                ])
+            }
+        } catch {
+            logger.log("container_runtime_dedupe_start_failed", fields: [
+                "instance": instanceName,
+                "error": String(describing: error)
+            ])
         }
     }
 

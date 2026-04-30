@@ -133,7 +133,7 @@ final class DistributionManager {
     private static let containerRuntimeImagewriterPackages = [
         "btrfs-progs", "e2fsprogs", "erofs-utils", "util-linux", "tar", "zstd", "xz", "coreutils",
         "openrc", "bash", "ca-certificates", "iproute2", "iptables", "nftables",
-        "containerd", "buildkit", "nerdctl", "runc", "cni-plugins"
+        "containerd", "buildkit", "nerdctl", "runc", "cni-plugins", "duperemove"
     ].joined(separator: " ")
 
     private let paths: MSLPaths
@@ -197,7 +197,8 @@ final class DistributionManager {
                 createdAt = metadata.createdAtEpochMs
             }
 
-            let hasDisk = fileManager.fileExists(atPath: diskPath.path)
+            let baseDiskPath = paths.distroBaseDiskFile(named: name)
+            let hasDisk = fileManager.fileExists(atPath: diskPath.path) || fileManager.fileExists(atPath: baseDiskPath.path)
             instances.append(
                 InstalledInstanceDescriptor(name: name, hasDisk: hasDisk, createdAtEpochMs: createdAt)
             )
@@ -244,7 +245,8 @@ final class DistributionManager {
     private func runtimeMetadataURLIfBootable(instanceName: String) -> URL? {
         let metadata = paths.distroMetadataFile(named: instanceName)
         let disk = paths.distroDiskFile(named: instanceName)
-        guard fileManager.fileExists(atPath: disk.path) else {
+        let baseDisk = paths.distroBaseDiskFile(named: instanceName)
+        guard fileManager.fileExists(atPath: disk.path) || fileManager.fileExists(atPath: baseDisk.path) else {
             return nil
         }
         return metadata
@@ -493,11 +495,12 @@ final class DistributionManager {
 
         let distroDir = paths.distroDirectory(named: name)
         let diskFile = paths.distroDiskFile(named: name)
+        let existingPrimaryDiskFile = targetAlias == "container-runtime" ? paths.distroBaseDiskFile(named: name) : diskFile
         let sourceFile = paths.distroSourceFile(named: name)
         let metadataFile = paths.distroMetadataFile(named: name)
 
-        if fileManager.fileExists(atPath: diskFile.path), !rebuild {
-            logger.log("image_create_skipped_existing", fields: ["name": name, "disk": diskFile.path])
+        if fileManager.fileExists(atPath: existingPrimaryDiskFile.path), !rebuild {
+            logger.log("image_create_skipped_existing", fields: ["name": name, "disk": existingPrimaryDiskFile.path])
             emitStatus("install: image already exists, skipping build")
             return distroDir
         }
@@ -533,13 +536,29 @@ final class DistributionManager {
             let requestedSizeGB = diskSizeGB ?? Self.defaultImagewriterDiskSizeGB
             let requestedSizeMB = max(1, requestedSizeGB) * 1024
             let initBinaryPath = try resolveImagewriterBootloaderBinaryPath()
+            let useReadonlyBaseCowState = materialized.sourceRecord.sourceType == "container-runtime"
+            let earlyInitBinaryPath = useReadonlyBaseCowState ? try resolveImagewriterEarlyInitBinaryPath() : nil
+            if useReadonlyBaseCowState {
+                guard let rootfsDir = materialized.rootfsDir else {
+                    throw MSLRuntimeError("container-runtime COW build requires a staged rootfs directory")
+                }
+                try installEarlyInitIntoRootfs(
+                    rootfsDir: rootfsDir,
+                    earlyInitBinaryPath: earlyInitBinaryPath
+                )
+            }
+            let baseDiskFile = useReadonlyBaseCowState ? paths.distroBaseDiskFile(named: name) : diskFile
+            let stateDiskFile = useReadonlyBaseCowState ? paths.distroStateDiskFile(named: name) : nil
+            let stateTemplateDiskFile = useReadonlyBaseCowState ? paths.distroStateTemplateDiskFile(named: name) : nil
             let runtimeSummaryURL = materialized.cleanupRoot.appendingPathComponent("container-runtime-summary.json", isDirectory: false)
             let extraGuestFilesBundleURL = try createImagewriterExtraFilesBundle(
                 for: materialized,
                 cleanupRoot: materialized.cleanupRoot
             )
 
-            emitStatus("install: creating btrfs disk image via imagewriter")
+            emitStatus(useReadonlyBaseCowState
+                ? "install: creating readonly EROFS base and btrfs state images via imagewriter"
+                : "install: creating btrfs disk image via imagewriter")
             didRunImagewriterBuild = true
             try runImagewriterBuild(
                 scriptPath: imagewriterScript,
@@ -547,9 +566,13 @@ final class DistributionManager {
                 rootfsTarballPath: nil,
                 rootfsDirectoryPath: materialized.rootfsDir?.path,
                 ociLayoutDirectoryPath: materialized.ociLayoutDir?.path,
-                outputDiskPath: diskFile.path,
+                outputDiskPath: baseDiskFile.path,
+                outputStateDiskPath: stateDiskFile?.path,
+                outputStateTemplateDiskPath: stateTemplateDiskFile?.path,
                 sizeMB: requestedSizeMB,
                 initBinaryPath: initBinaryPath,
+                earlyInitBinaryPath: earlyInitBinaryPath,
+                imageFS: useReadonlyBaseCowState ? "erofs" : "btrfs",
                 imagewriterPackages: materialized.imagewriterPackages,
                 extraGuestFilesBundlePath: extraGuestFilesBundleURL?.path,
                 runtimeValidationSummaryPath: materialized.ociLayoutDir == nil ? nil : runtimeSummaryURL.path,
@@ -596,6 +619,9 @@ final class DistributionManager {
                 ),
                 source: materialized.sourceRecord,
                 diskPath: diskFile.path,
+                baseDiskPath: useReadonlyBaseCowState ? baseDiskFile.path : nil,
+                stateDiskPath: stateDiskFile?.path,
+                rootMode: useReadonlyBaseCowState ? .readonlyBaseCowState : nil,
                 kernelProfileRef: kernelProfileRef,
                 runtimeProfile: runtimeProfile,
                 userConvergencePolicy: initialPolicy,
@@ -1451,6 +1477,46 @@ final class DistributionManager {
         return result
     }
 
+    func resetWritableState(name rawName: String) throws -> URL {
+        let name = try validateInstanceName(rawName)
+        let metadataURL = paths.distroMetadataFile(named: name)
+        guard fileManager.fileExists(atPath: metadataURL.path) else {
+            throw MSLRuntimeError("instance '\(name)' not found")
+        }
+        let metadata = try readJSON(DistributionInstanceMetadata.self, from: metadataURL)
+        guard metadata.resolvedRootMode() == .readonlyBaseCowState else {
+            throw MSLRuntimeError("instance '\(name)' does not use readonly-base-cow-state storage")
+        }
+
+        let templateURL = paths.distroStateTemplateDiskFile(named: name)
+        let stateURL = URL(fileURLWithPath: metadata.stateDiskPath ?? paths.distroStateDiskFile(named: name).path)
+        guard fileManager.fileExists(atPath: templateURL.path) else {
+            throw MSLRuntimeError("state template image not found for '\(name)': \(templateURL.path). reinstall or rebuild the instance.")
+        }
+
+        if fileManager.fileExists(atPath: stateURL.path) {
+            try fileManager.removeItem(at: stateURL)
+        }
+        try fileManager.createDirectory(at: stateURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try copySparseFile(from: templateURL, to: stateURL)
+        logger.log("state_disk_reset", fields: [
+            "instance": name,
+            "template": templateURL.path,
+            "state": stateURL.path
+        ])
+        return stateURL
+    }
+
+    private func copySparseFile(from source: URL, to destination: URL) throws {
+        if let cp = process.findExecutable(["cp"]) {
+            let result = try process.run(cp, ["--sparse=always", "-f", source.path, destination.path], captureOutput: true)
+            if result.exitCode == 0 {
+                return
+            }
+        }
+        try fileManager.copyItem(at: source, to: destination)
+    }
+
     private func sanitizeContainerString(_ value: Any?) -> String? {
         guard let value = value as? String else {
             return nil
@@ -2128,8 +2194,12 @@ final class DistributionManager {
         rootfsDirectoryPath: String?,
         ociLayoutDirectoryPath: String?,
         outputDiskPath: String,
+        outputStateDiskPath: String? = nil,
+        outputStateTemplateDiskPath: String? = nil,
         sizeMB: Int,
         initBinaryPath: String,
+        earlyInitBinaryPath: String? = nil,
+        imageFS: String = "btrfs",
         imagewriterPackages: String? = nil,
         extraGuestFilesBundlePath: String? = nil,
         runtimeValidationSummaryPath: String? = nil,
@@ -2147,13 +2217,24 @@ final class DistributionManager {
             "IMAGEWRITER_FORCE_SETUP": "0",
             "IMAGEWRITER_ALLOW_SETUP_WHEN_MISSING": "0",
             "IMAGEWRITER_REQUIRED_FS": "erofs",
-            "IMAGE_FS": "btrfs",
+            "IMAGE_FS": imageFS,
             "OUTPUT_RAW": outputDiskPath,
             "IMAGE_SIZE_MB": String(sizeMB),
             "IMAGEWRITER_INIT_BINARY": initBinaryPath,
             "IMAGEWRITER_RUN_TIMEOUT": "900",
             "IMAGEWRITER_PACKAGES": imagewriterPackages ?? Self.defaultImagewriterPackages
         ]
+        if let earlyInitBinaryPath, !earlyInitBinaryPath.isEmpty {
+            env["IMAGEWRITER_EARLY_INIT_BINARY"] = earlyInitBinaryPath
+        }
+        if let outputStateDiskPath, !outputStateDiskPath.isEmpty {
+            env["OUTPUT_STATE_RAW"] = outputStateDiskPath
+            env["STATE_IMAGE_SIZE_MB"] = String(sizeMB)
+        }
+        if let outputStateTemplateDiskPath, !outputStateTemplateDiskPath.isEmpty {
+            env["OUTPUT_STATE_TEMPLATE_RAW"] = outputStateTemplateDiskPath
+            env["STATE_IMAGE_SIZE_MB"] = String(sizeMB)
+        }
         if let rootfsTarballPath, !rootfsTarballPath.isEmpty {
             env["ROOTFS_TARBALL"] = rootfsTarballPath
         }
@@ -2366,6 +2447,40 @@ final class DistributionManager {
             )
         }
         return sourcePath
+    }
+
+    private func resolveImagewriterEarlyInitBinaryPath() throws -> String {
+        let envPath = ProcessInfo.processInfo.environment["MSL_EARLY_INIT_BINARY_PATH"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let sourcePath: String
+        if let envPath, !envPath.isEmpty {
+            sourcePath = envPath
+        } else {
+            sourcePath = paths.mslHostEarlyInitBinaryFile.path
+        }
+
+        guard fileManager.fileExists(atPath: sourcePath) else {
+            throw MSLRuntimeError(
+                "msl-early-init binary not found at \(sourcePath). run `./scripts/build-msl-init.sh` or set MSL_EARLY_INIT_BINARY_PATH."
+            )
+        }
+        return sourcePath
+    }
+
+    private func installEarlyInitIntoRootfs(rootfsDir: URL, earlyInitBinaryPath: String?) throws {
+        guard let earlyInitBinaryPath, !earlyInitBinaryPath.isEmpty else {
+            throw MSLRuntimeError("container-runtime COW build is missing msl-early-init binary path")
+        }
+        let earlyInitURL = URL(fileURLWithPath: earlyInitBinaryPath, isDirectory: false)
+        let initURL = rootfsDir.appendingPathComponent("init", isDirectory: false)
+        if fileManager.fileExists(atPath: initURL.path) {
+            try fileManager.removeItem(at: initURL)
+        }
+        try fileManager.copyItem(at: earlyInitURL, to: initURL)
+        try fileManager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: initURL.path)
+        for relativePath in ["run/msl/base", "run/msl/state", "run/msl/tmp", "sysroot"] {
+            try ensureDir(rootfsDir.appendingPathComponent(relativePath, isDirectory: true))
+        }
     }
 
     private func rebuildInstanceMetadata(at metadataURL: URL) throws -> DistributionInstanceMetadata {
@@ -3038,6 +3153,31 @@ final class DistributionManager {
             candidates: ["/usr/sbin/ip6tables-restore", "/sbin/ip6tables-restore", "/usr/bin/ip6tables-restore"],
             into: rootfsDir
         )
+        try writeExecutableScript(
+            """
+            #!/bin/sh
+            set -eu
+            state_root=/run/msl/state-root
+            uuid="$(blkid -s UUID -o value /dev/vdb 2>/dev/null || true)"
+            [ -n "$uuid" ] || uuid=msl-state
+            dedupe_home=/var/lib/msl-btrfs-dedupe/$uuid
+            hash_file="$dedupe_home/duperemove.hash"
+            [ -d "$state_root" ] || {
+              echo "msl-btrfs-dedupe: missing state root $state_root" >&2
+              exit 1
+            }
+            command -v duperemove >/dev/null 2>&1 || {
+              echo "msl-btrfs-dedupe: duperemove not found; rebuild container runtime with dedupe support" >&2
+              exit 1
+            }
+            mkdir -p "$dedupe_home"
+            while true; do
+              nice -n 10 duperemove -r -d -q --hashfile="$hash_file" --io-threads=1 --cpu-threads=1 "$state_root/upper" "$state_root/work" >/var/log/msl-btrfs-dedupe.log 2>&1 || true
+              sleep 900
+            done
+            """,
+            to: rootfsDir.appendingPathComponent("usr/local/bin/msl-btrfs-dedupe", isDirectory: false)
+        )
 
         try writeOpenRCService(
             name: "containerd",
@@ -3070,7 +3210,24 @@ final class DistributionManager {
             ],
             into: rootfsDir
         )
+        try writeOpenRCService(
+            name: "msl-btrfs-dedupe",
+            command: "/usr/local/bin/msl-btrfs-dedupe",
+            commandArgs: "",
+            pidfile: "/run/msl-btrfs-dedupe.pid",
+            dependencies: [
+                "need localmount",
+                "after bootmisc",
+                "before containerd buildkitd"
+            ],
+            startPre: [
+                "checkpath --directory /var/lib/msl-btrfs-dedupe",
+                "checkpath --directory /run/msl/state-root"
+            ],
+            into: rootfsDir
+        )
 
+        try ensureRunlevelLink(service: "msl-btrfs-dedupe", rootfsDir: rootfsDir)
         try ensureRunlevelLink(service: "containerd", rootfsDir: rootfsDir)
         try ensureRunlevelLink(service: "buildkitd", rootfsDir: rootfsDir)
     }

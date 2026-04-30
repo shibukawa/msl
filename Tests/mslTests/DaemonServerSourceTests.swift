@@ -28,6 +28,7 @@ final class DaemonServerSourceTests: XCTestCase {
         XCTAssertTrue(source.contains("policyTemplateID: \"container-runtime-root-v1\""))
         XCTAssertTrue(source.contains("try prepareContainerRuntimeServicesOnStartup(client: client, instanceName: instanceName)"))
         XCTAssertTrue(source.contains("try ensureContainerRuntimeServiceManagerInitialized(client: client, instanceName: instanceName)"))
+        XCTAssertTrue(source.contains("startContainerRuntimeDedupeIfAvailable(client: client, instanceName: instanceName)"))
         XCTAssertTrue(source.contains("try ensureContainerRuntimeService(\"containerd\", client: client, instanceName: instanceName)"))
         XCTAssertTrue(source.contains("try ensureContainerRuntimeService(\"buildkitd\", client: client, instanceName: instanceName)"))
         XCTAssertTrue(source.contains("marker=\"$marker_dir/container-runtime-cache-policy\""))
@@ -51,6 +52,7 @@ final class DaemonServerSourceTests: XCTestCase {
             "container_rm",
             "image_ls",
             "image_inspect",
+            "image_storage_summary",
             "image_rm",
             "container_prune",
             "image_prune"
@@ -64,6 +66,29 @@ final class DaemonServerSourceTests: XCTestCase {
         XCTAssertTrue(source.contains("parseNerdctlContainerStats"))
         XCTAssertTrue(source.contains("handleContainerStatsBatch"))
         XCTAssertTrue(source.contains("containerStatsList"))
+    }
+
+    func testContainerRuntimeSummaryReportsDedupeWithoutBlockingRuntimeHealth() throws {
+        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+        let source = try String(contentsOf: root.appendingPathComponent("Sources/mslCore/DaemonServer.swift"), encoding: .utf8)
+
+        XCTAssertTrue(source.contains("rc-service msl-btrfs-dedupe status"))
+        XCTAssertTrue(source.contains("dedupeEnabled: dedupeStatus != 127"))
+        XCTAssertTrue(source.contains("dedupeHealthy: dedupeStatus == 0"))
+        XCTAssertTrue(source.contains("container_runtime_dedupe_start_failed"))
+        XCTAssertFalse(source.contains("try ensureContainerRuntimeService(\"msl-btrfs-dedupe\""))
+    }
+
+    func testImageStorageSummaryUsesStructuredImageInspectAndHostDiskAccounting() throws {
+        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+        let source = try String(contentsOf: root.appendingPathComponent("Sources/mslCore/DaemonServer.swift"), encoding: .utf8)
+
+        XCTAssertTrue(source.contains("private func handleImageStorageSummary(_ request: RuntimeControlRequest) -> RuntimeControlResponse"))
+        XCTAssertTrue(source.contains("parseNerdctlImageInspectList(inspectOutput).compactMap(\\.sizeBytes).reduce(0, +)"))
+        XCTAssertTrue(source.contains("readContainerRuntimeHostImageStorageSummary(request)"))
+        XCTAssertTrue(source.contains("paths.distroStateTemplateDiskFile(named: instanceName)"))
+        XCTAssertTrue(source.contains("hostLogicalBytes: hostStorage.logical"))
+        XCTAssertTrue(source.contains("hostAllocatedBytes: hostStorage.allocated"))
     }
 
     func testContainerStatsFallsBackToCgroupProbeWhenNerdctlStatsAreEmpty() throws {

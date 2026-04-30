@@ -1189,6 +1189,42 @@ final class DistributionManagerTests: XCTestCase {
         XCTAssertEqual(result.keptCachePath, cacheDir.path)
     }
 
+    func testResetWritableStateCopiesTemplateToStateDisk() throws {
+        let ctx = try DistributionContext.make()
+        defer { ctx.cleanup() }
+
+        let instanceDir = ctx.paths.distroDirectory(named: "python")
+        try FileManager.default.createDirectory(at: instanceDir, withIntermediateDirectories: true)
+        let base = ctx.paths.distroBaseDiskFile(named: "python")
+        let state = ctx.paths.distroStateDiskFile(named: "python")
+        let template = ctx.paths.distroStateTemplateDiskFile(named: "python")
+        try Data([0xe0]).write(to: base)
+        try Data([0x01, 0x02, 0x03]).write(to: template)
+        try Data([0xff]).write(to: state)
+
+        let metadata = DistributionInstanceMetadata(
+            name: "python",
+            createdAtEpochMs: nowEpochMs(),
+            source: DistributionSourceRecord(
+                sourceType: "container-remote",
+                tarballFileName: "rootfs.oci",
+                sha256: "abc",
+                verifiedAtEpochMs: nowEpochMs()
+            ),
+            diskPath: ctx.paths.distroDiskFile(named: "python").path,
+            baseDiskPath: base.path,
+            stateDiskPath: state.path,
+            rootMode: .readonlyBaseCowState,
+            kernelProfileRef: nil,
+            userConvergencePolicy: nil
+        )
+        try JSONEncoder().encode(metadata).write(to: ctx.paths.distroMetadataFile(named: "python"), options: .atomic)
+
+        let resetURL = try ctx.makeManager().resetWritableState(name: "python")
+        XCTAssertEqual(resetURL.path, state.path)
+        XCTAssertEqual(try Data(contentsOf: state), Data([0x01, 0x02, 0x03]))
+    }
+
     func testResolveUserConvergencePolicyBackfillsFromManifestTemplate() throws {
         let ctx = try DistributionContext.make()
         defer { ctx.cleanup() }
