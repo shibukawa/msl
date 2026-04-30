@@ -331,6 +331,9 @@ public struct RuntimeControlRequest: Codable {
     public var envAdditions: [String: String]?
     public var hostShareRoot: String?
     public var dnsSource: String?
+    public var containerID: String?
+    public var containerIDs: [String]?
+    public var imageID: String?
 
     enum CodingKeys: String, CodingKey {
         case op
@@ -352,6 +355,9 @@ public struct RuntimeControlRequest: Codable {
         case envAdditions
         case hostShareRoot
         case dnsSource
+        case containerID
+        case containerIDs
+        case imageID
     }
 
     public init(
@@ -374,7 +380,10 @@ public struct RuntimeControlRequest: Codable {
         cwd: String? = nil,
         envAdditions: [String: String]? = nil,
         hostShareRoot: String? = nil,
-        dnsSource: String? = nil
+        dnsSource: String? = nil,
+        containerID: String? = nil,
+        containerIDs: [String]? = nil,
+        imageID: String? = nil
     ) {
         self.op = op
         self.instance = instance
@@ -396,6 +405,9 @@ public struct RuntimeControlRequest: Codable {
         self.envAdditions = envAdditions
         self.hostShareRoot = hostShareRoot
         self.dnsSource = dnsSource
+        self.containerID = containerID
+        self.containerIDs = containerIDs
+        self.imageID = imageID
     }
 }
 
@@ -558,6 +570,83 @@ public struct RuntimeProcessSnapshotItem: Codable, Identifiable {
     public var id: Int { pid }
 }
 
+public struct RuntimeContainerRuntimeSummary: Codable, Equatable {
+    public var containerdHealthy: Bool?
+    public var buildkitdHealthy: Bool?
+    public var containerCount: Int?
+    public var imageCount: Int?
+    public var sampledAtEpochMs: Int64
+}
+
+public struct RuntimeContainerListItem: Codable, Equatable, Identifiable {
+    public var id: String
+    public var name: String
+    public var image: String
+    public var command: String?
+    public var created: String?
+    public var status: String?
+    public var state: String?
+    public var ports: String?
+    public var labels: [String: String]
+    public var size: String?
+}
+
+public struct RuntimeContainerDetail: Codable, Equatable {
+    public var id: String
+    public var name: String
+    public var image: String?
+    public var state: String?
+    public var status: String?
+    public var created: String?
+    public var command: String?
+    public var ports: [String]
+    public var mounts: [String]
+    public var networks: [String]
+    public var restartPolicy: String?
+    public var envCount: Int?
+    public var labels: [String: String]
+}
+
+public struct RuntimeContainerStats: Codable, Equatable {
+    public var id: String
+    public var name: String?
+    public var cpuPercent: Double?
+    public var memoryUsageBytes: UInt64?
+    public var memoryLimitBytes: UInt64?
+    public var memoryLimitUnlimited: Bool?
+    public var networkRxBytes: UInt64?
+    public var networkTxBytes: UInt64?
+    public var blockReadBytes: UInt64?
+    public var blockWriteBytes: UInt64?
+    public var pids: Int?
+    public var sampledAtEpochMs: Int64
+
+    public var needsCgroupFallback: Bool {
+        (memoryUsageBytes == 0 && memoryLimitBytes == 0)
+            || (memoryUsageBytes == nil && memoryLimitBytes == nil)
+    }
+}
+
+public struct RuntimeImageListItem: Codable, Equatable, Identifiable {
+    public var id: String
+    public var repository: String
+    public var tag: String
+    public var digest: String?
+    public var created: String?
+    public var size: String?
+}
+
+public struct RuntimeImageDetail: Codable, Equatable {
+    public var id: String
+    public var repoTags: [String]
+    public var repoDigests: [String]
+    public var architecture: String?
+    public var os: String?
+    public var created: String?
+    public var sizeBytes: UInt64?
+    public var labels: [String: String]
+}
+
 public struct RuntimeControlResponse: Codable {
     public var ok: Bool
     public var error: String?
@@ -567,6 +656,13 @@ public struct RuntimeControlResponse: Codable {
     public var metrics: RuntimeInstanceMetrics?
     public var storage: RuntimeInstanceStorage?
     public var processes: [RuntimeProcessSnapshotItem]?
+    public var containerRuntimeSummary: RuntimeContainerRuntimeSummary?
+    public var containers: [RuntimeContainerListItem]?
+    public var containerDetail: RuntimeContainerDetail?
+    public var containerStats: RuntimeContainerStats?
+    public var containerStatsList: [RuntimeContainerStats]?
+    public var images: [RuntimeImageListItem]?
+    public var imageDetail: RuntimeImageDetail?
     // exec / pty / session responses
     public var stdout: String?
     public var stderr: String?
@@ -592,6 +688,13 @@ public struct RuntimeControlResponse: Codable {
         case metrics
         case storage
         case processes
+        case containerRuntimeSummary
+        case containers
+        case containerDetail
+        case containerStats
+        case containerStatsList
+        case images
+        case imageDetail
         case stdout
         case stderr
         case exitCode

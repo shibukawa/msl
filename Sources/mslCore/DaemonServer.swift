@@ -266,6 +266,7 @@ public final class DaemonServer {
     private var ptySubscriptionSources: [String: DispatchSourceRead] = [:]
     private let metricsSampleLock = NSLock()
     private var previousMetricsSamples: [String: GuestMetricsRawSample] = [:]
+    private var previousContainerCPUSamples: [String: (sampledAtEpochMs: Int64, usageUsec: UInt64)] = [:]
     private var activeInstanceName: String?
 
     private var initClient: InitChannelClient?
@@ -2076,6 +2077,34 @@ public final class DaemonServer {
             return handleInstanceStorage(request)
         case "instance_processes":
             return handleInstanceProcesses(request)
+        case "container_runtime_summary":
+            return handleContainerRuntimeSummary(request)
+        case "container_ls":
+            return handleContainerList(request)
+        case "container_inspect":
+            return handleContainerInspect(request)
+        case "container_stats":
+            return handleContainerStats(request)
+        case "container_stats_batch":
+            return handleContainerStatsBatch(request)
+        case "container_start":
+            return handleNerdctlContainerAction(request, action: "start")
+        case "container_stop":
+            return handleNerdctlContainerAction(request, action: "stop")
+        case "container_restart":
+            return handleNerdctlContainerAction(request, action: "restart")
+        case "container_rm":
+            return handleNerdctlContainerAction(request, action: "rm", extraArgs: ["--force"])
+        case "image_ls":
+            return handleImageList(request)
+        case "image_inspect":
+            return handleImageInspect(request)
+        case "image_rm":
+            return handleNerdctlImageRemove(request)
+        case "container_prune":
+            return handleNerdctlPrune(request, kind: "container")
+        case "image_prune":
+            return handleNerdctlPrune(request, kind: "image")
         case "instance_stop":
             return handleInstanceStop(request)
 
@@ -5972,6 +6001,532 @@ public final class DaemonServer {
             containerCount: containerCount,
             imageCount: imageCount
         )
+    }
+
+    private func handleContainerRuntimeSummary(_ request: RuntimeControlRequest) -> RuntimeControlResponse {
+        guard let context = resolveContext(for: request),
+              let client = context.initClient ?? initClient else {
+            return RuntimeControlResponse(ok: false, error: "instance_not_running")
+        }
+        guard let metrics = readContainerRuntimeMetrics(client: client) else {
+            return RuntimeControlResponse(ok: false, error: "container_runtime_unavailable")
+        }
+        return RuntimeControlResponse(
+            ok: true,
+            containerRuntimeSummary: RuntimeContainerRuntimeSummary(
+                containerdHealthy: metrics.containerdHealthy,
+                buildkitdHealthy: metrics.buildkitdHealthy,
+                containerCount: metrics.containerCount,
+                imageCount: metrics.imageCount,
+                sampledAtEpochMs: nowEpochMs()
+            )
+        )
+    }
+
+    private func handleContainerList(_ request: RuntimeControlRequest) -> RuntimeControlResponse {
+        do {
+            let stdout = try runNerdctlSnapshot(request, args: ["ps", "-a", "--format", "json"])
+            return RuntimeControlResponse(ok: true, containers: try parseNerdctlContainerList(stdout))
+        } catch {
+            return RuntimeControlResponse(ok: false, error: String(describing: error), containers: [])
+        }
+    }
+
+    private func handleImageList(_ request: RuntimeControlRequest) -> RuntimeControlResponse {
+        do {
+            let stdout = try runNerdctlSnapshot(request, args: ["images", "--format", "json"])
+            return RuntimeControlResponse(ok: true, images: try parseNerdctlImageList(stdout))
+        } catch {
+            return RuntimeControlResponse(ok: false, error: String(describing: error), images: [])
+        }
+    }
+
+    private func handleContainerInspect(_ request: RuntimeControlRequest) -> RuntimeControlResponse {
+        guard let id = sanitizedNerdctlTarget(request.containerID) else {
+            return RuntimeControlResponse(ok: false, error: "container_id_required")
+        }
+        do {
+            let stdout = try runNerdctlSnapshot(request, args: ["inspect", id])
+            return RuntimeControlResponse(ok: true, containerDetail: try parseNerdctlContainerInspect(stdout, fallbackID: id))
+        } catch {
+            return RuntimeControlResponse(ok: false, error: String(describing: error))
+        }
+    }
+
+    private func handleImageInspect(_ request: RuntimeControlRequest) -> RuntimeControlResponse {
+        guard let id = sanitizedNerdctlTarget(request.imageID) else {
+            return RuntimeControlResponse(ok: false, error: "image_id_required")
+        }
+        do {
+            let stdout = try runNerdctlSnapshot(request, args: ["image", "inspect", id])
+            return RuntimeControlResponse(ok: true, imageDetail: try parseNerdctlImageInspect(stdout, fallbackID: id))
+        } catch {
+            return RuntimeControlResponse(ok: false, error: String(describing: error))
+        }
+    }
+
+    private func handleContainerStats(_ request: RuntimeControlRequest) -> RuntimeControlResponse {
+        guard let id = sanitizedNerdctlTarget(request.containerID) else {
+            return RuntimeControlResponse(ok: false, error: "container_id_required")
+        }
+        do {
+            let stdout = try runNerdctlSnapshot(request, args: ["stats", "--no-stream", "--format", "json", id])
+            var stats = try parseNerdctlContainerStats(stdout, fallbackID: id)
+            if stats.needsCgroupFallback {
+                stats = mergeContainerStats(primary: stats, fallback: readContainerCgroupStats(request, id: id))
+            }
+            return RuntimeControlResponse(ok: true, containerStats: stats)
+        } catch {
+            if let fallback = readContainerCgroupStats(request, id: id) {
+                return RuntimeControlResponse(ok: true, containerStats: fallback)
+            }
+            return RuntimeControlResponse(ok: false, error: String(describing: error))
+        }
+    }
+
+    private func handleContainerStatsBatch(_ request: RuntimeControlRequest) -> RuntimeControlResponse {
+        let ids = (request.containerIDs ?? [])
+            .compactMap(sanitizedNerdctlTarget)
+            .filter { !$0.isEmpty }
+        guard !ids.isEmpty else {
+            return RuntimeControlResponse(ok: true, containerStatsList: [])
+        }
+        let stats = ids.compactMap { id -> RuntimeContainerStats? in
+            let single = RuntimeControlRequest(op: "container_stats", instance: request.instance, containerID: id)
+            return handleContainerStats(single).containerStats
+        }
+        return RuntimeControlResponse(ok: true, containerStatsList: stats)
+    }
+
+    private func handleNerdctlContainerAction(_ request: RuntimeControlRequest, action: String, extraArgs: [String] = []) -> RuntimeControlResponse {
+        guard let id = sanitizedNerdctlTarget(request.containerID) else {
+            return RuntimeControlResponse(ok: false, error: "container_id_required")
+        }
+        do {
+            let stdout = try runNerdctlSnapshot(request, args: [action] + extraArgs + [id], timeoutMs: 10_000)
+            return RuntimeControlResponse(ok: true, stdout: stdout)
+        } catch {
+            return RuntimeControlResponse(ok: false, error: String(describing: error))
+        }
+    }
+
+    private func handleNerdctlImageRemove(_ request: RuntimeControlRequest) -> RuntimeControlResponse {
+        guard let id = sanitizedNerdctlTarget(request.imageID) else {
+            return RuntimeControlResponse(ok: false, error: "image_id_required")
+        }
+        do {
+            let stdout = try runNerdctlSnapshot(request, args: ["rmi", id], timeoutMs: 10_000)
+            return RuntimeControlResponse(ok: true, stdout: stdout)
+        } catch {
+            return RuntimeControlResponse(ok: false, error: String(describing: error))
+        }
+    }
+
+    private func handleNerdctlPrune(_ request: RuntimeControlRequest, kind: String) -> RuntimeControlResponse {
+        do {
+            let stdout = try runNerdctlSnapshot(request, args: [kind, "prune", "--force"], timeoutMs: 30_000)
+            return RuntimeControlResponse(ok: true, stdout: stdout, meta: ["reclaimed": parsePruneReclaimed(stdout) ?? ""])
+        } catch {
+            return RuntimeControlResponse(ok: false, error: String(describing: error))
+        }
+    }
+
+    private func runNerdctlSnapshot(_ request: RuntimeControlRequest, args: [String], timeoutMs: Int = 4_000) throws -> String {
+        guard let context = resolveContext(for: request),
+              let client = context.initClient ?? initClient else {
+            throw MSLRuntimeError("instance_not_running")
+        }
+        let envPrefix = "CONTAINERD_ADDRESS=/run/containerd/containerd.sock BUILDKIT_HOST=unix:///run/buildkit/buildkitd.sock CONTAINERD_SNAPSHOTTER=native"
+        let command = ([envPrefix, shellJoined(["/usr/local/bin/nerdctl", "--snapshotter", "native"] + args)]).joined(separator: " ")
+        let response = try client.send(InitChannelRequest(
+            op: "exec",
+            argv: ["/bin/sh", "-lc", command],
+            runAsRoot: true,
+            timeoutMs: timeoutMs
+        ))
+        guard response.ok, (response.exitCode ?? 1) == 0 else {
+            throw MSLRuntimeError(response.error?.message ?? response.stderr ?? "nerdctl failed")
+        }
+        return response.stdout ?? ""
+    }
+
+    private func shellJoined(_ args: [String]) -> String {
+        args.map(shellQuote).joined(separator: " ")
+    }
+
+    private func shellQuote(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
+    private func sanitizedNerdctlTarget(_ value: String?) -> String? {
+        guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else {
+            return nil
+        }
+        guard !value.contains("\u{0000}"), value.unicodeScalars.allSatisfy({ $0.value >= 0x20 && $0.value < 0x7f }) else {
+            return nil
+        }
+        return value
+    }
+
+    private func parseNerdctlContainerList(_ text: String) throws -> [RuntimeContainerListItem] {
+        try parseNerdctlJSONLines(text).compactMap { object in
+            guard let id = stringValue(object, ["ID", "Id", "ContainerID"]), !id.isEmpty else { return nil }
+            let labels = dictionaryStringValue(object["Labels"])
+            let status = nonEmptyStringValue(object, ["Status", "STATUS"])
+            let state = nonEmptyStringValue(object, ["State", "STATE"])
+            return RuntimeContainerListItem(
+                id: id,
+                name: stringValue(object, ["Names", "Name"]) ?? "-",
+                image: stringValue(object, ["Image"]) ?? "-",
+                command: stringValue(object, ["Command"]),
+                created: stringValue(object, ["CreatedAt", "Created"]),
+                status: status ?? state,
+                state: state ?? compactContainerState(from: status),
+                ports: stringValue(object, ["Ports"]),
+                labels: labels,
+                size: stringValue(object, ["Size"])
+            )
+        }
+    }
+
+    private func nonEmptyStringValue(_ object: [String: Any], _ keys: [String]) -> String? {
+        guard let value = stringValue(object, keys)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !value.isEmpty,
+              value != "-" else {
+            return nil
+        }
+        return value
+    }
+
+    private func compactContainerState(from status: String?) -> String? {
+        guard let status = status?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !status.isEmpty,
+              status != "-" else {
+            return nil
+        }
+        let lowercased = status.lowercased()
+        if lowercased == "up" || lowercased.hasPrefix("up ") { return "running" }
+        if lowercased.hasPrefix("created") { return "created" }
+        if lowercased.hasPrefix("exited") { return "exited" }
+        if lowercased.hasPrefix("paused") { return "paused" }
+        if lowercased.hasPrefix("restarting") { return "restarting" }
+        if lowercased.hasPrefix("dead") { return "dead" }
+        return lowercased
+    }
+
+    private func parseNerdctlImageList(_ text: String) throws -> [RuntimeImageListItem] {
+        try parseNerdctlJSONLines(text).compactMap { object in
+            let id = stringValue(object, ["ID", "Id", "ImageID"]) ?? ""
+            guard !id.isEmpty else { return nil }
+            return RuntimeImageListItem(
+                id: id,
+                repository: stringValue(object, ["Repository", "REPOSITORY"]) ?? "<none>",
+                tag: stringValue(object, ["Tag", "TAG"]) ?? "<none>",
+                digest: stringValue(object, ["Digest"]),
+                created: stringValue(object, ["CreatedSince", "CreatedAt", "Created"]),
+                size: stringValue(object, ["Size"])
+            )
+        }
+    }
+
+    private func parseNerdctlContainerInspect(_ text: String, fallbackID: String) throws -> RuntimeContainerDetail {
+        let object = try firstJSONObject(text)
+        let config = object["Config"] as? [String: Any] ?? [:]
+        let state = object["State"] as? [String: Any] ?? [:]
+        let hostConfig = object["HostConfig"] as? [String: Any] ?? [:]
+        let networkSettings = object["NetworkSettings"] as? [String: Any] ?? [:]
+        let name = stringValue(object, ["Name"])?.trimmingCharacters(in: CharacterSet(charactersIn: "/")) ?? fallbackID
+        return RuntimeContainerDetail(
+            id: stringValue(object, ["Id", "ID"]) ?? fallbackID,
+            name: name.isEmpty ? fallbackID : name,
+            image: stringValue(config, ["Image"]) ?? stringValue(object, ["Image"]),
+            state: stringValue(state, ["Status"]) ?? stringValue(object, ["State"]),
+            status: boolValue(state["Running"]).map { $0 ? "running" : "stopped" },
+            created: stringValue(object, ["Created"]),
+            command: commandString(config["Cmd"]) ?? stringValue(object, ["Path"]),
+            ports: flattenStringMap(networkSettings["Ports"]),
+            mounts: parseMounts(object["Mounts"]),
+            networks: parseNetworks(networkSettings["Networks"]),
+            restartPolicy: ((hostConfig["RestartPolicy"] as? [String: Any]).flatMap { stringValue($0, ["Name"]) }),
+            envCount: (config["Env"] as? [Any])?.count,
+            labels: dictionaryStringValue(config["Labels"])
+        )
+    }
+
+    private func parseNerdctlImageInspect(_ text: String, fallbackID: String) throws -> RuntimeImageDetail {
+        let object = try firstJSONObject(text)
+        let config = object["Config"] as? [String: Any] ?? [:]
+        return RuntimeImageDetail(
+            id: stringValue(object, ["Id", "ID"]) ?? fallbackID,
+            repoTags: stringArrayValue(object["RepoTags"]),
+            repoDigests: stringArrayValue(object["RepoDigests"]),
+            architecture: stringValue(object, ["Architecture"]),
+            os: stringValue(object, ["Os", "OS"]),
+            created: stringValue(object, ["Created"]),
+            sizeBytes: uint64Value(object["Size"]),
+            labels: dictionaryStringValue(config["Labels"])
+        )
+    }
+
+    private func parseNerdctlContainerStats(_ text: String, fallbackID: String) throws -> RuntimeContainerStats {
+        let object = try parseNerdctlJSONLines(text).first ?? firstJSONObject(text)
+        let mem = parseUsageLimit(stringValue(object, ["MemUsage", "Memory"]))
+        let net = parsePairBytes(stringValue(object, ["NetIO", "Net I/O"]))
+        let block = parsePairBytes(stringValue(object, ["BlockIO", "Block I/O"]))
+        return RuntimeContainerStats(
+            id: stringValue(object, ["ID", "Container", "ContainerID"]) ?? fallbackID,
+            name: stringValue(object, ["Name"]),
+            cpuPercent: percentValue(stringValue(object, ["CPUPerc", "CPU %", "CPU"])),
+            memoryUsageBytes: mem?.0,
+            memoryLimitBytes: mem?.1,
+            memoryLimitUnlimited: nil,
+            networkRxBytes: net?.0,
+            networkTxBytes: net?.1,
+            blockReadBytes: block?.0,
+            blockWriteBytes: block?.1,
+            pids: intValue(object["PIDs"] ?? object["Pids"]),
+            sampledAtEpochMs: nowEpochMs()
+        )
+    }
+
+    private func readContainerCgroupStats(_ request: RuntimeControlRequest, id: String) -> RuntimeContainerStats? {
+        guard let stdout = try? runNerdctlSnapshot(
+            request,
+            args: [
+                "exec", id, "sh", "-lc",
+                """
+                printf 'memory_current=%s\\n' "$(cat /sys/fs/cgroup/memory.current 2>/dev/null || true)"
+                printf 'memory_max=%s\\n' "$(cat /sys/fs/cgroup/memory.max 2>/dev/null || true)"
+                printf 'pids_current=%s\\n' "$(cat /sys/fs/cgroup/pids.current 2>/dev/null || true)"
+                awk '/^usage_usec /{print "cpu_usage_usec="$2}' /sys/fs/cgroup/cpu.stat 2>/dev/null || true
+                awk 'NR>2 {gsub(/:/,"",$1); if ($1!="lo") {rx+=$2; tx+=$10}} END {printf "net_rx=%s\\nnet_tx=%s\\n", rx+0, tx+0}' /proc/net/dev 2>/dev/null || true
+                """
+            ],
+            timeoutMs: 4_000
+        ) else {
+            return nil
+        }
+        return parseContainerCgroupStats(stdout, id: id)
+    }
+
+    private func parseContainerCgroupStats(_ text: String, id: String) -> RuntimeContainerStats {
+        let values = parseContainerStatsKeyValueLines(text)
+        let sampledAt = nowEpochMs()
+        let usageUsec = values["cpu_usage_usec"].flatMap(UInt64.init)
+        let previous = metricsSampleLock.withLock { () -> (sampledAtEpochMs: Int64, usageUsec: UInt64)? in
+            let previous = previousContainerCPUSamples[id]
+            if let usageUsec {
+                previousContainerCPUSamples[id] = (sampledAt, usageUsec)
+            }
+            return previous
+        }
+        let cpuPercent: Double? = {
+            guard let usageUsec, let previous, sampledAt > previous.sampledAtEpochMs, usageUsec >= previous.usageUsec else {
+                return nil
+            }
+            let elapsedUsec = Double(sampledAt - previous.sampledAtEpochMs) * 1_000.0
+            guard elapsedUsec > 0 else { return nil }
+            return (Double(usageUsec - previous.usageUsec) / elapsedUsec) * 100.0
+        }()
+        let memoryMaxRaw = values["memory_max"]?.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+        let memoryLimitUnlimited = memoryMaxRaw == "max"
+        let memoryLimitBytes = memoryLimitUnlimited ? nil : memoryMaxRaw.flatMap(UInt64.init)
+        let memoryUsageBytes = values["memory_current"].flatMap(UInt64.init)
+        let networkRxBytes = values["net_rx"].flatMap(UInt64.init)
+        let networkTxBytes = values["net_tx"].flatMap(UInt64.init)
+        let pids = values["pids_current"].flatMap(Int.init)
+        return RuntimeContainerStats(
+            id: id,
+            name: nil,
+            cpuPercent: cpuPercent,
+            memoryUsageBytes: memoryUsageBytes,
+            memoryLimitBytes: memoryLimitBytes,
+            memoryLimitUnlimited: memoryLimitUnlimited,
+            networkRxBytes: networkRxBytes,
+            networkTxBytes: networkTxBytes,
+            blockReadBytes: nil,
+            blockWriteBytes: nil,
+            pids: pids,
+            sampledAtEpochMs: sampledAt
+        )
+    }
+
+    private func parseContainerStatsKeyValueLines(_ text: String) -> [String: String] {
+        var values: [String: String] = [:]
+        for rawLine in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            let parts = rawLine.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+            guard parts.count == 2 else { continue }
+            values[String(parts[0])] = String(parts[1]).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return values
+    }
+
+    private func mergeContainerStats(primary: RuntimeContainerStats, fallback: RuntimeContainerStats?) -> RuntimeContainerStats {
+        guard let fallback else { return primary }
+        return RuntimeContainerStats(
+            id: primary.id,
+            name: primary.name ?? fallback.name,
+            cpuPercent: primary.cpuPercent.flatMap { $0 == 0 ? fallback.cpuPercent ?? $0 : $0 } ?? fallback.cpuPercent,
+            memoryUsageBytes: primary.memoryUsageBytes.flatMap { $0 == 0 ? fallback.memoryUsageBytes ?? $0 : $0 } ?? fallback.memoryUsageBytes,
+            memoryLimitBytes: primary.memoryLimitBytes.flatMap { $0 == 0 ? fallback.memoryLimitBytes ?? $0 : $0 } ?? fallback.memoryLimitBytes,
+            memoryLimitUnlimited: fallback.memoryLimitUnlimited ?? primary.memoryLimitUnlimited,
+            networkRxBytes: primary.networkRxBytes.flatMap { $0 == 0 ? fallback.networkRxBytes ?? $0 : $0 } ?? fallback.networkRxBytes,
+            networkTxBytes: primary.networkTxBytes.flatMap { $0 == 0 ? fallback.networkTxBytes ?? $0 : $0 } ?? fallback.networkTxBytes,
+            blockReadBytes: primary.blockReadBytes,
+            blockWriteBytes: primary.blockWriteBytes,
+            pids: primary.pids.flatMap { $0 == 0 ? fallback.pids ?? $0 : $0 } ?? fallback.pids,
+            sampledAtEpochMs: max(primary.sampledAtEpochMs, fallback.sampledAtEpochMs)
+        )
+    }
+
+    private func parseNerdctlJSONLines(_ text: String) throws -> [[String: Any]] {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+        if let data = trimmed.data(using: .utf8),
+           let array = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
+            return array
+        }
+        if let data = trimmed.data(using: .utf8),
+           let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            return [object]
+        }
+        return try trimmed.split(separator: "\n").map { line in
+            let data = Data(line.utf8)
+            guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                throw MSLRuntimeError("invalid nerdctl json line")
+            }
+            return object
+        }
+    }
+
+    private func firstJSONObject(_ text: String) throws -> [String: Any] {
+        let data = Data(text.trimmingCharacters(in: .whitespacesAndNewlines).utf8)
+        if let array = try JSONSerialization.jsonObject(with: data) as? [[String: Any]], let first = array.first {
+            return first
+        }
+        if let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            return object
+        }
+        throw MSLRuntimeError("invalid nerdctl json")
+    }
+
+    private func stringValue(_ object: [String: Any], _ keys: [String]) -> String? {
+        for key in keys {
+            if let value = object[key] {
+                if let string = value as? String { return string }
+                if let number = value as? NSNumber { return number.stringValue }
+            }
+        }
+        return nil
+    }
+
+    private func dictionaryStringValue(_ value: Any?) -> [String: String] {
+        guard let dict = value as? [String: Any] else { return [:] }
+        return Dictionary(uniqueKeysWithValues: dict.compactMap { key, value in
+            if let string = value as? String { return (key, string) }
+            if let number = value as? NSNumber { return (key, number.stringValue) }
+            return nil
+        })
+    }
+
+    private func stringArrayValue(_ value: Any?) -> [String] {
+        (value as? [Any])?.compactMap { $0 as? String } ?? []
+    }
+
+    private func boolValue(_ value: Any?) -> Bool? {
+        if let value = value as? Bool { return value }
+        if let value = value as? NSNumber { return value.boolValue }
+        return nil
+    }
+
+    private func uint64Value(_ value: Any?) -> UInt64? {
+        if let value = value as? UInt64 { return value }
+        if let value = value as? Int { return UInt64(max(value, 0)) }
+        if let value = value as? NSNumber { return value.uint64Value }
+        if let value = value as? String { return UInt64(value) }
+        return nil
+    }
+
+    private func intValue(_ value: Any?) -> Int? {
+        if let value = value as? Int { return value }
+        if let value = value as? NSNumber { return value.intValue }
+        if let value = value as? String { return Int(value.trimmingCharacters(in: .whitespacesAndNewlines)) }
+        return nil
+    }
+
+    private func commandString(_ value: Any?) -> String? {
+        if let values = value as? [Any] {
+            return values.compactMap { $0 as? String }.joined(separator: " ")
+        }
+        return value as? String
+    }
+
+    private func flattenStringMap(_ value: Any?) -> [String] {
+        guard let dict = value as? [String: Any] else { return [] }
+        return dict.keys.sorted().map { key in "\(key): \(String(describing: dict[key] ?? ""))" }
+    }
+
+    private func parseMounts(_ value: Any?) -> [String] {
+        guard let mounts = value as? [[String: Any]] else { return [] }
+        return mounts.map { mount in
+            let source = stringValue(mount, ["Source", "Name"]) ?? "-"
+            let destination = stringValue(mount, ["Destination"]) ?? "-"
+            return "\(source) -> \(destination)"
+        }
+    }
+
+    private func parseNetworks(_ value: Any?) -> [String] {
+        guard let networks = value as? [String: Any] else { return [] }
+        return networks.keys.sorted()
+    }
+
+    private func percentValue(_ value: String?) -> Double? {
+        guard let value else { return nil }
+        return Double(value.replacingOccurrences(of: "%", with: "").trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
+    private func parseUsageLimit(_ value: String?) -> (UInt64, UInt64)? {
+        guard let value else { return nil }
+        let parts = value.components(separatedBy: "/")
+        guard let first = parts.first.flatMap(parseHumanBytes) else { return nil }
+        let second = parts.dropFirst().first.flatMap(parseHumanBytes) ?? 0
+        return (first, second)
+    }
+
+    private func parsePairBytes(_ value: String?) -> (UInt64, UInt64)? {
+        parseUsageLimit(value)
+    }
+
+    private func parseHumanBytes(_ raw: String) -> UInt64? {
+        let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let pattern = #"^([0-9]+(?:\.[0-9]+)?)\s*([A-Za-z]+)?$"#
+        guard let regex = try? NSRegularExpression(pattern: pattern),
+              let match = regex.firstMatch(in: value, range: NSRange(value.startIndex..., in: value)),
+              let numberRange = Range(match.range(at: 1), in: value),
+              let number = Double(value[numberRange]) else {
+            return UInt64(value)
+        }
+        let unit = match.range(at: 2).location == NSNotFound ? "" : Range(match.range(at: 2), in: value).map { String(value[$0]).lowercased() } ?? ""
+        let multiplier: Double
+        switch unit {
+        case "b", "": multiplier = 1
+        case "kb": multiplier = 1_000
+        case "mb": multiplier = 1_000_000
+        case "gb": multiplier = 1_000_000_000
+        case "tb": multiplier = 1_000_000_000_000
+        case "kib": multiplier = 1_024
+        case "mib": multiplier = 1_048_576
+        case "gib": multiplier = 1_073_741_824
+        case "tib": multiplier = 1_099_511_627_776
+        default: multiplier = 1
+        }
+        return UInt64(max(0, number * multiplier))
+    }
+
+    private func parsePruneReclaimed(_ stdout: String) -> String? {
+        stdout.split(separator: "\n")
+            .map(String.init)
+            .first { $0.localizedCaseInsensitiveContains("reclaimed") }
     }
 
     private func readGuestProcesses(client: InitChannelClient) throws -> [RuntimeProcessSnapshotItem] {

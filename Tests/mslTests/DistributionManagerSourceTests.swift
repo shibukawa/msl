@@ -2,7 +2,8 @@ import XCTest
 
 final class DistributionManagerSourceTests: XCTestCase {
     func testContainerRuntimeRootFSInstallsContainerToolWrappers() throws {
-        let source = try String(contentsOfFile: "/Users/shibukawayoshiki/.codex/worktrees/66e5/msl/Sources/mslCore/DistributionManager.swift")
+        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+        let source = try String(contentsOf: root.appendingPathComponent("Sources/mslCore/DistributionManager.swift"), encoding: .utf8)
         XCTAssertTrue(source.contains("resolveBundledContainerToolArtifact(named: \"buildctl\", platform: \"linux-arm64\")"))
         XCTAssertTrue(source.contains("\"/usr/local/bin/buildctl-real\""))
         XCTAssertTrue(source.contains("name: \"buildctl\""))
