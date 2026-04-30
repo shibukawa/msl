@@ -187,12 +187,14 @@ final class DashboardModel: ObservableObject {
     @Published var containerStatsByID: [String: RuntimeContainerStats] = [:]
     @Published var images: [RuntimeImageListItem] = []
     @Published var imageDetail: RuntimeImageDetail?
+    @Published var imageStorageSummary: RuntimeImageStorageSummary?
     @Published var selectedContainerID: String?
     @Published var selectedImageID: String?
     @Published var lastContainersUpdatedEpochMs: Int64?
     @Published var lastImagesUpdatedEpochMs: Int64?
     @Published var lastContainerSummaryUpdatedEpochMs: Int64?
     @Published var lastContainerMetricsUpdatedEpochMs: Int64?
+    @Published var lastImageStorageSummaryUpdatedEpochMs: Int64?
     @Published var isLoadingProcesses = false
     @Published var selectedTabError: String?
     @Published var lastMetricsUpdatedEpochMs: Int64?
@@ -212,14 +214,42 @@ final class DashboardModel: ObservableObject {
     private var imagesFetchInFlight = false
     private var containerDetailFetchInFlight = false
     private var imageDetailFetchInFlight = false
+    private var imageStorageSummaryFetchInFlight = false
     private var containerSummaryFetchInFlight = false
     private var containerMetricsFetchInFlight = false
     private var selectedContainerMetricsFetchInFlight = false
     private var lastSelectedContainerMetricsUpdatedEpochMs: Int64?
+    private var wasContainerRuntimeRunning = false
 
     var selectedContainer: RuntimeContainerListItem? {
         guard let selectedContainerID else { return nil }
         return containers.first { $0.id == selectedContainerID }
+    }
+
+    func hasCachedContainerData(for page: ContainerDesktopPage) -> Bool {
+        switch page {
+        case .containers:
+            return lastContainersUpdatedEpochMs != nil || !containers.isEmpty
+        case .images:
+            return lastImagesUpdatedEpochMs != nil || !images.isEmpty || imageStorageSummary != nil
+        case .runtime:
+            return containerSummary != nil
+        case .metrics:
+            return lastContainerMetricsUpdatedEpochMs != nil || !containerStatsByID.isEmpty
+        }
+    }
+
+    func cachedContainerUpdatedEpochMs(for page: ContainerDesktopPage) -> Int64? {
+        switch page {
+        case .containers:
+            return lastContainersUpdatedEpochMs
+        case .images:
+            return [lastImagesUpdatedEpochMs, lastImageStorageSummaryUpdatedEpochMs].compactMap { $0 }.max()
+        case .runtime:
+            return lastContainerSummaryUpdatedEpochMs
+        case .metrics:
+            return lastContainerMetricsUpdatedEpochMs
+        }
     }
 
     var containerWorker: AppManagerWorkerRecord? {
@@ -228,6 +258,10 @@ final class DashboardModel: ObservableObject {
 
     var hasContainerRuntime: Bool {
         containerWorker != nil || fileManager.fileExists(atPath: paths.distroDirectory(named: Self.containerInstanceName).path)
+    }
+
+    var isContainerRuntimeRunning: Bool {
+        containerWorker?.lifecycleState == .running
     }
 
     var selectedContainerPage: ContainerDesktopPage? {
@@ -302,8 +336,14 @@ final class DashboardModel: ObservableObject {
             .filter { !Self.hiddenInstanceNames.contains($0) }
             .sorted()) ?? []
         workers = manager?.snapshot().workers ?? []
+        let containerRuntimeWasRunning = wasContainerRuntimeRunning
+        let containerRuntimeIsRunning = isContainerRuntimeRunning
+        wasContainerRuntimeRunning = containerRuntimeIsRunning
         syncSelection()
         statusItemUpdateHandler?(statusSummary())
+        if containerRuntimeWasRunning != containerRuntimeIsRunning {
+            refreshImageStorageSummaryOnLifecycleTransition(running: containerRuntimeIsRunning)
+        }
         refreshSelectedDataIfNeeded(force: false)
     }
 
@@ -369,6 +409,7 @@ final class DashboardModel: ObservableObject {
 
     func refreshImages() {
         fetchImagesIfPossible(force: true)
+        fetchImageStorageSummaryIfPossible(force: true)
     }
 
     func startContainerRuntime() {
@@ -471,6 +512,9 @@ final class DashboardModel: ObservableObject {
             fetchContainerSummaryIfPossible()
             fetchImagesIfPossible(force: force)
             fetchImageDetailIfPossible(force: force)
+            if force {
+                fetchImageStorageSummaryIfPossible(force: true)
+            }
         case .runtime:
             fetchContainerSummaryIfPossible()
         case .metrics:
@@ -844,6 +888,84 @@ final class DashboardModel: ObservableObject {
         }
     }
 
+    private func fetchImageStorageSummaryIfPossible(force: Bool) {
+        guard let worker = containerWorker, worker.lifecycleState == .running, !imageStorageSummaryFetchInFlight else { return }
+        let now = nowEpochMs()
+        guard force || shouldFetch(lastUpdatedEpochMs: lastImageStorageSummaryUpdatedEpochMs, now: now, intervalMs: 60_000) else { return }
+        imageStorageSummaryFetchInFlight = true
+        let socketPath = worker.controlSocketPath
+        let request = RuntimeControlRequest(op: "image_storage_summary", instance: Self.containerInstanceName)
+        Task.detached {
+            do {
+                let client = RuntimeControlClient(socketPath: socketPath)
+                let response = try client.send(request)
+                await MainActor.run {
+                    if let summary = response.imageStorageSummary {
+                        self.imageStorageSummary = summary
+                        self.lastImageStorageSummaryUpdatedEpochMs = summary.sampledAtEpochMs
+                    }
+                    if let error = response.error, !response.ok {
+                        self.selectedTabError = error
+                    }
+                }
+            } catch {
+                await MainActor.run {
+                    self.selectedTabError = String(describing: error)
+                }
+            }
+            await MainActor.run {
+                self.imageStorageSummaryFetchInFlight = false
+            }
+        }
+    }
+
+    private func refreshImageStorageSummaryOnLifecycleTransition(running: Bool) {
+        if running {
+            fetchImageStorageSummaryIfPossible(force: true)
+        } else {
+            refreshHostImageStorageSummaryFromDisk()
+        }
+    }
+
+    private func refreshHostImageStorageSummaryFromDisk() {
+        let diskURLs = [
+            paths.distroBaseDiskFile(named: Self.containerInstanceName),
+            paths.distroStateDiskFile(named: Self.containerInstanceName),
+            paths.distroStateTemplateDiskFile(named: Self.containerInstanceName),
+            paths.distroDiskFile(named: Self.containerInstanceName)
+        ]
+        let existing = diskURLs.filter { fileManager.fileExists(atPath: $0.path) }
+        let logicalValues = existing.compactMap { logicalBytes(of: $0).flatMap(UInt64.init) }
+        let allocatedValues = existing.compactMap { allocatedBytes(of: $0).flatMap(UInt64.init) }
+        let sampledAt = nowEpochMs()
+        imageStorageSummary = RuntimeImageStorageSummary(
+            guestImageTotalBytes: imageStorageSummary?.guestImageTotalBytes,
+            hostLogicalBytes: logicalValues.isEmpty ? imageStorageSummary?.hostLogicalBytes : logicalValues.reduce(0, +),
+            hostAllocatedBytes: allocatedValues.isEmpty ? imageStorageSummary?.hostAllocatedBytes : allocatedValues.reduce(0, +),
+            sampledAtEpochMs: sampledAt
+        )
+        lastImageStorageSummaryUpdatedEpochMs = sampledAt
+    }
+
+    private func allocatedBytes(of fileURL: URL) -> Int64? {
+        let values = try? fileURL.resourceValues(forKeys: [.totalFileAllocatedSizeKey, .fileAllocatedSizeKey])
+        if let total = values?.totalFileAllocatedSize {
+            return Int64(total)
+        }
+        if let allocated = values?.fileAllocatedSize {
+            return Int64(allocated)
+        }
+        return nil
+    }
+
+    private func logicalBytes(of fileURL: URL) -> Int64? {
+        let values = try? fileURL.resourceValues(forKeys: [.fileSizeKey])
+        guard let size = values?.fileSize else {
+            return nil
+        }
+        return Int64(size)
+    }
+
     func performContainerAction(_ op: String) {
         guard let worker = containerWorker, let id = selectedContainerID else { return }
         let socketPath = worker.controlSocketPath
@@ -1097,7 +1219,13 @@ private struct ContainerDashboardPageView: View {
                     .foregroundStyle(.red)
                     .font(.callout)
             }
-            if model.containerWorker?.lifecycleState == .running {
+            let canShowPanel = model.isContainerRuntimeRunning || model.hasCachedContainerData(for: page)
+            if !model.isContainerRuntimeRunning, let updated = model.cachedContainerUpdatedEpochMs(for: page) {
+                Text("Showing cached data from \(formatDate(epochMs: updated)).")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            if canShowPanel {
                 switch page {
                 case .containers:
                     ContainerListPanel(model: model)
@@ -1127,7 +1255,7 @@ private struct ContainerListPanel: View {
                 UpdatedAtView(epochMs: model.lastContainersUpdatedEpochMs)
                 Spacer()
                 Button("Refresh") { model.refreshContainers() }
-                if let selected = model.selectedContainer {
+                if model.isContainerRuntimeRunning, let selected = model.selectedContainer {
                     if canStartContainer(selected) {
                         Button("Start") { model.performContainerAction("container_start") }
                     }
@@ -1146,6 +1274,7 @@ private struct ContainerListPanel: View {
                         model.performPrune("container_prune")
                     }
                 }
+                .disabled(!model.isContainerRuntimeRunning)
             }
             .buttonStyle(.bordered)
             HSplitView {
@@ -1182,12 +1311,24 @@ private struct ContainerRuntimePanel: View {
         MetricSection(title: "Runtime") {
             DetailMetricRow(label: "containerd", value: summary?.containerdHealthy == true ? "healthy" : "unavailable")
             DetailMetricRow(label: "buildkit", value: summary?.buildkitdHealthy == true ? "healthy" : "unavailable")
+            DetailMetricRow(label: "Btrfs dedupe", value: containerDedupeStatusDisplay(summary))
             DetailMetricRow(label: "Containers", value: summary?.containerCount.map(String.init) ?? "-")
             DetailMetricRow(label: "Images", value: summary?.imageCount.map(String.init) ?? "-")
             DetailMetricRow(label: "Updated", value: summary.map { formatDate(epochMs: $0.sampledAtEpochMs) } ?? "-")
         }
         Spacer()
     }
+}
+
+private func containerDedupeStatusDisplay(_ summary: RuntimeContainerRuntimeSummary?) -> String {
+    guard let summary else { return "-" }
+    if summary.dedupeEnabled != true {
+        return "disabled"
+    }
+    if summary.dedupeHealthy == true {
+        return "healthy"
+    }
+    return summary.dedupeDetail ?? "unavailable"
 }
 
 private struct ContainerMetricsPanel: View {
@@ -1316,14 +1457,16 @@ private struct ImageListPanel: View {
                         model.performImageAction("image_rm")
                     }
                 }
-                .disabled(model.selectedImageID == nil)
+                .disabled(model.selectedImageID == nil || !model.isContainerRuntimeRunning)
                 Button("Prune Unused") {
                     if confirmDestructive(title: "Prune Unused Images?", text: "This removes unused images from the container runtime.") {
                         model.performPrune("image_prune")
                     }
                 }
+                .disabled(!model.isContainerRuntimeRunning)
             }
             .buttonStyle(.bordered)
+            ImageStorageSummaryPanel(summary: model.imageStorageSummary)
             HSplitView {
                 Table(model.images.sorted(using: sortOrder), selection: Binding(
                     get: { model.selectedImageID },
@@ -1341,6 +1484,18 @@ private struct ImageListPanel: View {
                     .frame(minWidth: 480, idealWidth: 560, maxWidth: .infinity)
             }
         }
+    }
+}
+
+private struct ImageStorageSummaryPanel: View {
+    let summary: RuntimeImageStorageSummary?
+
+    var body: some View {
+        Text("Total Image Sizes: \(summary?.guestImageTotalBytes.map(formatCompactBytes) ?? "-") / Capacity \(summary?.hostLogicalBytes.map(formatCompactBytes) ?? "-") (Actual storage on macOS: \(summary?.hostAllocatedBytes.map(formatCompactBytes) ?? "-"))")
+            .font(.callout)
+            .foregroundStyle(.secondary)
+            .monospacedDigit()
+            .textSelection(.enabled)
     }
 }
 
@@ -1984,6 +2139,26 @@ private func formatBytes(_ value: UInt64) -> String {
     formatter.countStyle = .binary
     formatter.includesUnit = true
     return formatter.string(fromByteCount: Int64(min(value, UInt64(Int64.max))))
+}
+
+private func formatCompactBytes(_ value: UInt64) -> String {
+    let units = ["B", "KB", "MB", "GB", "TB"]
+    var scaled = Double(value)
+    var unitIndex = 0
+    while scaled >= 1000, unitIndex < units.count - 1 {
+        scaled /= 1000
+        unitIndex += 1
+    }
+    if unitIndex == 0 {
+        return "\(value)B"
+    }
+    if scaled >= 100 {
+        return "\(String(format: "%.0f", scaled))\(units[unitIndex])"
+    }
+    if scaled >= 10 {
+        return "\(String(format: "%.1f", scaled))\(units[unitIndex])"
+    }
+    return "\(String(format: "%.2f", scaled))\(units[unitIndex])"
 }
 
 private func formatRate(_ value: Double?) -> String {

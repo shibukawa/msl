@@ -52,6 +52,13 @@ final class ImagewriterScriptTests: XCTestCase {
         XCTAssertTrue(script.contains("imagewriter_guest_failure_detected mode=$mode"))
         XCTAssertTrue(script.contains("guest_stdout_log_for_mode()"))
         XCTAssertTrue(script.contains("guest_stderr_log_for_mode()"))
+        XCTAssertTrue(script.contains("OUTPUT_STATE_RAW"))
+        XCTAssertTrue(script.contains("OUTPUT_STATE_TEMPLATE_RAW"))
+        XCTAssertTrue(script.contains("STATE_IMAGE_SIZE_MB"))
+        XCTAssertTrue(script.contains("STATE_TEMPLATE_RAW=\"$OUTPUT_STATE_TEMPLATE_RAW\""))
+        XCTAssertTrue(script.contains("mark_stage_start \"state_btrfs\""))
+        XCTAssertTrue(script.contains("run_guest_worker_with_retry state"))
+        XCTAssertTrue(script.contains("copy_sparse_file \"$STATE_TEMPLATE_RAW\" \"$OUTPUT_STATE_RAW\""))
     }
 
     func testImagewriterGuestBuilderRequiresExplicitSize() throws {
@@ -65,6 +72,9 @@ final class ImagewriterScriptTests: XCTestCase {
         XCTAssertTrue(script.contains("--rootfs-dir <rootfs-dir>"))
         XCTAssertTrue(script.contains("--oci-layout-dir <oci-layout-dir>"))
         XCTAssertTrue(script.contains("--extra-files-bundle <bundle-dir>"))
+        XCTAssertTrue(script.contains("--mode state --output <output-image> --size-mb <n>"))
+        XCTAssertTrue(script.contains("build_empty_state_image()"))
+        XCTAssertTrue(script.contains("mkdir -p \"$OUTPUT_MOUNT_DIR/upper\" \"$OUTPUT_MOUNT_DIR/work\""))
         XCTAssertTrue(script.contains("mkfs.erofs"))
         XCTAssertTrue(script.contains("blkid -p -s TYPE -o value"))
         XCTAssertTrue(script.contains("imagewriter_guest_verified_fs mode=$MODE fs=$actual_fs output=$OUTPUT_IMAGE"))
@@ -135,7 +145,31 @@ final class ImagewriterScriptTests: XCTestCase {
         XCTAssertTrue(script.contains("install --rebuild --name \"$INSTANCE_NAME\" container-runtime"))
         XCTAssertTrue(script.contains("INSTANCE_NAME=\"${CONTAINER_RUNTIME_INSTANCE:-_container}\""))
         XCTAssertTrue(script.contains("tmp/container-runtime-artifact"))
+        XCTAssertTrue(script.contains("base.erofs.raw"))
+        XCTAssertTrue(script.contains("state.btrfs.template.raw"))
+        XCTAssertFalse(script.contains("cp \"$INSTANCE_DIR/disk.raw\""))
         XCTAssertTrue(script.contains("metadata.json"))
         XCTAssertTrue(script.contains("source.json"))
+    }
+
+    func testImagewriterGuestReportsBeesPackageHint() throws {
+        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+        let script = try String(contentsOf: root.appendingPathComponent("scripts/imagewriter-build-guest.sh"), encoding: .utf8)
+
+        XCTAssertTrue(script.contains("Alpine duperemove"))
+        XCTAssertTrue(script.contains("community repository"))
+    }
+
+    func testImagewriterCanInjectContainerRuntimeEarlyInit() throws {
+        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+        let hostScript = try String(contentsOf: root.appendingPathComponent("scripts/imagewriter-build.sh"), encoding: .utf8)
+        let guestScript = try String(contentsOf: root.appendingPathComponent("scripts/imagewriter-build-guest.sh"), encoding: .utf8)
+
+        XCTAssertTrue(hostScript.contains("IMAGEWRITER_EARLY_INIT_BINARY"))
+        XCTAssertTrue(hostScript.contains("--early-init-binary"))
+        XCTAssertTrue(guestScript.contains("--early-init-binary"))
+        XCTAssertTrue(guestScript.contains("mkdir -p \"$ROOTFS_DIR/run/msl/base\" \"$ROOTFS_DIR/run/msl/state\" \"$ROOTFS_DIR/run/msl/tmp\" \"$ROOTFS_DIR/sysroot\""))
+        XCTAssertTrue(guestScript.contains("cp -f \"$EARLY_INIT_BINARY\" \"$ROOTFS_DIR/init\""))
+        XCTAssertTrue(guestScript.contains("chmod 0755 \"$ROOTFS_DIR/init\""))
     }
 }

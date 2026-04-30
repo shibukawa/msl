@@ -34,7 +34,7 @@ public enum MSLCLIOptionsParser {
         var remaining: [String] = []
         let subcommands: Set<String> = [
             "run", "list", "install", "uninstall", "cache", "config", "init",
-            "memory", "port", "network", "status", "stop", "ssh-info", "cp", "nerdctl"
+            "memory", "port", "network", "status", "stop", "ssh-info", "cp", "nerdctl", "container"
         ]
 
         while i < raw.count {

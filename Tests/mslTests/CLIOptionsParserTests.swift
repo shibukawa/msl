@@ -78,6 +78,14 @@ final class CLIOptionsParserTests: XCTestCase {
         XCTAssertEqual(parsed.remainingArguments, ["nerdctl", "run", "--rm", "alpine", "uname", "-m"])
     }
 
+    func testStopsParsingAtContainerSubcommand() throws {
+        let parsed = try MSLCLIOptionsParser.parseGlobalRuntimeOptions([
+            "--instance", "runtime", "container", "reset", "--instance", "_container"
+        ])
+        XCTAssertEqual(parsed.instanceName, "runtime")
+        XCTAssertEqual(parsed.remainingArguments, ["container", "reset", "--instance", "_container"])
+    }
+
     func testRejectsDuplicateInstanceOption() {
         XCTAssertThrowsError(
             try MSLCLIOptionsParser.parseGlobalRuntimeOptions([

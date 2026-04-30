@@ -8,6 +8,9 @@ final class RuntimeContainerMonitoringModelsTests: XCTestCase {
             containerRuntimeSummary: RuntimeContainerRuntimeSummary(
                 containerdHealthy: true,
                 buildkitdHealthy: true,
+                dedupeEnabled: true,
+                dedupeHealthy: true,
+                dedupeDetail: "running",
                 containerCount: 1,
                 imageCount: 2,
                 sampledAtEpochMs: 123
@@ -90,6 +93,12 @@ final class RuntimeContainerMonitoringModelsTests: XCTestCase {
                 created: "2026-04-29",
                 sizeBytes: 50,
                 labels: ["maintainer": "msl"]
+            ),
+            imageStorageSummary: RuntimeImageStorageSummary(
+                guestImageTotalBytes: 50,
+                hostLogicalBytes: 1024,
+                hostAllocatedBytes: 512,
+                sampledAtEpochMs: 789
             )
         )
 
@@ -98,12 +107,16 @@ final class RuntimeContainerMonitoringModelsTests: XCTestCase {
 
         XCTAssertTrue(decoded.ok)
         XCTAssertEqual(decoded.containerRuntimeSummary?.containerCount, 1)
+        XCTAssertEqual(decoded.containerRuntimeSummary?.dedupeEnabled, true)
+        XCTAssertEqual(decoded.containerRuntimeSummary?.dedupeDetail, "running")
         XCTAssertEqual(decoded.containers?.first?.name, "web")
         XCTAssertEqual(decoded.containerDetail?.mounts.first, "/data -> /data")
         XCTAssertEqual(decoded.containerStats?.memoryLimitBytes, 2048)
         XCTAssertEqual(decoded.containerStatsList?.first?.id, "abc")
         XCTAssertEqual(decoded.images?.first?.repository, "nginx")
         XCTAssertEqual(decoded.imageDetail?.architecture, "arm64")
+        XCTAssertEqual(decoded.imageStorageSummary?.guestImageTotalBytes, 50)
+        XCTAssertEqual(decoded.imageStorageSummary?.hostAllocatedBytes, 512)
     }
 
     func testContainerStatsBatchRequestRoundTrip() throws {

@@ -522,6 +522,7 @@ public struct RuntimeBootProfile {
     public var kernelID: String
     public var kernelURL: URL
     public var commandLine: String
+    public var rootMode: DistributionInstanceMetadata.RootMode
     public var initMode: String
     public var serviceManager: String?
     public var profileSource: String

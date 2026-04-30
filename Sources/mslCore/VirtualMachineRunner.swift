@@ -107,6 +107,10 @@ public final class VirtualMachineRunner {
         if !FileManager.default.fileExists(atPath: diskURL.path) {
             throw MSLRuntimeError("vm disk not found at \(diskURL.path)")
         }
+        if let stateDiskURL = metadata.stateDiskURL,
+           !FileManager.default.fileExists(atPath: stateDiskURL.path) {
+            throw MSLRuntimeError("vm state disk not found at \(stateDiskURL.path); reinstall or rebuild the instance writable state image")
+        }
 
         let useSerialAttach = ProcessInfo.processInfo.environment["MSL_ATTACH_SERIAL"] == "1"
         var serialAttachment: (FileHandle, FileHandle)?
@@ -125,11 +129,13 @@ public final class VirtualMachineRunner {
         let configuration = try buildConfiguration(
             instanceName: metadata.instanceName,
             diskURL: diskURL,
+            diskReadOnly: metadata.rootMode == .readonlyBaseCowState,
+            stateDiskURL: metadata.stateDiskURL,
             machineIdentifierURL: metadata.machineIdentifierURL,
             efiVariableStoreURL: metadata.efiVariableStoreURL,
             serialAttachment: serialAttachment,
             diagnosticAttachment: diagnosticAttachment,
-            extraWritableDisks: metadata.ephemeralTmpDiskURL.map { [$0] } ?? []
+            extraWritableDisks: metadata.extraWritableDiskURLs()
         )
         logger?.log("vm_runner_configuration_built", fields: [
             "elapsed_ms": String(monotonicMs() - configStartMs)
@@ -255,6 +261,17 @@ public final class VirtualMachineRunner {
         let distribution = try JSONDecoder().decode(DistributionInstanceMetadata.self, from: data)
         let instanceDir = metadataURL.deletingLastPathComponent()
         let tmpStorage = try distribution.resolveValidatedTmpStoragePolicy()
+        let rootMode = distribution.resolvedRootMode()
+        let stateDiskURL: URL?
+        if rootMode == .readonlyBaseCowState {
+            guard let stateDiskPath = distribution.stateDiskPath?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !stateDiskPath.isEmpty else {
+                throw MSLRuntimeError("instance '\(distribution.name)' rootMode=readonly-base-cow-state is missing stateDiskPath")
+            }
+            stateDiskURL = URL(fileURLWithPath: stateDiskPath)
+        } else {
+            stateDiskURL = nil
+        }
         let ephemeralTmpDiskURL: URL?
         let ephemeralTmpDevicePath: String?
         let ephemeralTmpLabel: String?
@@ -265,7 +282,7 @@ public final class VirtualMachineRunner {
                 sizeMiB: tmpStorage.sizeMiB,
                 label: tmpLabel
             )
-            ephemeralTmpDevicePath = "/dev/vdb"
+            ephemeralTmpDevicePath = rootMode == .readonlyBaseCowState ? "/dev/vdc" : "/dev/vdb"
             ephemeralTmpLabel = tmpLabel
         } else {
             ephemeralTmpDiskURL = nil
@@ -280,7 +297,9 @@ public final class VirtualMachineRunner {
         ])
         return RuntimeInstanceMetadata(
             instanceName: distribution.name,
-            diskURL: URL(fileURLWithPath: distribution.diskPath),
+            diskURL: URL(fileURLWithPath: distribution.baseDiskPath ?? distribution.diskPath),
+            rootMode: rootMode,
+            stateDiskURL: stateDiskURL,
             machineIdentifierURL: instanceDir.appendingPathComponent("machine-identifier.bin", isDirectory: false),
             efiVariableStoreURL: instanceDir.appendingPathComponent("efi-variable-store", isDirectory: false),
             tmpStorage: tmpStorage,
@@ -430,6 +449,8 @@ public final class VirtualMachineRunner {
     private func buildConfiguration(
         instanceName: String,
         diskURL: URL,
+        diskReadOnly: Bool,
+        stateDiskURL: URL?,
         machineIdentifierURL: URL,
         efiVariableStoreURL: URL,
         serialAttachment: (FileHandle, FileHandle)?,
@@ -508,9 +529,13 @@ public final class VirtualMachineRunner {
         }
         vm.networkDevices = [network]
 
-        let diskAttachment = try VZDiskImageStorageDeviceAttachment(url: diskURL, readOnly: false)
+        let diskAttachment = try VZDiskImageStorageDeviceAttachment(url: diskURL, readOnly: diskReadOnly)
         let blockDevice = VZVirtioBlockDeviceConfiguration(attachment: diskAttachment)
         var storageDevices: [VZStorageDeviceConfiguration] = [blockDevice]
+        if let stateDiskURL {
+            let stateAttachment = try VZDiskImageStorageDeviceAttachment(url: stateDiskURL, readOnly: false)
+            storageDevices.append(VZVirtioBlockDeviceConfiguration(attachment: stateAttachment))
+        }
         for extraDiskURL in extraWritableDisks {
             let extraAttachment = try VZDiskImageStorageDeviceAttachment(url: extraDiskURL, readOnly: false)
             storageDevices.append(VZVirtioBlockDeviceConfiguration(attachment: extraAttachment))
@@ -890,6 +915,10 @@ public final class VirtualMachineRunner {
         if !FileManager.default.fileExists(atPath: diskURL.path) {
             throw MSLRuntimeError("vm disk not found at \(diskURL.path)")
         }
+        if let stateDiskURL = metadata.stateDiskURL,
+           !FileManager.default.fileExists(atPath: stateDiskURL.path) {
+            throw MSLRuntimeError("vm state disk not found at \(stateDiskURL.path); reinstall or rebuild the instance writable state image")
+        }
 
         // Always log serial output in daemon mode
         let serialAttachment = try makeSerialLogAttachment()
@@ -898,11 +927,13 @@ public final class VirtualMachineRunner {
         let configuration = try buildConfiguration(
             instanceName: metadata.instanceName,
             diskURL: diskURL,
+            diskReadOnly: metadata.rootMode == .readonlyBaseCowState,
+            stateDiskURL: metadata.stateDiskURL,
             machineIdentifierURL: metadata.machineIdentifierURL,
             efiVariableStoreURL: metadata.efiVariableStoreURL,
             serialAttachment: serialAttachment,
             diagnosticAttachment: diagnosticAttachment,
-            extraWritableDisks: metadata.ephemeralTmpDiskURL.map { [$0] } ?? []
+            extraWritableDisks: metadata.extraWritableDiskURLs()
         )
         logStartupPhase(
             phase: "vm_configuration_build",
@@ -1852,12 +1883,22 @@ private func monotonicMs() -> Int64 {
 private struct RuntimeInstanceMetadata {
     var instanceName: String
     var diskURL: URL
+    var rootMode: DistributionInstanceMetadata.RootMode
+    var stateDiskURL: URL?
     var machineIdentifierURL: URL
     var efiVariableStoreURL: URL
     var tmpStorage: DistributionInstanceMetadata.TmpStoragePolicy
     var ephemeralTmpDiskURL: URL?
     var ephemeralTmpDevicePath: String?
     var ephemeralTmpLabel: String?
+
+    func extraWritableDiskURLs() -> [URL] {
+        var urls: [URL] = []
+        if let ephemeralTmpDiskURL {
+            urls.append(ephemeralTmpDiskURL)
+        }
+        return urls
+    }
 }
 
 #if canImport(Virtualization)

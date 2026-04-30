@@ -183,6 +183,7 @@ struct MSLCommand: ParsableCommand {
         subcommands: [
             RunCommand.self,
             NerdctlCommand.self,
+            ContainerCommand.self,
             CpCommand.self,
             ListCommand.self,
             StatusCommand.self,
@@ -321,6 +322,30 @@ struct NerdctlCommand: ParsableCommand {
     mutating func run() throws {
         withRuntimeManager { manager in
             try manager.runNerdctl(argv: command, instanceName: instance ?? CLIInvocationContext.instanceName)
+        }
+    }
+}
+
+struct ContainerCommand: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "container",
+        abstract: "Manage the internal container runtime.",
+        subcommands: [ContainerResetCommand.self]
+    )
+}
+
+struct ContainerResetCommand: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "reset",
+        abstract: "Reset the internal container runtime writable state."
+    )
+
+    @Option(name: [.customLong("instance")], help: "Container runtime instance name. Defaults to _container.")
+    var instance: String?
+
+    mutating func run() throws {
+        withRuntimeManager { manager in
+            try manager.runContainerReset(instanceName: instance)
         }
     }
 }

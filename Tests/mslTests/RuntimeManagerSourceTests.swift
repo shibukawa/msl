@@ -21,6 +21,10 @@ final class RuntimeManagerSourceTests: XCTestCase {
         XCTAssertTrue(source.contains("public func runNerdctl"))
         XCTAssertTrue(source.contains("resolveContainerRuntimeTarget(explicitInstanceName: instanceName)"))
         XCTAssertTrue(source.contains("container runtime artifact is not installed; use `make build-container-runtime`"))
+        XCTAssertTrue(source.contains("container runtime uses legacy disk.raw storage; use `make build-container-runtime`"))
+        XCTAssertTrue(source.contains("metadata.resolvedRootMode() == .readonlyBaseCowState"))
+        XCTAssertTrue(source.contains("paths.distroBaseDiskFile(named: resolvedName)"))
+        XCTAssertTrue(source.contains("paths.distroStateDiskFile(named: resolvedName)"))
         XCTAssertTrue(source.contains("try daemonClient.ensureConnected("))
         XCTAssertTrue(source.contains("expectedInstanceName: target.instanceName"))
         XCTAssertTrue(source.contains("executeNerdctlViaDaemon("))
@@ -99,6 +103,17 @@ final class RuntimeManagerSourceTests: XCTestCase {
         XCTAssertTrue(source.contains("direct_init_interactive_pty"))
         XCTAssertTrue(source.contains("let hostTerminal = attachInput ? HostTerminalState.capture() : nil"))
         XCTAssertTrue(source.contains("if attachInput {\n                enterRawModeForShell()"))
+    }
+
+    func testContainerResetUsesStateResetPath() throws {
+        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+        let source = try String(contentsOf: root.appendingPathComponent("Sources/mslCore/RuntimeManager.swift"), encoding: .utf8)
+
+        XCTAssertTrue(source.contains("public func runContainerReset(instanceName rawName: String?) throws -> Never"))
+        XCTAssertTrue(source.contains("distributionManager.resolveContainerRuntimeInstanceName()"))
+        XCTAssertTrue(source.contains("try resolveContainerRuntimeTarget(explicitInstanceName: resolvedName)"))
+        XCTAssertTrue(source.contains("distributionManager.resetWritableState(name: resolvedName)"))
+        XCTAssertTrue(source.contains("container state reset:"))
     }
 
     func testDefaultInstanceIsNotAutoSetForReservedInternalInstances() throws {

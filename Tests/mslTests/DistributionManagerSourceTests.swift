@@ -20,6 +20,42 @@ final class DistributionManagerSourceTests: XCTestCase {
         XCTAssertTrue(source.contains("etc/nerdctl/nerdctl.toml"))
         XCTAssertTrue(source.contains("snapshotter = \"native\""))
         XCTAssertTrue(source.contains("CONTAINERD_SNAPSHOTTER=native"))
+        XCTAssertTrue(source.contains("\"duperemove\""))
+        XCTAssertTrue(source.contains("usr/local/bin/msl-btrfs-dedupe"))
+        XCTAssertTrue(source.contains("blkid -s UUID -o value /dev/vdb"))
+        XCTAssertTrue(source.contains("duperemove -r -d -q --hashfile=\"$hash_file\" --io-threads=1 --cpu-threads=1"))
+        XCTAssertTrue(source.contains("sleep 900"))
+        XCTAssertTrue(source.contains("try ensureRunlevelLink(service: \"msl-btrfs-dedupe\", rootfsDir: rootfsDir)"))
         XCTAssertFalse(source.contains("snapshotter = \"overlayfs\""))
+    }
+
+    func testContainerRuntimeInstallsUseReadonlyBaseCowState() throws {
+        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+        let source = try String(contentsOf: root.appendingPathComponent("Sources/mslCore/DistributionManager.swift"), encoding: .utf8)
+
+        XCTAssertTrue(source.contains("materialized.sourceRecord.sourceType == \"container-runtime\""))
+        XCTAssertTrue(source.contains("targetAlias == \"container-runtime\" ? paths.distroBaseDiskFile(named: name) : diskFile"))
+        XCTAssertTrue(source.contains("paths.distroBaseDiskFile(named: name)"))
+        XCTAssertTrue(source.contains("paths.distroStateDiskFile(named: name)"))
+        XCTAssertTrue(source.contains("paths.distroStateTemplateDiskFile(named: name)"))
+        XCTAssertTrue(source.contains("outputStateTemplateDiskPath: stateTemplateDiskFile?.path"))
+        XCTAssertTrue(source.contains("imageFS: useReadonlyBaseCowState ? \"erofs\" : \"btrfs\""))
+        XCTAssertTrue(source.contains("rootMode: useReadonlyBaseCowState ? .readonlyBaseCowState : nil"))
+    }
+
+    func testRemoteContainerInstallsRemainSingleDisk() throws {
+        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+        let source = try String(contentsOf: root.appendingPathComponent("Sources/mslCore/DistributionManager.swift"), encoding: .utf8)
+
+        XCTAssertFalse(source.contains("let useReadonlyBaseCowState = materialized.sourceRecord.sourceType == \"container-remote\""))
+    }
+
+    func testResetWritableStateUsesTemplateCopy() throws {
+        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+        let source = try String(contentsOf: root.appendingPathComponent("Sources/mslCore/DistributionManager.swift"), encoding: .utf8)
+
+        XCTAssertTrue(source.contains("func resetWritableState(name rawName: String) throws -> URL"))
+        XCTAssertTrue(source.contains("paths.distroStateTemplateDiskFile(named: name)"))
+        XCTAssertTrue(source.contains("try copySparseFile(from: templateURL, to: stateURL)"))
     }
 }

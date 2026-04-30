@@ -44,6 +44,12 @@ public final class BootstrapManager {
             destination: paths.mslHostInitBootloaderBinaryFile,
             logPrefix: "init_bootloader_binary"
         )
+        try stageGuestBinaryIfAvailable(
+            envVar: "MSL_EARLY_INIT_BINARY_PATH",
+            binaryName: "msl-early-init",
+            destination: paths.mslHostEarlyInitBinaryFile,
+            logPrefix: "early_init_binary"
+        )
         try stageExt4HelpersIfAvailable()
 
         logger.log("bootstrap_completed", fields: ["context": bootstrapContextName(context)])

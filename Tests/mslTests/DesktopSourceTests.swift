@@ -36,6 +36,7 @@ final class DesktopSourceTests: XCTestCase {
         XCTAssertTrue(source.contains("guard selectedContainerID != id else { return }"))
         XCTAssertTrue(source.contains("if self.containers != next"))
         XCTAssertTrue(source.contains("DetailMetricRow"))
+        XCTAssertTrue(source.contains("DetailMetricRow(label: \"Btrfs dedupe\", value: containerDedupeStatusDisplay(summary))"))
         XCTAssertTrue(source.contains("formatContainerMemoryLimit"))
     }
 
@@ -134,7 +135,8 @@ final class DesktopSourceTests: XCTestCase {
             "container_inspect",
             "container_stats_batch",
             "image_ls",
-            "image_inspect"
+            "image_inspect",
+            "image_storage_summary"
         ] {
             XCTAssertTrue(source.contains("op: \"\(op)\""), "missing request for \(op)")
         }
@@ -145,13 +147,39 @@ final class DesktopSourceTests: XCTestCase {
         XCTAssertTrue(source.contains("nonisolated private func runRuntimeAction(socketPath: String, request: RuntimeControlRequest) async"))
     }
 
+    func testContainerPagesCanRenderCachedDataWhileRuntimeIsStopped() throws {
+        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+        let source = try String(contentsOf: root.appendingPathComponent("Sources/MSLDesktop/MSLDesktopApp.swift"), encoding: .utf8)
+
+        XCTAssertTrue(source.contains("func hasCachedContainerData(for page: ContainerDesktopPage) -> Bool"))
+        XCTAssertTrue(source.contains("model.isContainerRuntimeRunning || model.hasCachedContainerData(for: page)"))
+        XCTAssertTrue(source.contains("Showing cached data from"))
+        XCTAssertTrue(source.contains(".disabled(model.selectedImageID == nil || !model.isContainerRuntimeRunning)"))
+        XCTAssertTrue(source.contains(".disabled(!model.isContainerRuntimeRunning)"))
+    }
+
+    func testImageStorageSummaryRefreshIsManualAndLifecycleDriven() throws {
+        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+        let source = try String(contentsOf: root.appendingPathComponent("Sources/MSLDesktop/MSLDesktopApp.swift"), encoding: .utf8)
+
+        XCTAssertTrue(source.contains("@Published var imageStorageSummary: RuntimeImageStorageSummary?"))
+        XCTAssertTrue(source.contains("@Published var lastImageStorageSummaryUpdatedEpochMs: Int64?"))
+        XCTAssertTrue(source.contains("private var wasContainerRuntimeRunning = false"))
+        XCTAssertTrue(source.contains("refreshImageStorageSummaryOnLifecycleTransition(running: containerRuntimeIsRunning)"))
+        XCTAssertTrue(source.contains("func refreshImages() {\n        fetchImagesIfPossible(force: true)\n        fetchImageStorageSummaryIfPossible(force: true)\n    }"))
+        XCTAssertTrue(source.contains("ImageStorageSummaryPanel(summary: model.imageStorageSummary"))
+        XCTAssertTrue(source.contains("Total Image Sizes:"))
+        XCTAssertTrue(source.contains("Actual storage on macOS:"))
+        XCTAssertTrue(source.contains("private func formatCompactBytes(_ value: UInt64) -> String"))
+    }
+
     func testContainerTableStatusAndStateSpecificActions() throws {
         let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
         let source = try String(contentsOf: root.appendingPathComponent("Sources/MSLDesktop/MSLDesktopApp.swift"), encoding: .utf8)
 
         XCTAssertTrue(source.contains("TableColumn(\"Status\") { Text(containerStatusDisplay($0)) }"))
         XCTAssertTrue(source.contains("private func containerStatusDisplay(_ container: RuntimeContainerListItem) -> String"))
-        XCTAssertTrue(source.contains("if let selected = model.selectedContainer"))
+        XCTAssertTrue(source.contains("if model.isContainerRuntimeRunning, let selected = model.selectedContainer"))
         XCTAssertTrue(source.contains("if canStartContainer(selected)"))
         XCTAssertTrue(source.contains("if canStopContainer(selected)"))
         XCTAssertTrue(source.contains("private func canStartContainer(_ container: RuntimeContainerListItem) -> Bool"))

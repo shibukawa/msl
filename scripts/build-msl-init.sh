@@ -9,6 +9,7 @@ TARGET="aarch64-unknown-linux-musl"
 STAGING_DIR="${MSL_HOME:-$HOME}/.msl-system"
 STAGING_OUT="$STAGING_DIR/msl-init"
 STAGING_BOOTLOADER_OUT="$STAGING_DIR/msl-init-bootloader"
+STAGING_EARLY_INIT_OUT="$STAGING_DIR/msl-early-init"
 BUILD_GIT_COMMIT="$(git -C "$ROOT_DIR" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
 BUILD_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
@@ -28,6 +29,7 @@ MSL_INIT_BUILD_TARGET="$TARGET" \
 cargo build --release --target "$TARGET"
 OUT="$ROOT_DIR/Support/msl-init/target/$TARGET/release/msl-init"
 BOOTLOADER_OUT="$ROOT_DIR/Support/msl-init/target/$TARGET/release/msl-init-bootloader"
+EARLY_INIT_OUT="$ROOT_DIR/Support/msl-init/target/$TARGET/release/msl-early-init"
 if command -v file >/dev/null 2>&1; then
   FILE_OUT="$(file "$OUT")"
   echo "$FILE_OUT"
@@ -41,13 +43,23 @@ if command -v file >/dev/null 2>&1; then
     echo "error: unexpected msl-init-bootloader binary format (expected Linux aarch64 ELF)." >&2
     exit 1
   fi
+  EARLY_INIT_FILE_OUT="$(file "$EARLY_INIT_OUT")"
+  echo "$EARLY_INIT_FILE_OUT"
+  if ! echo "$EARLY_INIT_FILE_OUT" | grep -q "ELF 64-bit.*ARM aarch64"; then
+    echo "error: unexpected msl-early-init binary format (expected Linux aarch64 ELF)." >&2
+    exit 1
+  fi
 fi
 chmod 0755 "$OUT"
+chmod 0755 "$EARLY_INIT_OUT"
 echo "built: $OUT"
 mkdir -p "$STAGING_DIR"
 cp -f "$OUT" "$STAGING_OUT"
 chmod 0755 "$STAGING_OUT"
 cp -f "$BOOTLOADER_OUT" "$STAGING_BOOTLOADER_OUT"
 chmod 0755 "$STAGING_BOOTLOADER_OUT"
+cp -f "$EARLY_INIT_OUT" "$STAGING_EARLY_INIT_OUT"
+chmod 0755 "$STAGING_EARLY_INIT_OUT"
 echo "staged: $STAGING_OUT"
 echo "staged-bootloader: $STAGING_BOOTLOADER_OUT"
+echo "staged-early-init: $STAGING_EARLY_INIT_OUT"

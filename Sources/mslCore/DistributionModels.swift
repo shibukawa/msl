@@ -309,6 +309,11 @@ public struct DistributionInstanceMetadata: Codable, Equatable {
         case containerRuntime = "container-runtime"
     }
 
+    public enum RootMode: String, Codable {
+        case singleDisk = "single-disk"
+        case readonlyBaseCowState = "readonly-base-cow-state"
+    }
+
     public struct DefaultExec: Codable, Equatable {
         public var argv: [String]
         public var workingDir: String?
@@ -445,6 +450,9 @@ public struct DistributionInstanceMetadata: Codable, Equatable {
     public var user: UserSnapshot?
     public var source: DistributionSourceRecord
     public var diskPath: String
+    public var baseDiskPath: String?
+    public var stateDiskPath: String?
+    public var rootMode: RootMode?
     public var kernelProfileRef: String?
     public var runtimeProfile: RuntimeInitProfile?
     public var userConvergencePolicy: UserConvergencePolicy?
@@ -467,6 +475,9 @@ public struct DistributionInstanceMetadata: Codable, Equatable {
         user: UserSnapshot? = nil,
         source: DistributionSourceRecord,
         diskPath: String,
+        baseDiskPath: String? = nil,
+        stateDiskPath: String? = nil,
+        rootMode: RootMode? = nil,
         kernelProfileRef: String?,
         runtimeProfile: RuntimeInitProfile? = nil,
         userConvergencePolicy: UserConvergencePolicy?,
@@ -488,6 +499,9 @@ public struct DistributionInstanceMetadata: Codable, Equatable {
         self.user = user
         self.source = source
         self.diskPath = diskPath
+        self.baseDiskPath = baseDiskPath
+        self.stateDiskPath = stateDiskPath
+        self.rootMode = rootMode
         self.kernelProfileRef = kernelProfileRef
         self.runtimeProfile = runtimeProfile
         self.userConvergencePolicy = userConvergencePolicy
@@ -509,6 +523,10 @@ public struct DistributionInstanceMetadata: Codable, Equatable {
 
     public func resolvedWorkloadKind() -> WorkloadKind {
         workloadKind ?? .generic
+    }
+
+    public func resolvedRootMode() -> RootMode {
+        rootMode ?? .singleDisk
     }
 
     public static func defaultTmpStoragePolicyForNewInstance() -> TmpStoragePolicy {

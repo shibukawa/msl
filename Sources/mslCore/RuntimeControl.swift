@@ -527,6 +527,9 @@ public struct RuntimeNetworkSnapshot: Codable {
 public struct RuntimeContainerRuntimeMetrics: Codable {
     public var containerdHealthy: Bool?
     public var buildkitdHealthy: Bool?
+    public var dedupeEnabled: Bool?
+    public var dedupeHealthy: Bool?
+    public var dedupeDetail: String?
     public var containerCount: Int?
     public var imageCount: Int?
 }
@@ -573,6 +576,9 @@ public struct RuntimeProcessSnapshotItem: Codable, Identifiable {
 public struct RuntimeContainerRuntimeSummary: Codable, Equatable {
     public var containerdHealthy: Bool?
     public var buildkitdHealthy: Bool?
+    public var dedupeEnabled: Bool?
+    public var dedupeHealthy: Bool?
+    public var dedupeDetail: String?
     public var containerCount: Int?
     public var imageCount: Int?
     public var sampledAtEpochMs: Int64
@@ -647,6 +653,20 @@ public struct RuntimeImageDetail: Codable, Equatable {
     public var labels: [String: String]
 }
 
+public struct RuntimeImageStorageSummary: Codable, Equatable {
+    public var guestImageTotalBytes: UInt64?
+    public var hostLogicalBytes: UInt64?
+    public var hostAllocatedBytes: UInt64?
+    public var sampledAtEpochMs: Int64
+
+    public init(guestImageTotalBytes: UInt64?, hostLogicalBytes: UInt64?, hostAllocatedBytes: UInt64?, sampledAtEpochMs: Int64) {
+        self.guestImageTotalBytes = guestImageTotalBytes
+        self.hostLogicalBytes = hostLogicalBytes
+        self.hostAllocatedBytes = hostAllocatedBytes
+        self.sampledAtEpochMs = sampledAtEpochMs
+    }
+}
+
 public struct RuntimeControlResponse: Codable {
     public var ok: Bool
     public var error: String?
@@ -663,6 +683,7 @@ public struct RuntimeControlResponse: Codable {
     public var containerStatsList: [RuntimeContainerStats]?
     public var images: [RuntimeImageListItem]?
     public var imageDetail: RuntimeImageDetail?
+    public var imageStorageSummary: RuntimeImageStorageSummary?
     // exec / pty / session responses
     public var stdout: String?
     public var stderr: String?
@@ -695,6 +716,7 @@ public struct RuntimeControlResponse: Codable {
         case containerStatsList
         case images
         case imageDetail
+        case imageStorageSummary
         case stdout
         case stderr
         case exitCode

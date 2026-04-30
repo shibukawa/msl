@@ -15,6 +15,7 @@ OUTPUT_IMAGE=""
 FS_TYPE="btrfs"
 SIZE_MB="0"
 INIT_BINARY=""
+EARLY_INIT_BINARY=""
 PACKAGES=""
 APK_CACHE_DIR=""
 APK_RETRY_LIMIT="5"
@@ -28,7 +29,8 @@ usage() {
   cat >&2 <<'EOF_USAGE'
 usage:
   imagewriter-build-guest.sh --mode stage1 (--rootfs <rootfs-archive> | --rootfs-dir <rootfs-dir>) --output <output-image> --size-mb <n> [--init-binary <path>] [--packages "<apk packages>"]
-  imagewriter-build-guest.sh --mode stage2 --fs-type <btrfs|erofs> (--rootfs <rootfs-archive> | --rootfs-dir <rootfs-dir> | --oci-layout-dir <oci-layout-dir>) [--extra-files-bundle <bundle-dir>] --output <output-image> --size-mb <n> [--init-binary <path>] [--packages "<apk packages>"]
+  imagewriter-build-guest.sh --mode stage2 --fs-type <btrfs|erofs> (--rootfs <rootfs-archive> | --rootfs-dir <rootfs-dir> | --oci-layout-dir <oci-layout-dir>) [--extra-files-bundle <bundle-dir>] --output <output-image> --size-mb <n> [--init-binary <path>] [--early-init-binary <path>] [--packages "<apk packages>"]
+  imagewriter-build-guest.sh --mode state --output <output-image> --size-mb <n>
 
 legacy:
   imagewriter-build-guest.sh <rootfs-archive> <output-image> [btrfs|erofs|ext4] <size-mb> [init-binary]
@@ -85,6 +87,10 @@ if [ "$#" -gt 0 ] && [ "${1#--}" != "$1" ]; then
         ;;
       --init-binary)
         INIT_BINARY="${2:-}"
+        shift 2
+        ;;
+      --early-init-binary)
+        EARLY_INIT_BINARY="${2:-}"
         shift 2
         ;;
       --packages)
@@ -177,6 +183,14 @@ case "$MODE" in
         ;;
     esac
     ;;
+  state)
+    FS_TYPE="btrfs"
+    if [ -z "$OUTPUT_IMAGE" ]; then
+      echo "error: state requires --output" >&2
+      usage
+      exit 1
+    fi
+    ;;
   legacy)
     if [ -z "$ROOTFS_ARCHIVE" ] || [ -z "$OUTPUT_IMAGE" ]; then
       usage
@@ -201,6 +215,10 @@ source_count=0
 [ -n "$ROOTFS_ARCHIVE" ] && source_count=$((source_count + 1))
 [ -n "$ROOTFS_SOURCE_DIR" ] && source_count=$((source_count + 1))
 [ -n "$OCI_LAYOUT_DIR" ] && source_count=$((source_count + 1))
+if [ "$MODE" = "state" ] && [ "$source_count" -ne 0 ]; then
+  echo "error: state mode does not accept --rootfs, --rootfs-dir, or --oci-layout-dir" >&2
+  exit 1
+fi
 if [ "$source_count" -gt 1 ]; then
   echo "error: specify only one of --rootfs, --rootfs-dir, or --oci-layout-dir" >&2
   exit 1
@@ -223,6 +241,10 @@ if [ -n "$EXTRA_FILES_BUNDLE" ] && [ ! -d "$EXTRA_FILES_BUNDLE" ]; then
 fi
 if [ -n "$INIT_BINARY" ] && [ ! -f "$INIT_BINARY" ]; then
   echo "error: init binary not found: $INIT_BINARY" >&2
+  exit 1
+fi
+if [ -n "$EARLY_INIT_BINARY" ] && [ ! -f "$EARLY_INIT_BINARY" ]; then
+  echo "error: early init binary not found: $EARLY_INIT_BINARY" >&2
   exit 1
 fi
 
@@ -526,6 +548,11 @@ install_packages() {
     attempts=$((attempts + 1))
     if [ "$attempts" -ge "$APK_RETRY_LIMIT" ]; then
       echo "error: apk add failed after $attempts attempts" >&2
+      case " $PACKAGES " in
+        *" duperemove "*)
+          echo "hint: container-runtime btrfs dedupe requires Alpine duperemove from the community repository." >&2
+          ;;
+      esac
       exit 1
     fi
     echo "warning: apk add failed (attempt $attempts/$APK_RETRY_LIMIT), retrying..." >&2
@@ -771,6 +798,15 @@ install_init_binary() {
   esac
 }
 
+install_early_init_binary() {
+  if [ -z "$EARLY_INIT_BINARY" ]; then
+    return
+  fi
+  mkdir -p "$ROOTFS_DIR/run/msl/base" "$ROOTFS_DIR/run/msl/state" "$ROOTFS_DIR/run/msl/tmp" "$ROOTFS_DIR/sysroot" || fail_guest_stage "early_init_injection" 1 "failed to create early init mountpoints"
+  cp -f "$EARLY_INIT_BINARY" "$ROOTFS_DIR/init" || fail_guest_stage "early_init_injection" 1 "failed to install early init into /init"
+  chmod 0755 "$ROOTFS_DIR/init" || fail_guest_stage "early_init_injection" 1 "failed to chmod /init"
+}
+
 build_from_source_dir() {
   source_dir="$1"
   case "$FS_TYPE" in
@@ -822,6 +858,20 @@ build_from_source_dir() {
   verify_output_fs_type "$FS_TYPE"
 }
 
+build_empty_state_image() {
+  resolve_size
+  truncate -s "${SIZE_MB}M" "$OUTPUT_IMAGE" || fail_guest_stage "state_image_build" 1 "failed to allocate btrfs state image"
+  progress_step "allocated state image"
+  mkfs.btrfs -f "$OUTPUT_IMAGE" >/dev/null || fail_guest_stage "state_image_build" 1 "mkfs.btrfs state image failed"
+  mount -o loop,compress=zstd "$OUTPUT_IMAGE" "$OUTPUT_MOUNT_DIR" || fail_guest_stage "state_image_build" 1 "failed to mount btrfs state image"
+  mkdir -p "$OUTPUT_MOUNT_DIR/upper" "$OUTPUT_MOUNT_DIR/work"
+  set_btrfs_compression "$OUTPUT_MOUNT_DIR" zstd
+  set_btrfs_compression "$OUTPUT_MOUNT_DIR/upper" zstd
+  set_btrfs_compression "$OUTPUT_MOUNT_DIR/work" zstd
+  verify_output_fs_type "btrfs"
+  progress_step "built btrfs state image"
+}
+
 cleanup() {
   umount "$OUTPUT_MOUNT_DIR" >/dev/null 2>&1 || true
   rm -rf "$WORK_DIR" >/dev/null 2>&1 || true
@@ -834,12 +884,16 @@ trap cleanup EXIT INT TERM
 
 echo "imagewriter_guest_stage_start mode=$MODE fs=$FS_TYPE output=$OUTPUT_IMAGE"
 case "$MODE" in
+  state)
+    build_empty_state_image
+    ;;
   stage1|stage2|legacy)
     install_extra_files
     extract_rootfs
     progress_step "extracted rootfs archive"
     write_runtime_summary
     install_init_binary
+    install_early_init_binary
     install_packages
     progress_step "installed stage packages"
     resolve_size

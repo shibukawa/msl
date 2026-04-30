@@ -51,6 +51,7 @@ public struct MSLPaths {
     public let mslHostExt4MkfsHelperBinaryFile: URL
     public let mslHostInitBinaryFile: URL
     public let mslHostInitBootloaderBinaryFile: URL
+    public let mslHostEarlyInitBinaryFile: URL
     public let mslHostExt4HelperBinaryFile: URL
     public let mslHostInitBootstrapLogFile: URL
     public let serialConsoleLogFile: URL
@@ -90,6 +91,7 @@ public struct MSLPaths {
         self.mslHostExt4MkfsHelperBinaryFile = mslHostToolsDir.appendingPathComponent("msl-ext4-mkfs", isDirectory: false)
         self.mslHostInitBinaryFile = mslHostToolsDir.appendingPathComponent("msl-init", isDirectory: false)
         self.mslHostInitBootloaderBinaryFile = mslHostToolsDir.appendingPathComponent("msl-init-bootloader", isDirectory: false)
+        self.mslHostEarlyInitBinaryFile = mslHostToolsDir.appendingPathComponent("msl-early-init", isDirectory: false)
         self.mslHostExt4HelperBinaryFile = mslHostToolsDir.appendingPathComponent("msl-ext4-image", isDirectory: false)
         self.mslHostInitBootstrapLogFile = mslHostToolsDir.appendingPathComponent("init-bootstrap.log", isDirectory: false)
         self.serialConsoleLogFile = logs.appendingPathComponent("serial-console.log", isDirectory: false)
@@ -131,6 +133,18 @@ public struct MSLPaths {
 
     public func distroDiskFile(named name: String) -> URL {
         distroDirectory(named: name).appendingPathComponent("disk.raw", isDirectory: false)
+    }
+
+    public func distroBaseDiskFile(named name: String) -> URL {
+        distroDirectory(named: name).appendingPathComponent("base.erofs.raw", isDirectory: false)
+    }
+
+    public func distroStateDiskFile(named name: String) -> URL {
+        distroDirectory(named: name).appendingPathComponent("state.btrfs.raw", isDirectory: false)
+    }
+
+    public func distroStateTemplateDiskFile(named name: String) -> URL {
+        distroDirectory(named: name).appendingPathComponent("state.btrfs.template.raw", isDirectory: false)
     }
 
     public func distroSourceFile(named name: String) -> URL {

@@ -658,6 +658,24 @@ public final class RuntimeManager {
         Foundation.exit(0)
     }
 
+    public func runContainerReset(instanceName rawName: String?) throws -> Never {
+        let resolvedName = (rawName?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
+            ? rawName!.trimmingCharacters(in: .whitespacesAndNewlines)
+            : distributionManager.resolveContainerRuntimeInstanceName()
+
+        let stateURL: URL = try lock.withExclusiveLock {
+            let state = try store.loadState()
+            if state.vmState == .running, state.distro == resolvedName {
+                throw MSLRuntimeError("container runtime '\(resolvedName)' is running. run `msl stop \(resolvedName)` first.")
+            }
+            _ = try resolveContainerRuntimeTarget(explicitInstanceName: resolvedName)
+            return try distributionManager.resetWritableState(name: resolvedName)
+        }
+
+        print("container state reset: \(stateURL.path)")
+        Foundation.exit(0)
+    }
+
     public func runDefaultShell(instanceName: String? = nil) throws -> Never {
         let commandStartMs = runtimeMonotonicMs()
         let metadataResolveStartMs = runtimeMonotonicMs()
@@ -3642,9 +3660,25 @@ public final class RuntimeManager {
             ? trimmedExplicit!
             : distributionManager.resolveContainerRuntimeInstanceName()
         let metadataURL = paths.distroMetadataFile(named: resolvedName)
-        let diskURL = paths.distroDiskFile(named: resolvedName)
-        guard fileManager.fileExists(atPath: metadataURL.path), fileManager.fileExists(atPath: diskURL.path) else {
+        guard fileManager.fileExists(atPath: metadataURL.path) else {
             throw MSLRuntimeError("container runtime artifact is not installed; use `make build-container-runtime`")
+        }
+        let metadata = try distributionManager.readOrRebuildInstanceMetadata(at: metadataURL)
+        guard metadata.source.sourceType == "container-runtime" else {
+            throw MSLRuntimeError("instance '\(resolvedName)' is not a container runtime instance")
+        }
+        if metadata.resolvedRootMode() == .readonlyBaseCowState {
+            let baseURL = URL(fileURLWithPath: metadata.baseDiskPath ?? paths.distroBaseDiskFile(named: resolvedName).path)
+            let stateURL = URL(fileURLWithPath: metadata.stateDiskPath ?? paths.distroStateDiskFile(named: resolvedName).path)
+            guard fileManager.fileExists(atPath: baseURL.path), fileManager.fileExists(atPath: stateURL.path) else {
+                throw MSLRuntimeError("container runtime split artifact is incomplete; use `make build-container-runtime`")
+            }
+        } else {
+            let diskURL = paths.distroDiskFile(named: resolvedName)
+            guard fileManager.fileExists(atPath: diskURL.path) else {
+                throw MSLRuntimeError("container runtime artifact is not installed; use `make build-container-runtime`")
+            }
+            throw MSLRuntimeError("container runtime uses legacy disk.raw storage; use `make build-container-runtime` to rebuild resettable storage")
         }
         return (resolvedName, metadataURL)
     }
