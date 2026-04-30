@@ -106,4 +106,17 @@ final class RuntimeManagerSourceTests: XCTestCase {
         let source = try String(contentsOf: root.appendingPathComponent("Sources/mslCore/RuntimeManager.swift"), encoding: .utf8)
         XCTAssertTrue(source.contains("if distributionManager.isReservedInternalInstanceName(name)"))
     }
+
+    func testExecutablePathResolutionDoesNotFollowSwiftPMBuildSymlink() throws {
+        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+        let source = try String(contentsOf: root.appendingPathComponent("Sources/mslCore/RuntimeManager.swift"), encoding: .utf8)
+        guard let functionRange = source.range(of: "private static func resolveExecutablePath"),
+              let nextRange = source.range(of: "\n    private struct WorkspaceStartupPolicyDecision", range: functionRange.upperBound..<source.endIndex) else {
+            return XCTFail("resolveExecutablePath function not found")
+        }
+        let body = String(source[functionRange.lowerBound..<nextRange.lowerBound])
+
+        XCTAssertTrue(body.contains(".standardizedFileURL"))
+        XCTAssertFalse(body.contains(".resolvingSymlinksInPath()"))
+    }
 }

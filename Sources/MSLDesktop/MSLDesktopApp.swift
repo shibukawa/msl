@@ -9,7 +9,7 @@ struct MSLDesktopApp: App {
     var body: some Scene {
         WindowGroup("MSL Desktop") {
             DashboardView(model: appDelegate.model)
-                .frame(minWidth: 1080, minHeight: 720)
+                .frame(minWidth: 1360, minHeight: 760)
         }
     }
 }
@@ -130,6 +130,33 @@ enum DashboardTab: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
+enum ContainerDesktopPage: String, CaseIterable, Identifiable {
+    case containers
+    case images
+    case runtime
+    case metrics
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .containers: return "Containers"
+        case .images: return "Images"
+        case .runtime: return "Runtime"
+        case .metrics: return "Metrics"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .containers: return "shippingbox"
+        case .images: return "square.stack.3d.up"
+        case .runtime: return "gauge.with.dots.needle.67percent"
+        case .metrics: return "chart.line.uptrend.xyaxis"
+        }
+    }
+}
+
 struct DashboardSelectionSummary {
     let instanceName: String
     let worker: AppManagerWorkerRecord?
@@ -137,6 +164,11 @@ struct DashboardSelectionSummary {
 
 @MainActor
 final class DashboardModel: ObservableObject {
+    fileprivate static let containerInstanceName = "_container"
+    fileprivate static let containerListSelection = "__containers_list"
+    fileprivate static let imageListSelection = "__images_list"
+    fileprivate static let containerRuntimeSelection = "__containers_runtime"
+    fileprivate static let containerMetricsSelection = "__containers_metrics"
     private static let hiddenInstanceNames: Set<String> = ["_imagewriter", "_container", "_podman"]
 
     @Published var workers: [AppManagerWorkerRecord] = []
@@ -148,6 +180,19 @@ final class DashboardModel: ObservableObject {
     @Published var metrics: RuntimeInstanceMetrics?
     @Published var storage: RuntimeInstanceStorage?
     @Published var processes: [RuntimeProcessSnapshotItem] = []
+    @Published var containerSummary: RuntimeContainerRuntimeSummary?
+    @Published var containers: [RuntimeContainerListItem] = []
+    @Published var containerDetail: RuntimeContainerDetail?
+    @Published var containerStats: RuntimeContainerStats?
+    @Published var containerStatsByID: [String: RuntimeContainerStats] = [:]
+    @Published var images: [RuntimeImageListItem] = []
+    @Published var imageDetail: RuntimeImageDetail?
+    @Published var selectedContainerID: String?
+    @Published var selectedImageID: String?
+    @Published var lastContainersUpdatedEpochMs: Int64?
+    @Published var lastImagesUpdatedEpochMs: Int64?
+    @Published var lastContainerSummaryUpdatedEpochMs: Int64?
+    @Published var lastContainerMetricsUpdatedEpochMs: Int64?
     @Published var isLoadingProcesses = false
     @Published var selectedTabError: String?
     @Published var lastMetricsUpdatedEpochMs: Int64?
@@ -163,6 +208,42 @@ final class DashboardModel: ObservableObject {
     private var metricsFetchInFlight = false
     private var storageFetchInFlight = false
     private var processesFetchInFlight = false
+    private var containersFetchInFlight = false
+    private var imagesFetchInFlight = false
+    private var containerDetailFetchInFlight = false
+    private var imageDetailFetchInFlight = false
+    private var containerSummaryFetchInFlight = false
+    private var containerMetricsFetchInFlight = false
+    private var selectedContainerMetricsFetchInFlight = false
+    private var lastSelectedContainerMetricsUpdatedEpochMs: Int64?
+
+    var selectedContainer: RuntimeContainerListItem? {
+        guard let selectedContainerID else { return nil }
+        return containers.first { $0.id == selectedContainerID }
+    }
+
+    var containerWorker: AppManagerWorkerRecord? {
+        workers.first(where: { $0.instanceName == Self.containerInstanceName })
+    }
+
+    var hasContainerRuntime: Bool {
+        containerWorker != nil || fileManager.fileExists(atPath: paths.distroDirectory(named: Self.containerInstanceName).path)
+    }
+
+    var selectedContainerPage: ContainerDesktopPage? {
+        switch selectedInstanceName {
+        case Self.containerListSelection:
+            return .containers
+        case Self.imageListSelection:
+            return .images
+        case Self.containerRuntimeSelection:
+            return .runtime
+        case Self.containerMetricsSelection:
+            return .metrics
+        default:
+            return nil
+        }
+    }
 
     var activeWorkers: [AppManagerWorkerRecord] {
         workers.filter { $0.lifecycleState == .running || $0.lifecycleState == .starting }
@@ -237,6 +318,11 @@ final class DashboardModel: ObservableObject {
         lastMetricsUpdatedEpochMs = nil
         lastStorageUpdatedEpochMs = nil
         lastProcessesUpdatedEpochMs = nil
+        selectedContainerID = nil
+        selectedImageID = nil
+        containerDetail = nil
+        containerStats = nil
+        imageDetail = nil
         refreshSelectedDataIfNeeded(force: true)
     }
 
@@ -277,6 +363,32 @@ final class DashboardModel: ObservableObject {
         refreshSelectedDataIfNeeded(force: true, only: .processes)
     }
 
+    func refreshContainers() {
+        fetchContainersIfPossible(force: true)
+    }
+
+    func refreshImages() {
+        fetchImagesIfPossible(force: true)
+    }
+
+    func startContainerRuntime() {
+        start(instanceName: Self.containerInstanceName)
+    }
+
+    func selectContainer(id: String?) {
+        guard selectedContainerID != id else { return }
+        selectedContainerID = id
+        containerDetail = nil
+        containerStats = nil
+    }
+
+    func selectImage(id: String?) {
+        guard selectedImageID != id else { return }
+        selectedImageID = id
+        imageDetail = nil
+        fetchImageDetailIfPossible(force: true)
+    }
+
     func showDashboard() {
         NSApp.activate(ignoringOtherApps: true)
         NSApp.windows.first?.makeKeyAndOrderFront(nil)
@@ -299,12 +411,19 @@ final class DashboardModel: ObservableObject {
             return
         }
         guard let selectedInstanceName else { return }
+        if selectedContainerPage != nil {
+            return
+        }
         if !installedInstances.contains(selectedInstanceName) {
             self.selectedInstanceName = installedInstances.first
         }
     }
 
     private func refreshSelectedDataIfNeeded(force: Bool, only tab: DashboardTab? = nil) {
+        if selectedContainerPage != nil {
+            refreshSelectedContainerDataIfNeeded(force: force)
+            return
+        }
         guard let selectedInstanceName else { return }
         let selectedWorker = workers.first(where: { $0.instanceName == selectedInstanceName })
 
@@ -337,6 +456,29 @@ final class DashboardModel: ObservableObject {
             if force || shouldFetch(lastUpdatedEpochMs: lastProcessesUpdatedEpochMs, now: now, intervalMs: 4_000) {
                 fetchProcessesIfPossible(instanceName: selectedInstanceName, worker: selectedWorker)
             }
+        }
+    }
+
+    private func refreshSelectedContainerDataIfNeeded(force: Bool) {
+        switch selectedContainerPage {
+        case .containers:
+            fetchContainerSummaryIfPossible()
+            fetchContainersIfPossible(force: force)
+            fetchContainerDetailIfPossible(force: force)
+            fetchSelectedContainerMetricsIfPossible(force: force)
+            fetchContainerMetricsIfPossible(force: force, selectedOnly: false)
+        case .images:
+            fetchContainerSummaryIfPossible()
+            fetchImagesIfPossible(force: force)
+            fetchImageDetailIfPossible(force: force)
+        case .runtime:
+            fetchContainerSummaryIfPossible()
+        case .metrics:
+            fetchContainerSummaryIfPossible()
+            fetchContainersIfPossible(force: force)
+            fetchContainerMetricsIfPossible(force: force, selectedOnly: false)
+        case nil:
+            break
         }
     }
 
@@ -455,6 +597,304 @@ final class DashboardModel: ObservableObject {
         }
     }
 
+    private func fetchContainerSummaryIfPossible() {
+        guard let worker = containerWorker, worker.lifecycleState == .running, !containerSummaryFetchInFlight else { return }
+        let now = nowEpochMs()
+        guard shouldFetch(lastUpdatedEpochMs: lastContainerSummaryUpdatedEpochMs, now: now, intervalMs: 5_000) else { return }
+        containerSummaryFetchInFlight = true
+        let socketPath = worker.controlSocketPath
+        let request = RuntimeControlRequest(op: "container_runtime_summary", instance: Self.containerInstanceName)
+        Task.detached {
+            do {
+                let client = RuntimeControlClient(socketPath: socketPath)
+                let response = try client.send(request)
+                await MainActor.run {
+                    if self.containerSummary != response.containerRuntimeSummary {
+                        self.containerSummary = response.containerRuntimeSummary
+                    }
+                    self.lastContainerSummaryUpdatedEpochMs = response.containerRuntimeSummary?.sampledAtEpochMs ?? nowEpochMs()
+                    if let error = response.error, !response.ok {
+                        self.selectedTabError = error
+                    }
+                }
+            } catch {
+                await MainActor.run {
+                    self.selectedTabError = String(describing: error)
+                }
+            }
+            await MainActor.run {
+                self.containerSummaryFetchInFlight = false
+            }
+        }
+    }
+
+    private func fetchContainersIfPossible(force: Bool) {
+        guard let worker = containerWorker, worker.lifecycleState == .running, !containersFetchInFlight else { return }
+        let now = nowEpochMs()
+        guard force || shouldFetch(lastUpdatedEpochMs: lastContainersUpdatedEpochMs, now: now, intervalMs: 5_000) else { return }
+        containersFetchInFlight = true
+        let socketPath = worker.controlSocketPath
+        let request = RuntimeControlRequest(op: "container_ls", instance: Self.containerInstanceName)
+        Task.detached {
+            do {
+                let client = RuntimeControlClient(socketPath: socketPath)
+                let response = try client.send(request)
+                await MainActor.run {
+                    let next = response.containers ?? []
+                    if self.containers != next {
+                        self.containers = next
+                    }
+                    self.lastContainersUpdatedEpochMs = nowEpochMs()
+                    if self.selectedContainerID == nil {
+                        self.selectedContainerID = self.containers.first?.id
+                    }
+                    if let error = response.error, !response.ok {
+                        self.selectedTabError = error
+                    }
+                }
+            } catch {
+                await MainActor.run {
+                    self.selectedTabError = String(describing: error)
+                }
+            }
+            await MainActor.run {
+                self.containersFetchInFlight = false
+            }
+        }
+    }
+
+    private func fetchContainerDetailIfPossible(force: Bool) {
+        guard let worker = containerWorker, worker.lifecycleState == .running,
+              let id = selectedContainerID, !containerDetailFetchInFlight else { return }
+        containerDetailFetchInFlight = true
+        let socketPath = worker.controlSocketPath
+        let request = RuntimeControlRequest(op: "container_inspect", instance: Self.containerInstanceName, containerID: id)
+        Task.detached {
+            do {
+                let client = RuntimeControlClient(socketPath: socketPath)
+                let detailResponse = try client.send(request)
+                await MainActor.run {
+                    guard self.selectedContainerID == id else { return }
+                    self.containerDetail = detailResponse.containerDetail
+                    self.containerStats = self.containerStatsByID[id]
+                    if let error = detailResponse.error, !detailResponse.ok {
+                        self.selectedTabError = error
+                    }
+                }
+            } catch {
+                await MainActor.run {
+                    self.selectedTabError = String(describing: error)
+                }
+            }
+            await MainActor.run {
+                self.containerDetailFetchInFlight = false
+            }
+        }
+    }
+
+    private func fetchContainerMetricsIfPossible(force: Bool, selectedOnly: Bool) {
+        guard let worker = containerWorker, worker.lifecycleState == .running, !containerMetricsFetchInFlight else { return }
+        let now = nowEpochMs()
+        guard force || shouldFetch(lastUpdatedEpochMs: lastContainerMetricsUpdatedEpochMs, now: now, intervalMs: 8_000) else { return }
+        let ids = containers.filter(isUpContainer).map(\.id)
+        guard !ids.isEmpty else { return }
+        containerMetricsFetchInFlight = true
+        let socketPath = worker.controlSocketPath
+        let request = RuntimeControlRequest(
+            op: "container_stats_batch",
+            instance: Self.containerInstanceName,
+            containerIDs: ids
+        )
+        Task.detached {
+            do {
+                let client = RuntimeControlClient(socketPath: socketPath)
+                let response = try client.send(request)
+                await MainActor.run {
+                    var next = self.containerStatsByID
+                    for stats in response.containerStatsList ?? [] {
+                        next[stats.id] = stats
+                    }
+                    if next != self.containerStatsByID {
+                        self.containerStatsByID = next
+                    }
+                    if let selected = self.selectedContainerID {
+                        self.containerStats = next[selected]
+                    }
+                    self.lastContainerMetricsUpdatedEpochMs = nowEpochMs()
+                    if let error = response.error, !response.ok {
+                        self.selectedTabError = error
+                    }
+                }
+            } catch {
+                await MainActor.run {
+                    self.selectedTabError = String(describing: error)
+                }
+            }
+            await MainActor.run {
+                self.containerMetricsFetchInFlight = false
+            }
+        }
+    }
+
+    private func fetchSelectedContainerMetricsIfPossible(force: Bool) {
+        guard let worker = containerWorker, worker.lifecycleState == .running,
+              let selectedContainer = selectedContainer,
+              isUpContainer(selectedContainer),
+              let id = selectedContainerID,
+              !selectedContainerMetricsFetchInFlight else { return }
+        let now = nowEpochMs()
+        guard force || shouldFetch(lastUpdatedEpochMs: lastSelectedContainerMetricsUpdatedEpochMs, now: now, intervalMs: 2_000) else { return }
+        selectedContainerMetricsFetchInFlight = true
+        let socketPath = worker.controlSocketPath
+        let request = RuntimeControlRequest(
+            op: "container_stats_batch",
+            instance: Self.containerInstanceName,
+            containerIDs: [id]
+        )
+        Task.detached {
+            do {
+                let client = RuntimeControlClient(socketPath: socketPath)
+                let response = try client.send(request)
+                await MainActor.run {
+                    guard self.selectedContainerID == id else { return }
+                    var next = self.containerStatsByID
+                    for stats in response.containerStatsList ?? [] {
+                        next[stats.id] = stats
+                    }
+                    if next != self.containerStatsByID {
+                        self.containerStatsByID = next
+                    }
+                    self.containerStats = next[id]
+                    self.lastSelectedContainerMetricsUpdatedEpochMs = nowEpochMs()
+                    if let error = response.error, !response.ok {
+                        self.selectedTabError = error
+                    }
+                }
+            } catch {
+                await MainActor.run {
+                    self.selectedTabError = String(describing: error)
+                }
+            }
+            await MainActor.run {
+                self.selectedContainerMetricsFetchInFlight = false
+            }
+        }
+    }
+
+    private func fetchImagesIfPossible(force: Bool) {
+        guard let worker = containerWorker, worker.lifecycleState == .running, !imagesFetchInFlight else { return }
+        let now = nowEpochMs()
+        guard force || shouldFetch(lastUpdatedEpochMs: lastImagesUpdatedEpochMs, now: now, intervalMs: 5_000) else { return }
+        imagesFetchInFlight = true
+        let socketPath = worker.controlSocketPath
+        let request = RuntimeControlRequest(op: "image_ls", instance: Self.containerInstanceName)
+        Task.detached {
+            do {
+                let client = RuntimeControlClient(socketPath: socketPath)
+                let response = try client.send(request)
+                await MainActor.run {
+                    let next = response.images ?? []
+                    if self.images != next {
+                        self.images = next
+                    }
+                    self.lastImagesUpdatedEpochMs = nowEpochMs()
+                    if self.selectedImageID == nil {
+                        self.selectedImageID = self.images.first?.id
+                    }
+                    if let error = response.error, !response.ok {
+                        self.selectedTabError = error
+                    }
+                }
+            } catch {
+                await MainActor.run {
+                    self.selectedTabError = String(describing: error)
+                }
+            }
+            await MainActor.run {
+                self.imagesFetchInFlight = false
+            }
+        }
+    }
+
+    private func fetchImageDetailIfPossible(force: Bool) {
+        guard let worker = containerWorker, worker.lifecycleState == .running,
+              let id = selectedImageID, !imageDetailFetchInFlight else { return }
+        imageDetailFetchInFlight = true
+        let socketPath = worker.controlSocketPath
+        let request = RuntimeControlRequest(op: "image_inspect", instance: Self.containerInstanceName, imageID: id)
+        Task.detached {
+            do {
+                let client = RuntimeControlClient(socketPath: socketPath)
+                let response = try client.send(request)
+                await MainActor.run {
+                    guard self.selectedImageID == id else { return }
+                    self.imageDetail = response.imageDetail
+                    if let error = response.error, !response.ok {
+                        self.selectedTabError = error
+                    }
+                }
+            } catch {
+                await MainActor.run {
+                    self.selectedTabError = String(describing: error)
+                }
+            }
+            await MainActor.run {
+                self.imageDetailFetchInFlight = false
+            }
+        }
+    }
+
+    func performContainerAction(_ op: String) {
+        guard let worker = containerWorker, let id = selectedContainerID else { return }
+        let socketPath = worker.controlSocketPath
+        let request = RuntimeControlRequest(op: op, instance: Self.containerInstanceName, containerID: id)
+        Task.detached {
+            await self.runRuntimeAction(socketPath: socketPath, request: request)
+            await MainActor.run { self.refreshContainers() }
+        }
+    }
+
+    func performImageAction(_ op: String) {
+        guard let worker = containerWorker, let id = selectedImageID else { return }
+        let socketPath = worker.controlSocketPath
+        let request = RuntimeControlRequest(op: op, instance: Self.containerInstanceName, imageID: id)
+        Task.detached {
+            await self.runRuntimeAction(socketPath: socketPath, request: request)
+            await MainActor.run { self.refreshImages() }
+        }
+    }
+
+    func performPrune(_ op: String) {
+        guard let worker = containerWorker else { return }
+        let socketPath = worker.controlSocketPath
+        let request = RuntimeControlRequest(op: op, instance: Self.containerInstanceName)
+        Task.detached {
+            await self.runRuntimeAction(socketPath: socketPath, request: request)
+            await MainActor.run {
+                self.refreshContainers()
+                self.refreshImages()
+            }
+        }
+    }
+
+    nonisolated private func runRuntimeAction(socketPath: String, request: RuntimeControlRequest) async {
+        do {
+            let client = RuntimeControlClient(socketPath: socketPath)
+            let response = try client.send(request)
+            await MainActor.run {
+                if !response.ok {
+                    self.selectedTabError = response.error ?? "container action failed"
+                } else if let reclaimed = response.meta?["reclaimed"], !reclaimed.isEmpty {
+                    self.selectedTabError = reclaimed
+                }
+            }
+        } catch {
+            await MainActor.run {
+                self.selectedTabError = String(describing: error)
+            }
+        }
+    }
+
     private func statusSummary() -> DashboardStatusSummary {
         let runningCount = workers.filter { $0.lifecycleState == .running }.count
         let bootingCount = workers.filter { $0.lifecycleState == .starting }.count
@@ -510,6 +950,14 @@ struct DashboardView: View {
                     )
                     .tag(name)
                 }
+                if model.hasContainerRuntime {
+                    Section("Containers") {
+                        ForEach(ContainerDesktopPage.allCases) { page in
+                            ContainerSidebarRow(page: page)
+                            .tag(selectionKey(for: page))
+                        }
+                    }
+                }
             }
             .navigationSplitViewColumnWidth(min: 280, ideal: 320)
         } detail: {
@@ -518,7 +966,9 @@ struct DashboardView: View {
                     Text(managerError)
                         .foregroundStyle(.red)
                 }
-                if let selected = model.selectedSummary {
+                if let page = model.selectedContainerPage {
+                    ContainerDashboardPageView(model: model, page: page)
+                } else if let selected = model.selectedSummary {
                     DetailHeader(summary: selected, detail: model.detail)
                     Picker("Tab", selection: Binding(
                         get: { model.selectedTab },
@@ -573,6 +1023,16 @@ struct DashboardView: View {
     }
 }
 
+@MainActor
+private func selectionKey(for page: ContainerDesktopPage) -> String {
+    switch page {
+    case .containers: return DashboardModel.containerListSelection
+    case .images: return DashboardModel.imageListSelection
+    case .runtime: return DashboardModel.containerRuntimeSelection
+    case .metrics: return DashboardModel.containerMetricsSelection
+    }
+}
+
 private struct SidebarRow: View {
     let name: String
     let worker: AppManagerWorkerRecord?
@@ -600,6 +1060,314 @@ private struct SidebarRow: View {
             .buttonStyle(.bordered)
         }
         .padding(.vertical, 6)
+    }
+}
+
+private struct ContainerSidebarRow: View {
+    let page: ContainerDesktopPage
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label(page.title, systemImage: page.systemImage)
+                .font(.headline)
+        }
+        .padding(.vertical, 6)
+    }
+}
+
+private struct ContainerDashboardPageView: View {
+    @ObservedObject var model: DashboardModel
+    let page: ContainerDesktopPage
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(page.title)
+                        .font(.largeTitle.weight(.semibold))
+                }
+                Spacer()
+                if model.containerWorker?.lifecycleState != .running {
+                    Button("Start Runtime") { model.startContainerRuntime() }
+                        .buttonStyle(.borderedProminent)
+                }
+            }
+            if let selectedTabError = model.selectedTabError {
+                Text(selectedTabError)
+                    .foregroundStyle(.red)
+                    .font(.callout)
+            }
+            if model.containerWorker?.lifecycleState == .running {
+                switch page {
+                case .containers:
+                    ContainerListPanel(model: model)
+                case .images:
+                    ImageListPanel(model: model)
+                case .runtime:
+                    ContainerRuntimePanel(summary: model.containerSummary)
+                case .metrics:
+                    ContainerMetricsPanel(containers: model.containers, statsByID: model.containerStatsByID, updatedEpochMs: model.lastContainerMetricsUpdatedEpochMs)
+                }
+            } else {
+                Text("Start the internal container runtime to inspect containers and images.")
+                    .foregroundStyle(.secondary)
+                Spacer()
+            }
+        }
+    }
+}
+
+private struct ContainerListPanel: View {
+    @ObservedObject var model: DashboardModel
+    @State private var sortOrder = [KeyPathComparator(\RuntimeContainerListItem.name)]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                UpdatedAtView(epochMs: model.lastContainersUpdatedEpochMs)
+                Spacer()
+                Button("Refresh") { model.refreshContainers() }
+                if let selected = model.selectedContainer {
+                    if canStartContainer(selected) {
+                        Button("Start") { model.performContainerAction("container_start") }
+                    }
+                    if canStopContainer(selected) {
+                        Button("Stop") { model.performContainerAction("container_stop") }
+                        Button("Restart") { model.performContainerAction("container_restart") }
+                    }
+                    Button("Remove") {
+                        if confirmDestructive(title: "Remove Container?", text: "This removes the selected container.") {
+                            model.performContainerAction("container_rm")
+                        }
+                    }
+                }
+                Button("Prune") {
+                    if confirmDestructive(title: "Prune Stopped Containers?", text: "This removes all stopped containers.") {
+                        model.performPrune("container_prune")
+                    }
+                }
+            }
+            .buttonStyle(.bordered)
+            HSplitView {
+                Table(model.containers.sorted(using: sortOrder), selection: Binding(
+                    get: { model.selectedContainerID },
+                    set: { model.selectContainer(id: $0) }
+                ), sortOrder: $sortOrder) {
+                    TableColumn("Name", value: \.name)
+                    TableColumn("Image", value: \.image)
+                    TableColumn("Status") { Text(containerStatusDisplay($0)) }
+                        .width(min: 92, ideal: 120, max: 160)
+                    TableColumn("CPU") { item in
+                        Text(containerCPUDisplay(item, stats: model.containerStatsByID[item.id]))
+                    }
+                    .width(min: 56, ideal: 70, max: 82)
+                    TableColumn("Memory") { item in
+                        Text(containerMemoryDisplay(item, stats: model.containerStatsByID[item.id]))
+                    }
+                    .width(min: 80, ideal: 96, max: 120)
+                    TableColumn("Ports") { Text($0.ports ?? "-").lineLimit(1) }
+                }
+                .frame(minWidth: 620, idealWidth: 760, maxWidth: .infinity)
+                ContainerDetailPanel(detail: model.containerDetail)
+                    .frame(minWidth: 480, idealWidth: 560, maxWidth: .infinity)
+            }
+        }
+    }
+}
+
+private struct ContainerRuntimePanel: View {
+    let summary: RuntimeContainerRuntimeSummary?
+
+    var body: some View {
+        MetricSection(title: "Runtime") {
+            DetailMetricRow(label: "containerd", value: summary?.containerdHealthy == true ? "healthy" : "unavailable")
+            DetailMetricRow(label: "buildkit", value: summary?.buildkitdHealthy == true ? "healthy" : "unavailable")
+            DetailMetricRow(label: "Containers", value: summary?.containerCount.map(String.init) ?? "-")
+            DetailMetricRow(label: "Images", value: summary?.imageCount.map(String.init) ?? "-")
+            DetailMetricRow(label: "Updated", value: summary.map { formatDate(epochMs: $0.sampledAtEpochMs) } ?? "-")
+        }
+        Spacer()
+    }
+}
+
+private struct ContainerMetricsPanel: View {
+    let containers: [RuntimeContainerListItem]
+    let statsByID: [String: RuntimeContainerStats]
+    let updatedEpochMs: Int64?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            UpdatedAtView(epochMs: updatedEpochMs)
+            Table(containers.filter(isUpContainer)) {
+                TableColumn("Name", value: \.name)
+                TableColumn("CPU") { item in
+                    Text(percentString(statsByID[item.id]?.cpuPercent))
+                }
+                TableColumn("Memory") { item in
+                    Text(statsByID[item.id]?.memoryUsageBytes.map(formatBytes) ?? "-")
+                }
+                TableColumn("Memory Limit") { item in
+                    Text(formatContainerMemoryLimit(statsByID[item.id]))
+                }
+                TableColumn("Network RX") { item in
+                    Text(statsByID[item.id]?.networkRxBytes.map(formatBytes) ?? "-")
+                }
+                TableColumn("Network TX") { item in
+                    Text(statsByID[item.id]?.networkTxBytes.map(formatBytes) ?? "-")
+                }
+            }
+        }
+    }
+}
+
+private func isUpContainer(_ container: RuntimeContainerListItem) -> Bool {
+    if let state = normalizedContainerLifecycleText(container.state),
+       state == "running" || state == "up" {
+        return true
+    }
+    guard let status = normalizedContainerLifecycleText(container.status) else {
+        return false
+    }
+    return status == "up" || status.hasPrefix("up ")
+}
+
+private func containerStatusDisplay(_ container: RuntimeContainerListItem) -> String {
+    let status = container.status?.trimmingCharacters(in: .whitespacesAndNewlines)
+    if let status, !status.isEmpty {
+        return status
+    }
+    let state = container.state?.trimmingCharacters(in: .whitespacesAndNewlines)
+    if let state, !state.isEmpty {
+        return state
+    }
+    return "-"
+}
+
+private func containerCPUDisplay(_ container: RuntimeContainerListItem, stats: RuntimeContainerStats?) -> String {
+    guard isUpContainer(container) else { return "-" }
+    return percentString(stats?.cpuPercent)
+}
+
+private func containerMemoryDisplay(_ container: RuntimeContainerListItem, stats: RuntimeContainerStats?) -> String {
+    guard isUpContainer(container) else { return "-" }
+    return stats?.memoryUsageBytes.map(formatBytes) ?? "-"
+}
+
+private func canStartContainer(_ container: RuntimeContainerListItem) -> Bool {
+    guard let state = normalizedContainerLifecycleText(container.state) ?? normalizedContainerLifecycleText(container.status) else {
+        return true
+    }
+    return !(state == "running" || state == "up" || state.hasPrefix("up "))
+}
+
+private func canStopContainer(_ container: RuntimeContainerListItem) -> Bool {
+    guard let state = normalizedContainerLifecycleText(container.state) ?? normalizedContainerLifecycleText(container.status) else {
+        return false
+    }
+    return state == "running" || state == "up" || state.hasPrefix("up ")
+}
+
+private func normalizedContainerLifecycleText(_ value: String?) -> String? {
+    let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    guard let trimmed, !trimmed.isEmpty, trimmed != "-" else { return nil }
+    return trimmed
+}
+
+private struct ContainerDetailPanel: View {
+    let detail: RuntimeContainerDetail?
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                if let detail {
+                    MetricSection(title: detail.name) {
+                        DetailMetricRow(label: "ID", value: detail.id)
+                        DetailMetricRow(label: "Image", value: detail.image ?? "-")
+                        DetailMetricRow(label: "State", value: detail.state ?? "-")
+                        DetailMetricRow(label: "Command", value: detail.command ?? "-")
+                        DetailMetricRow(label: "Created", value: detail.created ?? "-")
+                    }
+                    stringListSection("Ports", detail.ports)
+                    stringListSection("Storage / Mounts", detail.mounts)
+                    stringListSection("Networks", detail.networks)
+                    keyValueSection("Labels", detail.labels)
+                } else {
+                    Text("Select a container to inspect details.")
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(.leading, 12)
+        }
+    }
+}
+
+private struct ImageListPanel: View {
+    @ObservedObject var model: DashboardModel
+    @State private var sortOrder = [KeyPathComparator(\RuntimeImageListItem.repository)]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                UpdatedAtView(epochMs: model.lastImagesUpdatedEpochMs)
+                Spacer()
+                Button("Refresh") { model.refreshImages() }
+                Button("Remove Image") {
+                    if confirmDestructive(title: "Remove Image?", text: "This removes the selected image if no container depends on it.") {
+                        model.performImageAction("image_rm")
+                    }
+                }
+                .disabled(model.selectedImageID == nil)
+                Button("Prune Unused") {
+                    if confirmDestructive(title: "Prune Unused Images?", text: "This removes unused images from the container runtime.") {
+                        model.performPrune("image_prune")
+                    }
+                }
+            }
+            .buttonStyle(.bordered)
+            HSplitView {
+                Table(model.images.sorted(using: sortOrder), selection: Binding(
+                    get: { model.selectedImageID },
+                    set: { model.selectImage(id: $0) }
+                ), sortOrder: $sortOrder) {
+                    TableColumn("Repository", value: \.repository)
+                    TableColumn("Tag", value: \.tag)
+                    TableColumn("Image ID", value: \.id) { Text($0.id).lineLimit(1) }
+                    TableColumn("Created") { Text($0.created ?? "-") }
+                    TableColumn("Size") { Text($0.size ?? "-") }
+                        .width(min: 80, ideal: 96, max: 120)
+                }
+                .frame(minWidth: 620, idealWidth: 760, maxWidth: .infinity)
+                ImageDetailPanel(detail: model.imageDetail)
+                    .frame(minWidth: 480, idealWidth: 560, maxWidth: .infinity)
+            }
+        }
+    }
+}
+
+private struct ImageDetailPanel: View {
+    let detail: RuntimeImageDetail?
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                if let detail {
+                    MetricSection(title: "Image") {
+                        DetailMetricRow(label: "ID", value: detail.id)
+                        DetailMetricRow(label: "Architecture", value: detail.architecture ?? "-")
+                        DetailMetricRow(label: "OS", value: detail.os ?? "-")
+                        DetailMetricRow(label: "Created", value: detail.created ?? "-")
+                        DetailMetricRow(label: "Size", value: detail.sizeBytes.map(formatBytes) ?? "-")
+                    }
+                    stringListSection("Tags", detail.repoTags)
+                    stringListSection("Digests", detail.repoDigests)
+                    keyValueSection("Labels", detail.labels)
+                } else {
+                    Text("Select an image to inspect details.")
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(.leading, 12)
+        }
     }
 }
 
@@ -1092,6 +1860,46 @@ private struct ProcessesTab: View {
     }
 }
 
+@ViewBuilder
+private func stringListSection(_ title: String, _ values: [String]) -> some View {
+    MetricSection(title: title) {
+        if values.isEmpty {
+            DetailMetricRow(label: "Items", value: "-")
+        } else {
+            ForEach(values, id: \.self) { value in
+                Text(value)
+                    .font(.callout.monospaced())
+                    .lineLimit(nil)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+            }
+        }
+    }
+}
+
+@ViewBuilder
+private func keyValueSection(_ title: String, _ values: [String: String]) -> some View {
+    MetricSection(title: title) {
+        if values.isEmpty {
+            DetailMetricRow(label: "Items", value: "-")
+        } else {
+            ForEach(values.keys.sorted(), id: \.self) { key in
+                DetailMetricRow(label: key, value: values[key] ?? "")
+            }
+        }
+    }
+}
+
+private func confirmDestructive(title: String, text: String) -> Bool {
+    let alert = NSAlert()
+    alert.alertStyle = .warning
+    alert.messageText = title
+    alert.informativeText = text
+    alert.addButton(withTitle: "Continue")
+    alert.addButton(withTitle: "Cancel")
+    return alert.runModal() == .alertFirstButtonReturn
+}
+
 private struct MetricSection<Content: View>: View {
     let title: String
     @ViewBuilder var content: Content
@@ -1123,6 +1931,26 @@ private struct MetricRow: View {
             Text(value)
                 .monospacedDigit()
                 .textSelection(.enabled)
+        }
+    }
+}
+
+private struct DetailMetricRow: View {
+    let label: String
+    let value: String
+
+    var body: some View {
+        Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 4) {
+            GridRow(alignment: .top) {
+                Text(label)
+                    .foregroundStyle(.secondary)
+                    .frame(width: 96, alignment: .leading)
+                Text(value)
+                    .monospacedDigit()
+                    .textSelection(.enabled)
+                    .lineLimit(nil)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
     }
 }
@@ -1184,6 +2012,14 @@ private func formatProcessMemory(_ bytes: UInt64) -> String {
         return String(format: "%.1f MB", mebibytes)
     }
     return String(format: "%.2f MB", mebibytes)
+}
+
+private func formatContainerMemoryLimit(_ stats: RuntimeContainerStats?) -> String {
+    guard let stats else { return "-" }
+    if stats.memoryLimitUnlimited == true {
+        return "Unlimited"
+    }
+    return stats.memoryLimitBytes.map(formatBytes) ?? "-"
 }
 
 private func formatDuration(seconds: Int64) -> String {

@@ -3367,20 +3367,19 @@ public final class RuntimeManager {
             return rawPath
         }
         if trimmed.hasPrefix("/") {
-            return URL(fileURLWithPath: trimmed).resolvingSymlinksInPath().path
+            return URL(fileURLWithPath: trimmed).standardizedFileURL.path
         }
         if trimmed.contains("/") {
             let cwd = URL(fileURLWithPath: fileManager.currentDirectoryPath, isDirectory: true)
             return URL(fileURLWithPath: trimmed, relativeTo: cwd)
                 .standardizedFileURL
-                .resolvingSymlinksInPath()
                 .path
         }
         if let pathEnv = ProcessInfo.processInfo.environment["PATH"] {
             for dir in pathEnv.split(separator: ":") {
                 let candidate = String(dir) + "/" + trimmed
                 if fileManager.isExecutableFile(atPath: candidate) {
-                    return URL(fileURLWithPath: candidate).resolvingSymlinksInPath().path
+                    return URL(fileURLWithPath: candidate).standardizedFileURL.path
                 }
             }
         }
