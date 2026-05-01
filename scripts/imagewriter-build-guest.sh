@@ -594,18 +594,23 @@ extract_rootfs() {
     normalize_root_fstab
     return
   fi
+  tar_extract_preserve() {
+    archive="$1"
+    shift
+    tar --numeric-owner --same-owner -p "$@" "$archive" -C "$ROOTFS_DIR"
+  }
   case "$ROOTFS_ARCHIVE" in
     *.tar.gz|*.tgz)
-      tar -xzf "$ROOTFS_ARCHIVE" -C "$ROOTFS_DIR"
+      tar_extract_preserve "$ROOTFS_ARCHIVE" -xzf
       ;;
     *.tar.xz)
-      tar -xJf "$ROOTFS_ARCHIVE" -C "$ROOTFS_DIR"
+      tar_extract_preserve "$ROOTFS_ARCHIVE" -xJf
       ;;
     *.tar.zst|*.tzst)
-      tar --zstd -xf "$ROOTFS_ARCHIVE" -C "$ROOTFS_DIR"
+      tar_extract_preserve "$ROOTFS_ARCHIVE" --zstd -xf
       ;;
     *)
-      tar -xf "$ROOTFS_ARCHIVE" -C "$ROOTFS_DIR"
+      tar_extract_preserve "$ROOTFS_ARCHIVE" -xf
       ;;
   esac
   normalize_root_fstab

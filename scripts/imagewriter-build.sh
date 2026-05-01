@@ -15,6 +15,9 @@ INIT_BINARY_PATH="${IMAGEWRITER_INIT_BINARY:-}"
 EARLY_INIT_BINARY_PATH="${IMAGEWRITER_EARLY_INIT_BINARY:-}"
 RUN_TIMEOUT="${IMAGEWRITER_RUN_TIMEOUT:-900}"
 IMAGEWRITER_PACKAGES="${IMAGEWRITER_PACKAGES:-btrfs-progs e2fsprogs erofs-utils util-linux tar zstd xz coreutils}"
+if [ "${IMAGEWRITER_ROOTFS_PACKAGES+x}" != "x" ]; then
+  IMAGEWRITER_ROOTFS_PACKAGES="$IMAGEWRITER_PACKAGES"
+fi
 IMAGEWRITER_APK_CACHE_DIR="${IMAGEWRITER_APK_CACHE_DIR:-}"
 IMAGEWRITER_APK_RETRY_LIMIT="${IMAGEWRITER_APK_RETRY_LIMIT:-5}"
 IMAGEWRITER_RUNTIME_SUMMARY_PATH="${IMAGEWRITER_RUNTIME_SUMMARY_PATH:-}"
@@ -507,19 +510,31 @@ copy_if_needed() {
   fi
 }
 
+remove_staged_tree() {
+  target="$1"
+  if [ ! -e "$target" ]; then
+    return 0
+  fi
+  if rm -rf "$target" 2>/dev/null; then
+    return 0
+  fi
+  chmod -R u+rwX "$target" 2>/dev/null || true
+  rm -rf "$target"
+}
+
 if [ -n "$ROOTFS_TARBALL" ]; then
   copy_if_needed "$ROOTFS_TARBALL" "$STAGE_ROOTFS"
 elif [ -n "$OCI_LAYOUT_DIR" ]; then
-  rm -rf "$STAGE_OCI_LAYOUT_DIR"
+  remove_staged_tree "$STAGE_OCI_LAYOUT_DIR"
   mkdir -p "$STAGE_OCI_LAYOUT_DIR"
   cp -R "$OCI_LAYOUT_DIR"/. "$STAGE_OCI_LAYOUT_DIR"/
 else
-  rm -rf "$STAGE_ROOTFS_DIR"
+  remove_staged_tree "$STAGE_ROOTFS_DIR"
   mkdir -p "$STAGE_ROOTFS_DIR"
   cp -R "$ROOTFS_DIR"/. "$STAGE_ROOTFS_DIR"/
 fi
 if [ -n "$STAGE_EXTRA_GUEST_FILES" ]; then
-  rm -rf "$STAGE_EXTRA_GUEST_FILES"
+  remove_staged_tree "$STAGE_EXTRA_GUEST_FILES"
   mkdir -p "$STAGE_EXTRA_GUEST_FILES"
   cp -R "$EXTRA_GUEST_FILES_BUNDLE"/. "$STAGE_EXTRA_GUEST_FILES"/
   if [ -f "$STAGE_EXTRA_GUEST_FILES/manifest.json" ]; then
@@ -886,7 +901,7 @@ if [ "$TWO_STAGE_IMAGEWRITER" -eq 1 ]; then
   fi
 
   mark_stage_start "stage1_ext4" "$GUEST_ROOTFS" "$GUEST_STAGE1_OUTPUT"
-  if run_guest_worker_with_retry stage1 "$GUEST_ROOTFS" "$GUEST_STAGE1_OUTPUT" "ext4" "$IMAGE_SIZE_MB" "$GUEST_INIT" "$IMAGEWRITER_PACKAGES" "$GUEST_APK_CACHE"; then
+  if run_guest_worker_with_retry stage1 "$GUEST_ROOTFS" "$GUEST_STAGE1_OUTPUT" "ext4" "$IMAGE_SIZE_MB" "$GUEST_INIT" "$IMAGEWRITER_ROOTFS_PACKAGES" "$GUEST_APK_CACHE"; then
     mark_stage_complete "stage1_ext4"
   else
     stage_code=$?
@@ -897,7 +912,7 @@ if [ "$TWO_STAGE_IMAGEWRITER" -eq 1 ]; then
 
   stage2_name="stage2_${IMAGE_FS}"
   mark_stage_start "$stage2_name" "$GUEST_ROOTFS" "$GUEST_STAGE2_OUTPUT"
-  if run_guest_worker_with_retry stage2 "$GUEST_ROOTFS" "$GUEST_STAGE2_OUTPUT" "$IMAGE_FS" "$IMAGE_SIZE_MB" "$GUEST_INIT" "$IMAGEWRITER_PACKAGES" "$GUEST_APK_CACHE"; then
+  if run_guest_worker_with_retry stage2 "$GUEST_ROOTFS" "$GUEST_STAGE2_OUTPUT" "$IMAGE_FS" "$IMAGE_SIZE_MB" "$GUEST_INIT" "$IMAGEWRITER_ROOTFS_PACKAGES" "$GUEST_APK_CACHE"; then
     mark_stage_complete "$stage2_name"
   else
     stage_code=$?
@@ -950,7 +965,7 @@ else
     stage_fail_exit=21
   else
     single_pass_mode="stage2"
-    single_pass_packages="$IMAGEWRITER_PACKAGES"
+    single_pass_packages="$IMAGEWRITER_ROOTFS_PACKAGES"
   fi
 
   mark_stage_start "$stage_name" "$GUEST_ROOTFS" "$GUEST_OUTPUT"

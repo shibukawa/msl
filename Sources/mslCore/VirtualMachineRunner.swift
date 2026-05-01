@@ -1661,11 +1661,43 @@ public final class VirtualMachineRunner {
             "check_command": checkCommand,
             "requested_role": role
         ])
-        throw MSLRuntimeError(
-            "init channel did not connect within \(timeoutSec)s; " +
-            "requested_role=\(role), init_mode=\(initMode), service_manager=\(serviceManager). " +
-            "check guest service with `\(checkCommand)` and inspect serial log at \(paths.serialConsoleLogFile.path)"
+        let diagnostic = Self.initHandshakeTimeoutMessage(
+            timeoutSec: timeoutSec,
+            role: role,
+            initMode: initMode,
+            serviceManager: serviceManager,
+            checkCommand: checkCommand,
+            serialLogPath: paths.serialConsoleLogFile.path
         )
+        throw MSLRuntimeError(diagnostic)
+    }
+
+    internal static func initHandshakeTimeoutMessage(
+        timeoutSec: Int,
+        role: String,
+        initMode: String,
+        serviceManager: String,
+        checkCommand: String,
+        serialLogPath: String
+    ) -> String {
+        var message = "init channel did not connect within \(timeoutSec)s; " +
+            "requested_role=\(role), init_mode=\(initMode), service_manager=\(serviceManager). " +
+            "check guest service with `\(checkCommand)` and inspect serial log at \(serialLogPath)"
+        if serialLogContainsRootFilesystemCorruption(serialLogPath) {
+            message += ". serial log contains root filesystem I/O or Btrfs corruption markers; the installed distro disk may need reinstall or rebuild after preserving any needed data"
+        }
+        return message
+    }
+
+    internal static func serialLogContainsRootFilesystemCorruption(_ path: String) -> Bool {
+        guard let data = FileManager.default.contents(atPath: path),
+              let text = String(data: data.suffix(256 * 1024), encoding: .utf8) else {
+            return false
+        }
+        let lowered = text.lowercased()
+        return lowered.contains("btrfs error")
+            || lowered.contains("parent transid verify failed")
+            || lowered.contains("input/output error")
     }
 
     private func shouldEmitInitHandshakeStderrLogs() -> Bool {

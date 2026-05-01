@@ -889,9 +889,244 @@ final class DistributionManagerTests: XCTestCase {
         XCTAssertTrue(recorded.contains("allow=0"))
         XCTAssertTrue(recorded.contains("required_fs=erofs"))
         XCTAssertTrue(recorded.contains("force_setup=0"))
-        XCTAssertTrue(recorded.contains("rootfs_tarball="))
-        XCTAssertFalse(recorded.contains("rootfs_tarball=/"))
-        XCTAssertTrue(recorded.contains("rootfs_dir=/"))
+        XCTAssertTrue(recorded.contains("rootfs_tarball=/"))
+        XCTAssertTrue(recorded.contains("rootfs_dir="))
+        XCTAssertFalse(recorded.contains("rootfs_dir=/"))
+    }
+
+    func testCreateImageWithImagewriterAcceptsAbsoluteShellSymlink() throws {
+        let ctx = try DistributionContext.make()
+        defer { ctx.cleanup() }
+
+        let localTarball = try ctx.makeRootfsArchiveWithAbsoluteShellSymlink(named: "alpine-rootfs.tar.gz")
+
+        let fakeInit = ctx.root.appendingPathComponent("msl-init-bootloader-fake-symlink-shell", isDirectory: false)
+        try Data(repeating: 0x42, count: 64).write(to: fakeInit)
+        setenv("MSL_INIT_BOOTLOADER_BINARY_PATH", fakeInit.path, 1)
+        defer { unsetenv("MSL_INIT_BOOTLOADER_BINARY_PATH") }
+
+        let recordedEnv = ctx.root.appendingPathComponent("imagewriter-symlink-env.txt", isDirectory: false)
+        let fakeImagewriter = ctx.root.appendingPathComponent("imagewriter-success-symlink.sh", isDirectory: false)
+        try ctx.makeShellScript(
+            at: fakeImagewriter,
+            contents: """
+            #!/bin/sh
+            {
+              printf 'rootfs_tarball=%s\n' "$ROOTFS_TARBALL"
+              printf 'rootfs_dir=%s\n' "$ROOTFS_DIR"
+            } > "\(recordedEnv.path)"
+            : > "$OUTPUT_RAW"
+            exit 0
+            """
+        )
+        setenv("MSL_IMAGEWRITER_BUILD_SCRIPT", fakeImagewriter.path, 1)
+        defer { unsetenv("MSL_IMAGEWRITER_BUILD_SCRIPT") }
+
+        let manager = ctx.makeManager()
+        _ = try manager.createImageWithImagewriter(
+            name: "alpine",
+            targetAlias: nil,
+            localFilePath: localTarball.path,
+            rebuild: false,
+            diskSizeGB: nil,
+            mslExecutablePath: "/usr/bin/true"
+        )
+
+        let recorded = try String(contentsOf: recordedEnv, encoding: .utf8)
+        XCTAssertTrue(recorded.contains("rootfs_tarball=/"))
+        XCTAssertTrue(recorded.contains("rootfs_dir="))
+        XCTAssertFalse(recorded.contains("rootfs_dir=/"))
+    }
+
+    func testAlpineManifestInstallPassesSudoRootFSPackageToImagewriter() throws {
+        let ctx = try DistributionContext.make()
+        defer { ctx.cleanup() }
+
+        let localTarball = try ctx.makeRootfsArchiveWithAbsoluteShellSymlink(named: "alpine-rootfs.tar.gz")
+        let sha = try ctx.sha256(of: localTarball)
+        let entry = DistributionManifestEntry(
+            id: "alpine-3.23-arm64",
+            distro: "alpine",
+            version: "3.23",
+            arch: "arm64",
+            tarballURL: "https://example.com/rootfs.tar.gz",
+            sha256: sha,
+            signatureURL: "https://example.com/rootfs.tar.gz.asc",
+            checksumURL: "https://example.com/rootfs.tar.gz.sha256",
+            signatureTarget: "artifact",
+            keyFingerprint: "F1",
+            supportState: .supported
+        )
+        let descriptor = DistributionInstallDescriptor(
+            canonicalName: "alpine-3.23",
+            aliases: ["alpine-3.23"],
+            manifestId: entry.id
+        )
+        try ctx.seedManifestCache(entry: entry, tarball: localTarball, sha256: sha)
+
+        let fakeInit = ctx.root.appendingPathComponent("msl-init-bootloader-fake-alpine-packages", isDirectory: false)
+        try Data(repeating: 0x45, count: 64).write(to: fakeInit)
+        setenv("MSL_INIT_BOOTLOADER_BINARY_PATH", fakeInit.path, 1)
+        defer { unsetenv("MSL_INIT_BOOTLOADER_BINARY_PATH") }
+
+        let recordedEnv = ctx.root.appendingPathComponent("imagewriter-alpine-packages-env.txt", isDirectory: false)
+        let fakeImagewriter = ctx.root.appendingPathComponent("imagewriter-success-alpine-packages.sh", isDirectory: false)
+        try ctx.makeShellScript(
+            at: fakeImagewriter,
+            contents: """
+            #!/bin/sh
+            {
+              printf 'rootfs_packages=%s\n' "$IMAGEWRITER_ROOTFS_PACKAGES"
+              printf 'imagewriter_packages=%s\n' "$IMAGEWRITER_PACKAGES"
+              printf 'rootfs_tarball=%s\n' "$ROOTFS_TARBALL"
+              printf 'rootfs_dir=%s\n' "$ROOTFS_DIR"
+            } > "\(recordedEnv.path)"
+            : > "$OUTPUT_RAW"
+            exit 0
+            """
+        )
+        setenv("MSL_IMAGEWRITER_BUILD_SCRIPT", fakeImagewriter.path, 1)
+        defer { unsetenv("MSL_IMAGEWRITER_BUILD_SCRIPT") }
+
+        let store = DistributionManifestStore(entries: [entry], installDescriptors: [descriptor])
+        let manager = DistributionManager(
+            paths: ctx.paths,
+            logger: MSLLogger(logFile: ctx.paths.logs.appendingPathComponent("test.log", isDirectory: false)),
+            manifestStore: store
+        )
+        _ = try manager.createImageWithImagewriter(
+            name: "alpine",
+            targetAlias: "alpine-3.23",
+            localFilePath: nil,
+            rebuild: false,
+            diskSizeGB: nil,
+            mslExecutablePath: "/usr/bin/true"
+        )
+
+        let recorded = try String(contentsOf: recordedEnv, encoding: .utf8)
+        XCTAssertTrue(recorded.contains("rootfs_packages=sudo"))
+        XCTAssertTrue(recorded.contains("imagewriter_packages=btrfs-progs"))
+        XCTAssertTrue(recorded.contains("rootfs_tarball=/"))
+        XCTAssertTrue(recorded.contains("rootfs_dir="))
+        XCTAssertFalse(recorded.contains("rootfs_dir=/"))
+    }
+
+    func testNonAlpineManifestInstallDoesNotInjectRootFSPackages() throws {
+        let ctx = try DistributionContext.make()
+        defer { ctx.cleanup() }
+
+        let localTarball = try ctx.makeRootfsArchive(named: "debian-rootfs.tar.gz")
+        let sha = try ctx.sha256(of: localTarball)
+        let entry = DistributionManifestEntry(
+            id: "debian-trixie-arm64",
+            distro: "debian",
+            version: "trixie",
+            arch: "arm64",
+            tarballURL: "https://example.com/rootfs.tar.gz",
+            sha256: sha,
+            signatureURL: "https://example.com/rootfs.tar.gz.asc",
+            checksumURL: "https://example.com/rootfs.tar.gz.sha256",
+            signatureTarget: "artifact",
+            keyFingerprint: "F1",
+            supportState: .supported
+        )
+        let descriptor = DistributionInstallDescriptor(
+            canonicalName: "debian-trixie",
+            aliases: ["debian-trixie"],
+            manifestId: entry.id
+        )
+        try ctx.seedManifestCache(entry: entry, tarball: localTarball, sha256: sha)
+
+        let fakeInit = ctx.root.appendingPathComponent("msl-init-bootloader-fake-debian-packages", isDirectory: false)
+        try Data(repeating: 0x46, count: 64).write(to: fakeInit)
+        setenv("MSL_INIT_BOOTLOADER_BINARY_PATH", fakeInit.path, 1)
+        defer { unsetenv("MSL_INIT_BOOTLOADER_BINARY_PATH") }
+
+        let recordedEnv = ctx.root.appendingPathComponent("imagewriter-debian-packages-env.txt", isDirectory: false)
+        let fakeImagewriter = ctx.root.appendingPathComponent("imagewriter-success-debian-packages.sh", isDirectory: false)
+        try ctx.makeShellScript(
+            at: fakeImagewriter,
+            contents: """
+            #!/bin/sh
+            printf 'rootfs_packages=%s\n' "$IMAGEWRITER_ROOTFS_PACKAGES" > "\(recordedEnv.path)"
+            : > "$OUTPUT_RAW"
+            exit 0
+            """
+        )
+        setenv("MSL_IMAGEWRITER_BUILD_SCRIPT", fakeImagewriter.path, 1)
+        defer { unsetenv("MSL_IMAGEWRITER_BUILD_SCRIPT") }
+
+        let store = DistributionManifestStore(entries: [entry], installDescriptors: [descriptor])
+        let manager = DistributionManager(
+            paths: ctx.paths,
+            logger: MSLLogger(logFile: ctx.paths.logs.appendingPathComponent("test.log", isDirectory: false)),
+            manifestStore: store
+        )
+        _ = try manager.createImageWithImagewriter(
+            name: "debian",
+            targetAlias: "debian-trixie",
+            localFilePath: nil,
+            rebuild: false,
+            diskSizeGB: nil,
+            mslExecutablePath: "/usr/bin/true"
+        )
+
+        let recorded = try String(contentsOf: recordedEnv, encoding: .utf8)
+        XCTAssertEqual(recorded, "rootfs_packages=\n")
+    }
+
+    func testHTTPStatusValidationRejects404() {
+        XCTAssertTrue(DistributionManager.isSuccessfulHTTPStatus(200))
+        XCTAssertTrue(DistributionManager.isSuccessfulHTTPStatus(204))
+        XCTAssertFalse(DistributionManager.isSuccessfulHTTPStatus(301))
+        XCTAssertFalse(DistributionManager.isSuccessfulHTTPStatus(404))
+        XCTAssertFalse(DistributionManager.isSuccessfulHTTPStatus(500))
+    }
+
+    func testManifestCacheRejectsVerifiedRecordWhenTarballChecksumDiffers() throws {
+        let ctx = try DistributionContext.make()
+        defer { ctx.cleanup() }
+
+        let tarball = ctx.root.appendingPathComponent("rootfs.tar.gz", isDirectory: false)
+        try Data("not the expected archive".utf8).write(to: tarball, options: .atomic)
+        let expectedSHA = SHA256.hash(data: Data("expected".utf8)).map { String(format: "%02x", $0) }.joined()
+        let actualSHA = try ctx.sha256(of: tarball)
+        let verifiedPath = ctx.root.appendingPathComponent("verified.json", isDirectory: false)
+        let entry = DistributionManifestEntry(
+            id: "debian-trixie-arm64",
+            distro: "debian",
+            version: "trixie",
+            arch: "arm64",
+            tarballURL: "https://example.com/rootfs.tar.gz",
+            sha256: expectedSHA,
+            signatureURL: "https://example.com/rootfs.tar.gz.asc",
+            checksumURL: "https://example.com/rootfs.tar.gz.sha256",
+            signatureTarget: "artifact",
+            keyFingerprint: "F1",
+            supportState: .supported
+        )
+        let verified = DistributionVerifiedRecord(
+            tarballPath: tarball.path,
+            sha256: expectedSHA,
+            signatureFingerprint: "F1",
+            verifiedAtEpochMs: nowEpochMs(),
+            manifestId: entry.id
+        )
+        try JSONEncoder().encode(verified).write(to: verifiedPath, options: .atomic)
+
+        let status = try ctx.makeManager().manifestCacheRecordIfUsable(
+            entry: entry,
+            tarballPath: tarball,
+            verifiedPath: verifiedPath
+        )
+
+        switch status {
+        case .invalidChecksum(let expected, let actual):
+            XCTAssertEqual(expected, expectedSHA)
+            XCTAssertEqual(actual, actualSHA)
+        default:
+            XCTFail("expected invalid checksum, got \(status)")
+        }
     }
 
     func testCreateImageUses1GiBDefaultForInternalImagewriterWhenDiskSizeIsNil() throws {
@@ -1419,6 +1654,36 @@ private struct DistributionContext {
         try JSONEncoder().encode(manifest).write(to: path, options: .atomic)
     }
 
+    func sha256(of url: URL) throws -> String {
+        SHA256.hash(data: try Data(contentsOf: url)).map { String(format: "%02x", $0) }.joined()
+    }
+
+    func seedManifestCache(
+        entry: DistributionManifestEntry,
+        tarball: URL,
+        sha256: String
+    ) throws {
+        let tarballFileName = URL(string: entry.tarballURL)?.lastPathComponent ?? "\(entry.id).tar"
+        let cacheDir = paths.cacheDownloadsDir
+            .appendingPathComponent(entry.distro, isDirectory: true)
+            .appendingPathComponent(entry.version, isDirectory: true)
+            .appendingPathComponent(entry.arch, isDirectory: true)
+        try FileManager.default.createDirectory(at: cacheDir, withIntermediateDirectories: true)
+        let cachedTarball = cacheDir.appendingPathComponent(tarballFileName, isDirectory: false)
+        try FileManager.default.copyItem(at: tarball, to: cachedTarball)
+        let verified = DistributionVerifiedRecord(
+            tarballPath: cachedTarball.path,
+            sha256: sha256,
+            signatureFingerprint: entry.keyFingerprint,
+            verifiedAtEpochMs: nowEpochMs(),
+            manifestId: entry.id
+        )
+        try JSONEncoder().encode(verified).write(
+            to: cacheDir.appendingPathComponent("verified.json", isDirectory: false),
+            options: .atomic
+        )
+    }
+
     func fileMode(at url: URL) throws -> UInt16 {
         let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
         guard let mode = attributes[.posixPermissions] as? NSNumber else {
@@ -1437,6 +1702,32 @@ private struct DistributionContext {
         let shellPath = binDir.appendingPathComponent("sh", isDirectory: false)
         try Data("#!/bin/sh\nexit 0\n".utf8).write(to: shellPath, options: .atomic)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: shellPath.path)
+        try Data("# placeholder\n".utf8).write(to: etcDir.appendingPathComponent("fstab"), options: .atomic)
+
+        let archive = root.appendingPathComponent(name, isDirectory: false)
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
+        process.arguments = ["-czf", archive.path, "-C", sourceDir.path, "."]
+        try process.run()
+        process.waitUntilExit()
+        XCTAssertEqual(process.terminationStatus, 0)
+        return archive
+    }
+
+    func makeRootfsArchiveWithAbsoluteShellSymlink(named name: String) throws -> URL {
+        let sourceDir = root.appendingPathComponent("\(name)-src", isDirectory: true)
+        let binDir = sourceDir.appendingPathComponent("bin", isDirectory: true)
+        let etcDir = sourceDir.appendingPathComponent("etc", isDirectory: true)
+        try FileManager.default.createDirectory(at: binDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: etcDir, withIntermediateDirectories: true)
+
+        let busyboxPath = binDir.appendingPathComponent("busybox", isDirectory: false)
+        try Data("#!/bin/sh\nexit 0\n".utf8).write(to: busyboxPath, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: busyboxPath.path)
+        try FileManager.default.createSymbolicLink(
+            atPath: binDir.appendingPathComponent("sh", isDirectory: false).path,
+            withDestinationPath: "/bin/busybox"
+        )
         try Data("# placeholder\n".utf8).write(to: etcDir.appendingPathComponent("fstab"), options: .atomic)
 
         let archive = root.appendingPathComponent(name, isDirectory: false)
