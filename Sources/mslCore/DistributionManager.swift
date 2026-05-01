@@ -113,6 +113,7 @@ private struct RootFSMaterializationResult {
     var defaultExec: DistributionInstanceMetadata.DefaultExec?
     var shellAvailable: Bool?
     var imagewriterPackages: String?
+    var imagewriterRootFSPackages: String?
     var sourceArchivePath: String?
     var cleanupRoot: URL
 }
@@ -130,6 +131,7 @@ final class DistributionManager {
     private static let containerRuntimeAlias = "container-runtime"
     private static let containerRuntimeInstanceName = "_container"
     private static let defaultImagewriterPackages = "btrfs-progs e2fsprogs erofs-utils util-linux tar zstd xz coreutils"
+    private static let alpineDistributionRootFSPackages = "sudo"
     private static let containerRuntimeImagewriterPackages = [
         "btrfs-progs", "e2fsprogs", "erofs-utils", "util-linux", "tar", "zstd", "xz", "coreutils",
         "openrc", "bash", "ca-certificates", "iproute2", "iptables", "nftables",
@@ -560,11 +562,13 @@ final class DistributionManager {
                 ? "install: creating readonly EROFS base and btrfs state images via imagewriter"
                 : "install: creating btrfs disk image via imagewriter")
             didRunImagewriterBuild = true
+            let rootfsTarballPath = imagewriterRootFSTarballPath(for: materialized)
+            let rootfsDirectoryPath = imagewriterRootFSDirectoryPath(for: materialized)
             try runImagewriterBuild(
                 scriptPath: imagewriterScript,
                 mslExecutablePath: mslExecutablePath,
-                rootfsTarballPath: nil,
-                rootfsDirectoryPath: materialized.rootfsDir?.path,
+                rootfsTarballPath: rootfsTarballPath,
+                rootfsDirectoryPath: rootfsDirectoryPath,
                 ociLayoutDirectoryPath: materialized.ociLayoutDir?.path,
                 outputDiskPath: baseDiskFile.path,
                 outputStateDiskPath: stateDiskFile?.path,
@@ -574,6 +578,7 @@ final class DistributionManager {
                 earlyInitBinaryPath: earlyInitBinaryPath,
                 imageFS: useReadonlyBaseCowState ? "erofs" : "btrfs",
                 imagewriterPackages: materialized.imagewriterPackages,
+                imagewriterRootFSPackages: materialized.imagewriterRootFSPackages,
                 extraGuestFilesBundlePath: extraGuestFilesBundleURL?.path,
                 runtimeValidationSummaryPath: materialized.ociLayoutDir == nil ? nil : runtimeSummaryURL.path,
                 requestedDefaultExec: materialized.defaultExec,
@@ -655,6 +660,24 @@ final class DistributionManager {
         ])
         emitStatus("install: image ready")
         return distroDir
+    }
+
+    private func imagewriterRootFSTarballPath(for materialized: RootFSMaterializationResult) -> String? {
+        switch materialized.source {
+        case .manifest, .localFile:
+            return materialized.sourceArchivePath
+        case .containerRemote, .containerRuntime:
+            return nil
+        }
+    }
+
+    private func imagewriterRootFSDirectoryPath(for materialized: RootFSMaterializationResult) -> String? {
+        switch materialized.source {
+        case .containerRuntime:
+            return materialized.rootfsDir?.path
+        case .manifest, .localFile, .containerRemote:
+            return nil
+        }
     }
 
     @discardableResult
@@ -806,6 +829,7 @@ final class DistributionManager {
                 defaultExec: nil,
                 shellAvailable: true,
                 imagewriterPackages: nil,
+                imagewriterRootFSPackages: Self.rootFSPackages(forManifestEntry: entry),
                 sourceArchivePath: tarballURL.path,
                 cleanupRoot: stagingRoot
             )
@@ -836,6 +860,7 @@ final class DistributionManager {
                 defaultExec: nil,
                 shellAvailable: true,
                 imagewriterPackages: nil,
+                imagewriterRootFSPackages: "",
                 sourceArchivePath: tarballURL.path,
                 cleanupRoot: stagingRoot
             )
@@ -875,6 +900,7 @@ final class DistributionManager {
                 ),
                 shellAvailable: nil,
                 imagewriterPackages: nil,
+                imagewriterRootFSPackages: "",
                 sourceArchivePath: nil,
                 cleanupRoot: stagingRoot
             )
@@ -916,11 +942,18 @@ final class DistributionManager {
                     source: "runtime-default"
                 ),
                 shellAvailable: true,
-                imagewriterPackages: Self.containerRuntimeImagewriterPackages,
+                imagewriterPackages: nil,
+                imagewriterRootFSPackages: Self.containerRuntimeImagewriterPackages,
                 sourceArchivePath: tarballURL.path,
                 cleanupRoot: stagingRoot
             )
         }
+    }
+
+    private static func rootFSPackages(forManifestEntry entry: DistributionManifestEntry) -> String {
+        entry.distro.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "alpine"
+            ? alpineDistributionRootFSPackages
+            : ""
     }
 
     private func validateRuntimeShell(in rootfsDir: URL) throws {
@@ -930,12 +963,32 @@ final class DistributionManager {
             "bin/ash"
         ]
         for candidate in candidates {
-            let path = rootfsDir.appendingPathComponent(candidate, isDirectory: false).path
-            if fileManager.fileExists(atPath: path) {
+            if rootfsPathExists(candidate, in: rootfsDir) {
                 return
             }
         }
         throw MSLRuntimeError("rootfs is not supported: no usable shell found (/bin/sh, /bin/bash, /bin/ash)")
+    }
+
+    private func rootfsPathExists(_ relativePath: String, in rootfsDir: URL, depth: Int = 0) -> Bool {
+        guard depth < 16 else { return false }
+        let path = rootfsDir.appendingPathComponent(relativePath, isDirectory: false)
+        guard let destination = try? fileManager.destinationOfSymbolicLink(atPath: path.path) else {
+            return fileManager.fileExists(atPath: path.path)
+        }
+        let nextRelativePath: String
+        if destination.hasPrefix("/") {
+            nextRelativePath = String(destination.drop(while: { $0 == "/" }))
+        } else {
+            let parent = (relativePath as NSString).deletingLastPathComponent
+            nextRelativePath = (parent as NSString).appendingPathComponent(destination)
+        }
+        let normalized = (nextRelativePath as NSString).standardizingPath
+        let clean = normalized.hasPrefix("/") ? String(normalized.dropFirst()) : normalized
+        guard !clean.isEmpty, !clean.hasPrefix("../"), clean != ".." else {
+            return false
+        }
+        return rootfsPathExists(clean, in: rootfsDir, depth: depth + 1)
     }
 
     private func initialContainerDefaultExec(
@@ -2201,6 +2254,7 @@ final class DistributionManager {
         earlyInitBinaryPath: String? = nil,
         imageFS: String = "btrfs",
         imagewriterPackages: String? = nil,
+        imagewriterRootFSPackages: String? = nil,
         extraGuestFilesBundlePath: String? = nil,
         runtimeValidationSummaryPath: String? = nil,
         requestedDefaultExec: DistributionInstanceMetadata.DefaultExec? = nil,
@@ -2222,7 +2276,8 @@ final class DistributionManager {
             "IMAGE_SIZE_MB": String(sizeMB),
             "IMAGEWRITER_INIT_BINARY": initBinaryPath,
             "IMAGEWRITER_RUN_TIMEOUT": "900",
-            "IMAGEWRITER_PACKAGES": imagewriterPackages ?? Self.defaultImagewriterPackages
+            "IMAGEWRITER_PACKAGES": imagewriterPackages ?? Self.defaultImagewriterPackages,
+            "IMAGEWRITER_ROOTFS_PACKAGES": imagewriterRootFSPackages ?? ""
         ]
         if let earlyInitBinaryPath, !earlyInitBinaryPath.isEmpty {
             env["IMAGEWRITER_EARLY_INIT_BINARY"] = earlyInitBinaryPath
@@ -2704,15 +2759,27 @@ final class DistributionManager {
         let signaturePath = cacheDir.appendingPathComponent("\(tarballFileName).asc", isDirectory: false)
         let checksumPath = cacheDir.appendingPathComponent("\(tarballFileName).sha256", isDirectory: false)
 
-        if !force,
-           fileManager.fileExists(atPath: tarballPath.path),
-           fileManager.fileExists(atPath: verifiedPath.path) {
-            let existing = try readJSON(DistributionVerifiedRecord.self, from: verifiedPath)
-            if existing.sha256.caseInsensitiveCompare(entry.sha256) == .orderedSame &&
-               existing.manifestId == entry.id {
+        if !force {
+            let cacheStatus = try manifestCacheRecordIfUsable(
+                entry: entry,
+                tarballPath: tarballPath,
+                verifiedPath: verifiedPath
+            )
+            switch cacheStatus {
+            case .hit(let existing):
                 logger.log("cache_hit", fields: ["id": entry.id, "path": tarballPath.path])
                 emitStatus("install: using cached archive \(tarballFileName)")
                 return existing
+            case .invalidChecksum(let expected, let actual):
+                logger.log("cache_invalid", fields: [
+                    "id": entry.id,
+                    "path": tarballPath.path,
+                    "expected_sha256": expected,
+                    "actual_sha256": actual
+                ])
+                emitStatus("install: cached archive checksum mismatch; refetching \(tarballFileName)")
+            case .miss:
+                break
             }
         }
 
@@ -2770,6 +2837,33 @@ final class DistributionManager {
         logger.log("cache_fetch_completed", fields: ["id": entry.id, "path": tarballPath.path])
         emitStatus("install: fetched archive \(tarballFileName)")
         return verified
+    }
+
+    internal enum ManifestCacheStatus {
+        case hit(DistributionVerifiedRecord)
+        case invalidChecksum(expected: String, actual: String)
+        case miss
+    }
+
+    internal func manifestCacheRecordIfUsable(
+        entry: DistributionManifestEntry,
+        tarballPath: URL,
+        verifiedPath: URL
+    ) throws -> ManifestCacheStatus {
+        guard fileManager.fileExists(atPath: tarballPath.path),
+              fileManager.fileExists(atPath: verifiedPath.path) else {
+            return .miss
+        }
+        let existing = try readJSON(DistributionVerifiedRecord.self, from: verifiedPath)
+        guard existing.sha256.caseInsensitiveCompare(entry.sha256) == .orderedSame,
+              existing.manifestId == entry.id else {
+            return .miss
+        }
+        let actualSHA = try computeSHA256(fileAt: tarballPath)
+        guard actualSHA.caseInsensitiveCompare(existing.sha256) == .orderedSame else {
+            return .invalidChecksum(expected: existing.sha256, actual: actualSHA)
+        }
+        return .hit(existing)
     }
 
     internal func cacheLocalFile(_ fileURL: URL, force: Bool) throws -> DistributionVerifiedRecord {
@@ -3723,6 +3817,10 @@ final class DistributionManager {
         if let transferError = observer.error {
             throw MSLRuntimeError("download failed for \(url.absoluteString): \(transferError)")
         }
+        if let statusCode = observer.httpStatusCode,
+           !Self.isSuccessfulHTTPStatus(statusCode) {
+            throw MSLRuntimeError("download failed for \(url.absoluteString): HTTP \(statusCode)")
+        }
         guard let tmpURL = observer.downloadedFileURL else {
             throw MSLRuntimeError("download failed: no temporary file for \(url.absoluteString)")
         }
@@ -3746,6 +3844,10 @@ final class DistributionManager {
             hasher.update(data: data)
         }
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    internal static func isSuccessfulHTTPStatus(_ statusCode: Int) -> Bool {
+        (200..<300).contains(statusCode)
     }
 
     private func normalizeFingerprint(_ value: String) -> String {
@@ -3884,6 +3986,7 @@ private final class DownloadTaskObserver: NSObject, URLSessionDownloadDelegate {
 
     private(set) var downloadedFileURL: URL?
     private(set) var error: Error?
+    private(set) var httpStatusCode: Int?
     private(set) var bytesWritten: Int64 = 0
     private(set) var bytesExpected: Int64 = NSURLSessionTransferSizeUnknown
     private(set) var startSignaled: Bool = false
@@ -3925,7 +4028,10 @@ private final class DownloadTaskObserver: NSObject, URLSessionDownloadDelegate {
         downloadedFileURL = location
     }
 
-    func urlSession(_: URLSession, task _: URLSessionTask, didCompleteWithError error: Error?) {
+    func urlSession(_: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        if let response = task.response as? HTTPURLResponse {
+            httpStatusCode = response.statusCode
+        }
         self.error = error
         semaphore.signal()
     }

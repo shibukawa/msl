@@ -214,6 +214,7 @@ public final class AppManager {
             return existing
         }
 
+        let launchEpochMs = nowEpochMs()
         let runtimeRoot = paths.workerRuntimeDirectory(named: instanceName)
         try fileManager.createDirectory(at: runtimeRoot, withIntermediateDirectories: true)
         try fileManager.createDirectory(at: runtimeRoot.appendingPathComponent("logs", isDirectory: true), withIntermediateDirectories: true)
@@ -246,18 +247,83 @@ public final class AppManager {
         workerProcesses[instanceName] = process
         workerProcessLock.unlock()
 
-        let deadline = Date().addingTimeInterval(30)
+        let deadline = Date().addingTimeInterval(Self.workerRegistrationTimeoutSec())
         while Date() < deadline {
             if let worker = try? resolveRunningWorker(instanceName: instanceName) {
                 return worker
             }
+            if let failure = workerStartupFailure(instanceName: instanceName, runtimeRoot: runtimeRoot, notOlderThanEpochMs: launchEpochMs) {
+                throw MSLRuntimeError(failure)
+            }
             if !process.isRunning && process.terminationStatus != 0 {
+                if let failure = workerStartupFailure(instanceName: instanceName, runtimeRoot: runtimeRoot, notOlderThanEpochMs: launchEpochMs) {
+                    throw MSLRuntimeError(failure)
+                }
                 throw MSLRuntimeError("worker failed to start for instance '\(instanceName)'")
             }
             Thread.sleep(forTimeInterval: 0.2)
         }
 
+        let graceDeadline = Date().addingTimeInterval(2.0)
+        while Date() < graceDeadline {
+            if let worker = try? resolveRunningWorker(instanceName: instanceName) {
+                return worker
+            }
+            if let failure = workerStartupFailure(instanceName: instanceName, runtimeRoot: runtimeRoot, notOlderThanEpochMs: launchEpochMs) {
+                throw MSLRuntimeError(failure)
+            }
+            if !process.isRunning {
+                if process.terminationStatus != 0 {
+                    throw MSLRuntimeError("worker failed to start for instance '\(instanceName)'")
+                }
+                break
+            }
+            Thread.sleep(forTimeInterval: 0.1)
+        }
         throw MSLRuntimeError("worker did not register in time for instance '\(instanceName)'")
+    }
+
+    private func workerStartupFailure(instanceName: String, runtimeRoot: URL, notOlderThanEpochMs: Int64) -> String? {
+        let stateURL = runtimeRoot.appendingPathComponent("state.json", isDirectory: false)
+        guard fileManager.fileExists(atPath: stateURL.path),
+              let data = try? Data(contentsOf: stateURL),
+              let state = try? JSONDecoder().decode(RuntimeState.self, from: data) else {
+            return nil
+        }
+        let instanceState = state.instances?.first(where: { $0.instance == instanceName })
+        let lifecycle = instanceState?.lifecycleState ?? state.lifecycleState
+        guard lifecycle == .error else {
+            return nil
+        }
+        let transitionEpochMs = instanceState?.lastTransitionEpochMs ?? state.lastTransitionEpochMs
+        guard transitionEpochMs >= notOlderThanEpochMs - 1_000 else {
+            return nil
+        }
+
+        let message = [
+            instanceState?.lastErrorMessage,
+            instanceState?.lastError,
+            state.lastErrorMessage
+        ]
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first { !$0.isEmpty }
+        guard let message else {
+            return "worker failed during startup for instance '\(instanceName)'"
+        }
+
+        let stepName = instanceState?.startupStepName ?? state.startupStepName
+        let code = instanceState?.lastErrorCode ?? state.lastErrorCode
+        var details: [String] = []
+        if let stepName, !stepName.isEmpty {
+            details.append("startup_step=\(stepName)")
+        }
+        if let code, !code.isEmpty {
+            details.append("code=\(code)")
+        }
+        if details.isEmpty {
+            return message
+        }
+        return "\(message) (\(details.joined(separator: ", ")))"
     }
 
     private func resolveRunningWorker(instanceName: String) throws -> AppManagerWorkerRecord {
@@ -355,5 +421,13 @@ public final class AppManager {
             || description.contains("no such file or directory")
             || description.contains("socket is not connected")
             || description.contains("not a socket")
+    }
+
+    private static func workerRegistrationTimeoutSec() -> TimeInterval {
+        if let raw = ProcessInfo.processInfo.environment["MSL_WORKER_REGISTER_TIMEOUT_SEC"],
+           let value = Double(raw), value > 0 {
+            return max(0.2, min(value, 30.0))
+        }
+        return 30.0
     }
 }

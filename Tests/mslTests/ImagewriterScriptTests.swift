@@ -29,6 +29,8 @@ final class ImagewriterScriptTests: XCTestCase {
         XCTAssertTrue(script.contains("stage2_${IMAGE_FS}"))
         XCTAssertTrue(script.contains("ALLOW_SETUP_WHEN_MISSING"))
         XCTAssertTrue(script.contains("REQUIRED_IMAGEWRITER_FS"))
+        XCTAssertTrue(script.contains("IMAGEWRITER_ROOTFS_PACKAGES"))
+        XCTAssertTrue(script.contains("IMAGEWRITER_ROOTFS_PACKAGES=\"$IMAGEWRITER_PACKAGES\""))
         XCTAssertTrue(script.contains("[ -f \"$(instance_disk_path)\" ]"))
         XCTAssertTrue(script.contains("required imagewriter instance is missing"))
         XCTAssertTrue(script.contains("verify_expected_fs_type \"$STAGE2_OUTPUT\" \"$IMAGE_FS\" \"$stage2_name\""))
@@ -40,11 +42,13 @@ final class ImagewriterScriptTests: XCTestCase {
         XCTAssertTrue(script.contains("ROOTFS_DIR"))
         XCTAssertTrue(script.contains("OCI_LAYOUT_DIR"))
         XCTAssertTrue(script.contains("EXTRA_GUEST_FILES_BUNDLE"))
+        XCTAssertTrue(script.contains("remove_staged_tree()"))
+        XCTAssertTrue(script.contains("chmod -R u+rwX \"$target\""))
         XCTAssertTrue(script.contains("--rootfs-dir \"$input_path\""))
         XCTAssertTrue(script.contains("--oci-layout-dir \"$input_path\""))
         XCTAssertTrue(script.contains("--extra-files-bundle \"$extra_files_bundle\""))
         XCTAssertTrue(script.contains("single_pass_mode=\"stage2\""))
-        XCTAssertTrue(script.contains("single_pass_packages=\"$IMAGEWRITER_PACKAGES\""))
+        XCTAssertTrue(script.contains("single_pass_packages=\"$IMAGEWRITER_ROOTFS_PACKAGES\""))
         XCTAssertTrue(script.contains("manifest.lines"))
         XCTAssertTrue(script.contains("guest_tmp_image=\"${9}\""))
         XCTAssertTrue(script.contains("apk_retry_limit=\"${10}\""))
@@ -85,6 +89,7 @@ final class ImagewriterScriptTests: XCTestCase {
         XCTAssertTrue(script.contains("fail_guest_stage \"container_unpack\" 26"))
         XCTAssertTrue(script.contains("fail_guest_stage \"rootfs_copy\" 26"))
         XCTAssertTrue(script.contains("fail_guest_stage \"runtime_validation\" 26"))
+        XCTAssertTrue(script.contains("tar --numeric-owner --same-owner -p"))
     }
 
     func testBuildImagewriterTargetUsesErofs() throws {

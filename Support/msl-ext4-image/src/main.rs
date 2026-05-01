@@ -500,4 +500,15 @@ mod tests {
 
         fs::remove_file(&path).expect("cleanup");
     }
+
+    #[test]
+    fn tar_metadata_parser_preserves_setuid_owner_and_mode() {
+        let line = "---s--x--x  0 0      0      204576 Jul  1  2025 ./usr/bin/sudo";
+        let (path, meta) = parse_tar_metadata_line(line).expect("parse tar metadata");
+
+        assert_eq!(path, "/usr/bin/sudo");
+        assert_eq!(meta.uid, 0);
+        assert_eq!(meta.gid, 0);
+        assert_eq!(meta.mode, 0o4111);
+    }
 }

@@ -55,6 +55,7 @@ build-imagewriter-help:
 	@echo ""
 	@echo "Optional env:"
 	@echo "  IMAGEWRITER_PACKAGES=\"btrfs-progs e2fsprogs erofs-utils util-linux tar zstd xz coreutils\""
+	@echo "  IMAGEWRITER_ROOTFS_PACKAGES=\"...\"  # default: IMAGEWRITER_PACKAGES for script/make callers"
 	@echo "  IMAGEWRITER_CLEAN_DISTROS=1   # default: 1 (_imagewriter only)"
 	@echo "  IMAGEWRITER_FORCE_SETUP=1     # default for make build-imagewriter: 1"
 	@echo "  MSL_INIT_BOOTLOADER_BINARY_PATH=...  # default: $$HOME/.msl-system/msl-init-bootloader"
