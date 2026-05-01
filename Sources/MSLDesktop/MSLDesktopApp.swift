@@ -17,6 +17,7 @@ struct MSLDesktopApp: App {
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let model = DashboardModel()
+    private let guiWindowManager = GUIWindowManager()
     private var statusItem: NSStatusItem?
     private var openWindowMenuItem: NSMenuItem?
     private var statusSummaryMenuItem: NSMenuItem?
@@ -25,6 +26,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         configureStatusItem()
         model.setStatusItemUpdateHandler { [weak self] summary in
             self?.updateStatusItem(summary: summary)
+        }
+        model.setGUISessionsUpdateHandler { [weak self] sessions in
+            self?.guiWindowManager.sync(sessions: sessions)
         }
         model.startManager()
     }
@@ -206,6 +210,7 @@ final class DashboardModel: ObservableObject {
     private var timer: Timer?
     private var manager: AppManager?
     private var statusItemUpdateHandler: ((DashboardStatusSummary) -> Void)?
+    private var guiSessionsUpdateHandler: (([RuntimeGUISession]) -> Void)?
     private var detailFetchInFlight = false
     private var metricsFetchInFlight = false
     private var storageFetchInFlight = false
@@ -278,6 +283,7 @@ final class DashboardModel: ObservableObject {
             return nil
         }
     }
+    private var guiSessionsFetchInFlight = false
 
     var activeWorkers: [AppManagerWorkerRecord] {
         workers.filter { $0.lifecycleState == .running || $0.lifecycleState == .starting }
@@ -301,6 +307,10 @@ final class DashboardModel: ObservableObject {
 
     func setStatusItemUpdateHandler(_ handler: @escaping (DashboardStatusSummary) -> Void) {
         statusItemUpdateHandler = handler
+    }
+
+    func setGUISessionsUpdateHandler(_ handler: @escaping ([RuntimeGUISession]) -> Void) {
+        guiSessionsUpdateHandler = handler
     }
 
     func startManager() {
@@ -344,6 +354,7 @@ final class DashboardModel: ObservableObject {
         if containerRuntimeWasRunning != containerRuntimeIsRunning {
             refreshImageStorageSummaryOnLifecycleTransition(running: containerRuntimeIsRunning)
         }
+        refreshGUISessions()
         refreshSelectedDataIfNeeded(force: false)
     }
 
@@ -1039,6 +1050,36 @@ final class DashboardModel: ObservableObject {
             toolTip: toolTip,
             hasError: hasError
         )
+    }
+
+    private func refreshGUISessions() {
+        guard !guiSessionsFetchInFlight else { return }
+        let runningWorkers = workers.filter { $0.lifecycleState == .running }
+        guard !runningWorkers.isEmpty else {
+            guiSessionsUpdateHandler?([])
+            return
+        }
+        guiSessionsFetchInFlight = true
+        Task {
+            var collected: [RuntimeGUISession] = []
+            for worker in runningWorkers {
+                do {
+                    let client = RuntimeControlClient(socketPath: worker.controlSocketPath)
+                    let response = try client.send(RuntimeControlRequest(op: "gui_session_list", instance: worker.instanceName))
+                    if let sessions = response.guiSessions {
+                        collected.append(contentsOf: sessions)
+                    }
+                } catch {
+                    continue
+                }
+            }
+            let deduped = Dictionary(grouping: collected, by: \.id).compactMap { $0.value.last }
+                .sorted { $0.startedAtEpochMs < $1.startedAtEpochMs }
+            await MainActor.run {
+                self.guiSessionsUpdateHandler?(deduped)
+                self.guiSessionsFetchInFlight = false
+            }
+        }
     }
 }
 

@@ -1298,6 +1298,77 @@ public final class RuntimeManager {
         return trimmed == "root" || trimmed == "0"
     }
 
+    public func runGUICommand(
+        argv: [String],
+        instanceName: String? = nil,
+        title: String? = nil
+    ) throws -> Never {
+        let startMs = runtimeMonotonicMs()
+        let target = try resolveRuntimeTarget(explicitInstanceName: instanceName)
+        let workspacePolicy = evaluateWorkspaceStartupPolicy(instanceName: target.instanceName, metadataURL: target.metadataURL)
+        guard !argv.isEmpty else {
+            throw MSLRuntimeError("app run requires at least one argument")
+        }
+
+        try lock.withExclusiveLock {
+            try bootstrap.ensureBootstrapped(context: .runtime)
+        }
+
+        try daemonClient.ensureConnected(
+            expectedInstanceName: target.instanceName,
+            hostShareRoot: resolveWorkspaceHostShareRoot(),
+            callerCwd: currentCallerCwd()
+        )
+        prepareCacheSharingIfNeeded(instanceName: target.instanceName)
+        let execCwd = prepareWorkspaceIfNeeded(policy: workspacePolicy, instanceName: target.instanceName)
+
+        let response = try daemonClient.send(RuntimeControlRequest(
+            op: "gui_session_start",
+            instance: target.instanceName,
+            callerCwd: currentCallerCwd(),
+            argv: argv,
+            cwd: execCwd,
+            guiWindowTitle: title
+        ))
+        guard response.ok, let guiSession = response.guiSession else {
+            logger.log("gui_app_launch_failed", fields: [
+                "instance": target.instanceName,
+                "argv0": argv[0],
+                "error": response.error ?? "gui_session_start failed"
+            ])
+            fputs("msl: \(response.error ?? "failed to start GUI application")\n", stderr)
+            Foundation.exit(1)
+        }
+
+        if let managerSocketPath = try? resolveManagerSocketPath() {
+            let managerClient = ManagerControlClient(socketPath: managerSocketPath)
+            _ = try? managerClient.send(ManagerControlRequest(op: "show_window"))
+        }
+
+        print("guiSession: \(guiSession.id)")
+        print("instance: \(guiSession.instanceName)")
+        print("state: \(guiSession.state.rawValue)")
+        print("display: \(guiSession.display.displayName)")
+        print("displayPort: \(guiSession.display.port)")
+        print("title: \(guiSession.title)")
+        logger.log("gui_app_launch_completed", fields: [
+            "instance": target.instanceName,
+            "argv0": argv[0],
+            "session": guiSession.id,
+            "elapsed_ms": String(runtimeMonotonicMs() - startMs)
+        ])
+        Foundation.exit(0)
+    }
+
+    private func resolveManagerSocketPath() throws -> String {
+        let managerSocket = paths.managerSocketFile.path
+        let client = ManagerControlClient(socketPath: managerSocket)
+        if (try? client.send(ManagerControlRequest(op: "app_ping")).ok) == true {
+            return managerSocket
+        }
+        return managerSocket
+    }
+
     private func shouldFallbackToLegacyExec(for errorMessage: String) -> Bool {
         let lowered = errorMessage.lowercased()
         return lowered.contains("vsock connection closed by guest")

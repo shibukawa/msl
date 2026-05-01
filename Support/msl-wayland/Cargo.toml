@@ -1,0 +1,6 @@
+[workspace]
+members = [
+  "host-core",
+  "guest-proxy",
+]
+resolver = "2"

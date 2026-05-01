@@ -334,6 +334,10 @@ public struct RuntimeControlRequest: Codable {
     public var containerID: String?
     public var containerIDs: [String]?
     public var imageID: String?
+    public var guiSessionId: String?
+    public var guiWindowTitle: String?
+    public var displayName: String?
+    public var displayPort: Int?
 
     enum CodingKeys: String, CodingKey {
         case op
@@ -358,6 +362,10 @@ public struct RuntimeControlRequest: Codable {
         case containerID
         case containerIDs
         case imageID
+        case guiSessionId
+        case guiWindowTitle
+        case displayName
+        case displayPort
     }
 
     public init(
@@ -383,7 +391,11 @@ public struct RuntimeControlRequest: Codable {
         dnsSource: String? = nil,
         containerID: String? = nil,
         containerIDs: [String]? = nil,
-        imageID: String? = nil
+        imageID: String? = nil,
+        guiSessionId: String? = nil,
+        guiWindowTitle: String? = nil,
+        displayName: String? = nil,
+        displayPort: Int? = nil
     ) {
         self.op = op
         self.instance = instance
@@ -408,6 +420,10 @@ public struct RuntimeControlRequest: Codable {
         self.containerID = containerID
         self.containerIDs = containerIDs
         self.imageID = imageID
+        self.guiSessionId = guiSessionId
+        self.guiWindowTitle = guiWindowTitle
+        self.displayName = displayName
+        self.displayPort = displayPort
     }
 }
 
@@ -695,6 +711,10 @@ public struct RuntimeControlResponse: Codable {
     public var stderrBase64: String?
     public var chunks: [RuntimeControlStreamChunk]?
     public var sessionId: String?
+    public var guiSession: RuntimeGUISession?
+    public var guiSessions: [RuntimeGUISession]?
+    public var frame: RuntimeGUIFrame?
+    public var imeState: RuntimeGUIIMEState?
     public var meta: [String: String]?
     public var rawData: Data? = nil
     public var rawStdout: Data? = nil
@@ -727,6 +747,10 @@ public struct RuntimeControlResponse: Codable {
         case stderrBase64
         case chunks
         case sessionId
+        case guiSession
+        case guiSessions
+        case frame
+        case imeState
         case meta
     }
 }

@@ -7,13 +7,18 @@ APP_DIR="$ROOT_DIR/.build/debug/$APP_NAME"
 CONTENTS_DIR="$APP_DIR/Contents"
 MACOS_DIR="$CONTENTS_DIR/MacOS"
 RESOURCES_DIR="$CONTENTS_DIR/Resources"
+FRAMEWORKS_DIR="$CONTENTS_DIR/Frameworks"
 CONTAINER_TOOLS_SOURCE_DIR="$ROOT_DIR/.build/debug/tools"
 CONTAINER_TOOLS_DEST_DIR="$RESOURCES_DIR/container-tools"
+WAYLAND_SOURCE_LIB="$ROOT_DIR/.build/debug/wayland/libmsl_wayland_core.dylib"
 
-mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"
+mkdir -p "$MACOS_DIR" "$RESOURCES_DIR" "$FRAMEWORKS_DIR"
 
 cp "$ROOT_DIR/.build/debug/MSLDesktop" "$MACOS_DIR/MSLDesktop"
 cp "$ROOT_DIR/.build/debug/msl" "$MACOS_DIR/msl"
+if [[ -f "$WAYLAND_SOURCE_LIB" ]]; then
+  cp "$WAYLAND_SOURCE_LIB" "$FRAMEWORKS_DIR/libmsl_wayland_core.dylib"
+fi
 rm -rf "$CONTAINER_TOOLS_DEST_DIR"
 if [[ -f "$CONTAINER_TOOLS_SOURCE_DIR/manifest.json" ]]; then
   mkdir -p "$CONTAINER_TOOLS_DEST_DIR"

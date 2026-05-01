@@ -93,6 +93,14 @@ func buildAttachedContainerAuthorityString(
     return "attached-container+\(hex)"
 }
 
+private extension NSLock {
+    func withLock<T>(_ body: () -> T) -> T {
+        lock()
+        defer { unlock() }
+        return body()
+    }
+}
+
 /// VMオーナーデーモンプロセス。VM の起動・保持、vsock 管理、
 /// control socket でCLI からのリクエストを受け付ける。
 public final class DaemonServer {
@@ -260,10 +268,12 @@ public final class DaemonServer {
     private let launchOriginTracker = LaunchOriginTracker()
     private let logRouter: RuntimeLogRouter
     private let sessionEventLock = NSLock()
+    private let guiSessionLock = NSLock()
     private var procEventBuffers: [String: HostProcEventBuffer] = [:]
     private var ptyEventBuffers: [String: HostPtyEventBuffer] = [:]
     private var procSubscriptionSources: [String: DispatchSourceRead] = [:]
     private var ptySubscriptionSources: [String: DispatchSourceRead] = [:]
+    private var guiSessions: [String: RuntimeGUISession] = [:]
     private let metricsSampleLock = NSLock()
     private var previousMetricsSamples: [String: GuestMetricsRawSample] = [:]
     private var previousContainerCPUSamples: [String: (sampledAtEpochMs: Int64, usageUsec: UInt64)] = [:]
@@ -2051,6 +2061,14 @@ public final class DaemonServer {
             return handleSessionRegister(request)
         case "session_unregister":
             return handleSessionUnregister(request)
+        case "gui_session_start":
+            return handleGUISessionStart(request)
+        case "gui_session_stop":
+            return handleGUISessionStop(request)
+        case "gui_session_list":
+            return handleGUISessionList(request)
+        case "gui_window_focus":
+            return handleGUIWindowFocus(request)
 
         // --- port forwarding (existing) ---
         case "port_add":
@@ -3204,6 +3222,11 @@ public final class DaemonServer {
                         case .exited:
                             sawExit = true
                             buffer.push(.exited(event.exitCode ?? 0, event.text))
+                            self.updateGUISessionForProcessExit(
+                                procID: procId,
+                                exitCode: event.exitCode,
+                                reason: event.text
+                            )
                         case .streamsClosed:
                             sawStreamsClosed = true
                             buffer.push(.streamsClosed)
@@ -4055,6 +4078,231 @@ public final class DaemonServer {
         } catch {
             return RuntimeControlResponse(ok: false, error: String(describing: error))
         }
+    }
+
+    private func handleGUISessionStart(_ request: RuntimeControlRequest) -> RuntimeControlResponse {
+        guard let argv = request.argv, !argv.isEmpty else {
+            return RuntimeControlResponse(ok: false, error: "missing argv")
+        }
+
+        let instanceName: String
+        do {
+            instanceName = resolveTargetInstanceName(request)
+            _ = try ensureInstanceRunning(instanceName: instanceName, callerCwd: request.callerCwd)
+        } catch {
+            return RuntimeControlResponse(ok: false, error: String(describing: error))
+        }
+
+        let registerResponse = handleSessionRegister(RuntimeControlRequest(
+            op: "session_register",
+            instance: instanceName,
+            callerCwd: request.callerCwd
+        ))
+        guard registerResponse.ok, let sessionID = registerResponse.sessionId else {
+            return RuntimeControlResponse(ok: false, error: registerResponse.error ?? "failed to register GUI session")
+        }
+
+        let guiSessionID = request.guiSessionId ?? UUID().uuidString
+        let displayName = request.displayName ?? "wayland-\(String(guiSessionID.prefix(8)))"
+        let displayPort = request.displayPort ?? guiDisplayPort(for: guiSessionID)
+        let title = request.guiWindowTitle?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+            ? request.guiWindowTitle!
+            : defaultGUITitle(argv: argv)
+        var mergedEnv = managedGUIEnvironment(displayName: displayName, sessionID: guiSessionID, port: displayPort)
+        if let additions = request.envAdditions {
+            for (key, value) in additions {
+                mergedEnv[key] = value
+            }
+        }
+        let now = nowEpochMs()
+        var guiSession = RuntimeGUISession(
+            id: guiSessionID,
+            instanceName: instanceName,
+            sessionId: sessionID,
+            procId: nil,
+            title: title,
+            command: argv,
+            state: .launching,
+            display: RuntimeGUIDisplayDescriptor(
+                displayName: displayName,
+                port: displayPort
+            ),
+            lastError: nil,
+            startedAtEpochMs: now,
+            lastUpdatedEpochMs: now
+        )
+        storeGUISession(guiSession)
+
+        let launchCommand = guiLaunchCommand(
+            argv: argv,
+            displayName: displayName,
+            displayPort: displayPort
+        )
+        let procResponse = handleProcOpen(RuntimeControlRequest(
+            op: "proc_open",
+            instance: instanceName,
+            argv: launchCommand,
+            sessionId: sessionID,
+            cwd: request.cwd,
+            envAdditions: mergedEnv
+        ))
+
+        guard procResponse.ok, let procID = procResponse.procId else {
+            guiSession.state = .error
+            guiSession.lastError = procResponse.error ?? "proc_open failed"
+            guiSession.lastUpdatedEpochMs = nowEpochMs()
+            storeGUISession(guiSession)
+            _ = handleSessionUnregister(RuntimeControlRequest(op: "session_unregister", instance: instanceName, sessionId: sessionID))
+            publishGUISessionEvent(type: "failed", session: guiSession)
+            return RuntimeControlResponse(ok: false, error: guiSession.lastError, guiSession: guiSession)
+        }
+
+        guiSession.procId = procID
+        guiSession.state = .running
+        guiSession.lastUpdatedEpochMs = nowEpochMs()
+        storeGUISession(guiSession)
+        publishGUISessionEvent(type: "started", session: guiSession)
+        return RuntimeControlResponse(ok: true, procId: procID, sessionId: sessionID, guiSession: guiSession)
+    }
+
+    private func handleGUISessionStop(_ request: RuntimeControlRequest) -> RuntimeControlResponse {
+        guard let guiSessionID = request.guiSessionId else {
+            return RuntimeControlResponse(ok: false, error: "missing guiSessionId")
+        }
+        guard var guiSession = lookupGUISession(guiSessionID) else {
+            return RuntimeControlResponse(ok: false, error: "unknown guiSessionId")
+        }
+
+        guiSession.state = .stopping
+        guiSession.lastUpdatedEpochMs = nowEpochMs()
+        storeGUISession(guiSession)
+
+        if let procID = guiSession.procId {
+            _ = handleProcClose(RuntimeControlRequest(
+                op: "proc_close",
+                instance: guiSession.instanceName,
+                procId: procID,
+                sessionId: guiSession.sessionId
+            ))
+        }
+        _ = handleSessionUnregister(RuntimeControlRequest(
+            op: "session_unregister",
+            instance: guiSession.instanceName,
+            sessionId: guiSession.sessionId
+        ))
+        guiSession.state = .stopped
+        guiSession.lastUpdatedEpochMs = nowEpochMs()
+        storeGUISession(guiSession)
+        publishGUISessionEvent(type: "stopped", session: guiSession)
+        return RuntimeControlResponse(ok: true, guiSession: guiSession)
+    }
+
+    private func handleGUISessionList(_ request: RuntimeControlRequest) -> RuntimeControlResponse {
+        let sessions = guiSessionLock.withLock {
+            guiSessions.values
+                .filter { session in
+                    guard let instance = request.instance, !instance.isEmpty else { return true }
+                    return session.instanceName == instance
+                }
+                .sorted { lhs, rhs in lhs.startedAtEpochMs < rhs.startedAtEpochMs }
+        }
+        return RuntimeControlResponse(ok: true, guiSessions: sessions)
+    }
+
+    private func handleGUIWindowFocus(_ request: RuntimeControlRequest) -> RuntimeControlResponse {
+        guard let guiSessionID = request.guiSessionId,
+              let guiSession = lookupGUISession(guiSessionID) else {
+            return RuntimeControlResponse(ok: false, error: "unknown guiSessionId")
+        }
+        publishGUISessionEvent(type: "focus", session: guiSession)
+        return RuntimeControlResponse(ok: true, guiSession: guiSession)
+    }
+
+    private func defaultGUITitle(argv: [String]) -> String {
+        let executable = URL(fileURLWithPath: argv[0]).lastPathComponent
+        return executable.isEmpty ? "MSL App" : executable
+    }
+
+    private func guiLaunchCommand(
+        argv: [String],
+        displayName: String,
+        displayPort: Int
+    ) -> [String] {
+        [
+            "/bin/sh",
+            "-lc",
+            """
+            proxy_bin="$1"
+            display_name="$2"
+            display_port="$3"
+            shift 3
+            if [ -x "$proxy_bin" ]; then
+              exec "$proxy_bin" --display "$display_name" --port "$display_port" -- "$@"
+            fi
+            exec "$@"
+            """,
+            "msl-wayland-launch",
+            "/usr/local/bin/msl-wayland-proxy",
+            displayName,
+            String(displayPort)
+        ] + argv
+    }
+
+    private func guiDisplayPort(for guiSessionID: String) -> Int {
+        let scalarSum = guiSessionID.unicodeScalars.reduce(0) { partialResult, scalar in
+            partialResult + Int(scalar.value)
+        }
+        return 38000 + (scalarSum % 1000)
+    }
+
+    private func storeGUISession(_ session: RuntimeGUISession) {
+        guiSessionLock.withLock {
+            guiSessions[session.id] = session
+        }
+    }
+
+    private func lookupGUISession(_ id: String) -> RuntimeGUISession? {
+        guiSessionLock.withLock { guiSessions[id] }
+    }
+
+    private func updateGUISessionForProcessExit(procID: String, exitCode: Int32?, reason: String?) {
+        var sessionToPublish: RuntimeGUISession?
+        guiSessionLock.withLock {
+            guard let existing = guiSessions.values.first(where: { $0.procId == procID }) else {
+                return
+            }
+            var updated = existing
+            updated.state = (exitCode ?? 0) == 0 ? .stopped : .error
+            updated.lastError = (exitCode ?? 0) == 0 ? nil : (reason ?? "GUI process exited with code \(exitCode ?? 1)")
+            updated.lastUpdatedEpochMs = nowEpochMs()
+            guiSessions[updated.id] = updated
+            sessionToPublish = updated
+        }
+
+        guard let sessionToPublish else { return }
+        _ = handleSessionUnregister(RuntimeControlRequest(
+            op: "session_unregister",
+            instance: sessionToPublish.instanceName,
+            sessionId: sessionToPublish.sessionId
+        ))
+        publishGUISessionEvent(type: sessionToPublish.state == .error ? "failed" : "exited", session: sessionToPublish)
+    }
+
+    private func publishGUISessionEvent(type: String, session: RuntimeGUISession) {
+        eventBus?.publish(
+            topic: "gui_session",
+            type: type,
+            instance: session.instanceName,
+            state: session.state.rawValue,
+            meta: [
+                "guiSessionId": session.id,
+                "sessionId": session.sessionId,
+                "procId": session.procId ?? "",
+                "title": session.title,
+                "displayName": session.display.displayName,
+                "displayPort": String(session.display.port)
+            ]
+        )
     }
 
     // MARK: - Port Forwarding

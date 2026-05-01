@@ -1,4 +1,4 @@
-.PHONY: build build-init build-ext4-helper build-image build-imagewriter build-imagewriter-help imagewriter-help imagewriter-setup imagewriter \
+.PHONY: build build-init build-wayland build-ext4-helper build-image build-imagewriter build-imagewriter-help imagewriter-help imagewriter-setup imagewriter \
 	build-container-runtime \
 	stage-container-tools package-container-tools install-container-tools \
 	reset reset-disk reset-full clean-alpine clean-ubuntu run \
@@ -14,11 +14,15 @@ UMOCI_VERSION ?= latest
 
 build:
 	$(MAKE) build-init
+	$(MAKE) build-wayland
 	$(MAKE) build-ext4-helper
 	./scripts/build-signed.sh
 
 build-init:
 	./scripts/build-msl-init.sh
+
+build-wayland:
+	./scripts/build-msl-wayland.sh
 
 build-ext4-helper:
 	./scripts/build-msl-ext4-image.sh

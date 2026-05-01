@@ -185,6 +185,7 @@ struct MSLCommand: ParsableCommand {
             NerdctlCommand.self,
             ContainerCommand.self,
             CpCommand.self,
+            AppCommand.self,
             ListCommand.self,
             StatusCommand.self,
             StopCommand.self,
@@ -230,6 +231,46 @@ struct MSLCommand: ParsableCommand {
                 setenv("MSL_ATTACH_SERIAL", "1", 1)
             }
             try manager.runDefaultShell(instanceName: instance)
+        }
+    }
+}
+
+struct AppCommand: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "app",
+        abstract: "Run and manage GUI applications.",
+        subcommands: [AppRunCommand.self]
+    )
+}
+
+struct AppRunCommand: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "run",
+        abstract: "Run a Wayland-native GUI application in the VM."
+    )
+
+    @Option(name: [.customLong("title")], help: "Window title override for the host child window.")
+    var title: String?
+
+    @Argument(help: "Optional target instance name.")
+    var targetInstance: String?
+
+    @Argument(parsing: .remaining, help: "Command and arguments.")
+    var command: [String] = []
+
+    mutating func validate() throws {
+        if command.isEmpty {
+            throw ValidationError("Missing GUI command. See `msl app run --help`.")
+        }
+    }
+
+    mutating func run() throws {
+        withRuntimeManager { manager in
+            try manager.runGUICommand(
+                argv: command,
+                instanceName: targetInstance ?? CLIInvocationContext.instanceName,
+                title: title
+            )
         }
     }
 }
