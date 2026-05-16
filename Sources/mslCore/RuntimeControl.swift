@@ -335,6 +335,7 @@ public struct RuntimeControlRequest: Codable {
     public var containerIDs: [String]?
     public var imageID: String?
     public var guiSessionId: String?
+    public var imeState: RuntimeGUIIMEState?
     public var guiWindowTitle: String?
     public var displayName: String?
     public var displayPort: Int?
@@ -363,6 +364,7 @@ public struct RuntimeControlRequest: Codable {
         case containerIDs
         case imageID
         case guiSessionId
+        case imeState
         case guiWindowTitle
         case displayName
         case displayPort
@@ -393,6 +395,7 @@ public struct RuntimeControlRequest: Codable {
         containerIDs: [String]? = nil,
         imageID: String? = nil,
         guiSessionId: String? = nil,
+        imeState: RuntimeGUIIMEState? = nil,
         guiWindowTitle: String? = nil,
         displayName: String? = nil,
         displayPort: Int? = nil
@@ -421,6 +424,7 @@ public struct RuntimeControlRequest: Codable {
         self.containerIDs = containerIDs
         self.imageID = imageID
         self.guiSessionId = guiSessionId
+        self.imeState = imeState
         self.guiWindowTitle = guiWindowTitle
         self.displayName = displayName
         self.displayPort = displayPort
@@ -714,6 +718,7 @@ public struct RuntimeControlResponse: Codable {
     public var guiSession: RuntimeGUISession?
     public var guiSessions: [RuntimeGUISession]?
     public var frame: RuntimeGUIFrame?
+    public var sharedFrame: RuntimeGUISharedFrame?
     public var imeState: RuntimeGUIIMEState?
     public var meta: [String: String]?
     public var rawData: Data? = nil
@@ -750,6 +755,7 @@ public struct RuntimeControlResponse: Codable {
         case guiSession
         case guiSessions
         case frame
+        case sharedFrame
         case imeState
         case meta
     }

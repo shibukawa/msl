@@ -1350,6 +1350,9 @@ public final class RuntimeManager {
         print("state: \(guiSession.state.rawValue)")
         print("display: \(guiSession.display.displayName)")
         print("displayPort: \(guiSession.display.port)")
+        if let runtimeDir = response.meta?["waylandRuntimeDir"] {
+            print("runtimeDir: \(runtimeDir)")
+        }
         print("title: \(guiSession.title)")
         logger.log("gui_app_launch_completed", fields: [
             "instance": target.instanceName,
@@ -2694,6 +2697,11 @@ public final class RuntimeManager {
         let client = ManagerControlClient(socketPath: paths.managerSocketFile.path)
         if FileManager.default.fileExists(atPath: paths.managerSocketFile.path) {
             do {
+                let quitResponse = try client.send(ManagerControlRequest(op: "quit_desktop"))
+                if quitResponse.ok {
+                    print("stopped desktop")
+                    return
+                }
                 let response = try client.send(ManagerControlRequest(op: "stop_manager"))
                 guard response.ok else {
                     throw MSLRuntimeError(response.error ?? "failed to stop app manager")

@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import SwiftUI
 import mslCore
 
@@ -21,6 +22,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem?
     private var openWindowMenuItem: NSMenuItem?
     private var statusSummaryMenuItem: NSMenuItem?
+    private var forceQuitRequested = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         configureStatusItem()
@@ -30,6 +32,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model.setGUISessionsUpdateHandler { [weak self] sessions in
             self?.guiWindowManager.sync(sessions: sessions)
         }
+        model.setDesktopQuitHandler { [weak self] in
+            self?.requestForceQuit()
+        }
         model.startManager()
     }
 
@@ -38,6 +43,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        if forceQuitRequested {
+            return .terminateNow
+        }
+        bringDashboardToFront()
         model.refresh()
         guard model.hasActiveWorkers else {
             return .terminateNow
@@ -54,6 +63,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         alert.addButton(withTitle: "Quit and Stop VMs")
         alert.addButton(withTitle: "Cancel")
+        alert.window.level = .modalPanel
         return alert.runModal() == .alertFirstButtonReturn ? .terminateNow : .terminateCancel
     }
 
@@ -121,6 +131,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc
     private func quitApp() {
+        bringDashboardToFront()
+        NSApp.terminate(nil)
+    }
+
+    private func bringDashboardToFront() {
+        NSApp.activate(ignoringOtherApps: true)
+        if let window = NSApp.windows.first {
+            window.makeKeyAndOrderFront(nil)
+            window.orderFrontRegardless()
+        }
+    }
+
+    private func requestForceQuit() {
+        NSApp.activate(ignoringOtherApps: true)
+        forceQuitRequested = true
         NSApp.terminate(nil)
     }
 }
@@ -211,6 +236,7 @@ final class DashboardModel: ObservableObject {
     private var manager: AppManager?
     private var statusItemUpdateHandler: ((DashboardStatusSummary) -> Void)?
     private var guiSessionsUpdateHandler: (([RuntimeGUISession]) -> Void)?
+    private var desktopQuitHandler: (() -> Void)?
     private var detailFetchInFlight = false
     private var metricsFetchInFlight = false
     private var storageFetchInFlight = false
@@ -225,6 +251,8 @@ final class DashboardModel: ObservableObject {
     private var selectedContainerMetricsFetchInFlight = false
     private var lastSelectedContainerMetricsUpdatedEpochMs: Int64?
     private var wasContainerRuntimeRunning = false
+    private var guiEventSubscriptions: [String: DesktopDaemonEventSubscription] = [:]
+    private var waylandRuntimeControlObserver: NSObjectProtocol?
 
     var selectedContainer: RuntimeContainerListItem? {
         guard let selectedContainerID else { return nil }
@@ -284,6 +312,7 @@ final class DashboardModel: ObservableObject {
         }
     }
     private var guiSessionsFetchInFlight = false
+    private var latestGUISessions: [RuntimeGUISession] = []
 
     var activeWorkers: [AppManagerWorkerRecord] {
         workers.filter { $0.lifecycleState == .running || $0.lifecycleState == .starting }
@@ -313,6 +342,10 @@ final class DashboardModel: ObservableObject {
         guiSessionsUpdateHandler = handler
     }
 
+    func setDesktopQuitHandler(_ handler: @escaping () -> Void) {
+        desktopQuitHandler = handler
+    }
+
     func startManager() {
         let logger = MSLLogger(
             logFile: paths.appLogs.appendingPathComponent("desktop.log", isDirectory: false),
@@ -325,7 +358,11 @@ final class DashboardModel: ObservableObject {
         manager.setShowWindowHandler { [weak self] in
             self?.showWindow()
         }
+        manager.setQuitDesktopHandler { [weak self] in
+            self?.desktopQuitHandler?()
+        }
         self.manager = manager
+        installWaylandRuntimeControlObserver()
         do {
             try manager.start()
             refresh()
@@ -336,6 +373,12 @@ final class DashboardModel: ObservableObject {
             }
         } catch {
             managerError = String(describing: error)
+        }
+    }
+
+    deinit {
+        if let waylandRuntimeControlObserver {
+            NotificationCenter.default.removeObserver(waylandRuntimeControlObserver)
         }
     }
 
@@ -351,11 +394,69 @@ final class DashboardModel: ObservableObject {
         wasContainerRuntimeRunning = containerRuntimeIsRunning
         syncSelection()
         statusItemUpdateHandler?(statusSummary())
+        syncGUIEventSubscriptions()
         if containerRuntimeWasRunning != containerRuntimeIsRunning {
             refreshImageStorageSummaryOnLifecycleTransition(running: containerRuntimeIsRunning)
         }
         refreshGUISessions()
         refreshSelectedDataIfNeeded(force: false)
+    }
+
+    private func installWaylandRuntimeControlObserver() {
+        guard waylandRuntimeControlObserver == nil else { return }
+        waylandRuntimeControlObserver = NotificationCenter.default.addObserver(
+            forName: .waylandRuntimeControlRequest,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let self,
+                  let op = notification.userInfo?["op"] as? String,
+                  let instanceName = notification.userInfo?["instanceName"] as? String,
+                  let guiSessionID = notification.userInfo?["guiSessionId"] as? String else {
+                return
+            }
+            let argv = notification.userInfo?["argv"] as? [String] ?? []
+            let imeState = notification.userInfo?["imeState"] as? RuntimeGUIIMEState
+            Task { @MainActor in
+                self.sendWaylandRuntimeControl(
+                    op: op,
+                    instanceName: instanceName,
+                    guiSessionID: guiSessionID,
+                    argv: argv,
+                    imeState: imeState
+                )
+            }
+        }
+    }
+
+    private func sendWaylandRuntimeControl(
+        op: String,
+        instanceName: String,
+        guiSessionID: String,
+        argv: [String],
+        imeState: RuntimeGUIIMEState? = nil
+    ) {
+        guard let worker = workers.first(where: { $0.instanceName == instanceName }) else {
+            NSLog("wayland_runtime_control_failed op=%@ guiSessionId=%@ reason=no_worker", op, guiSessionID)
+            return
+        }
+        Task {
+            do {
+                let client = RuntimeControlClient(socketPath: worker.controlSocketPath)
+                let response = try client.send(RuntimeControlRequest(
+                    op: op,
+                    instance: instanceName,
+                    argv: argv,
+                    guiSessionId: guiSessionID,
+                    imeState: imeState
+                ))
+                if !response.ok {
+                    NSLog("wayland_runtime_control_failed op=%@ guiSessionId=%@ error=%@", op, guiSessionID, response.error ?? "unknown")
+                }
+            } catch {
+                NSLog("wayland_runtime_control_failed op=%@ guiSessionId=%@ error=%@", op, guiSessionID, String(describing: error))
+            }
+        }
     }
 
     func select(instanceName: String) {
@@ -1056,6 +1157,7 @@ final class DashboardModel: ObservableObject {
         guard !guiSessionsFetchInFlight else { return }
         let runningWorkers = workers.filter { $0.lifecycleState == .running }
         guard !runningWorkers.isEmpty else {
+            latestGUISessions = []
             guiSessionsUpdateHandler?([])
             return
         }
@@ -1076,10 +1178,323 @@ final class DashboardModel: ObservableObject {
             let deduped = Dictionary(grouping: collected, by: \.id).compactMap { $0.value.last }
                 .sorted { $0.startedAtEpochMs < $1.startedAtEpochMs }
             await MainActor.run {
+                self.latestGUISessions = deduped
                 self.guiSessionsUpdateHandler?(deduped)
                 self.guiSessionsFetchInFlight = false
             }
         }
+    }
+
+    private func syncGUIEventSubscriptions() {
+        let runningWorkers = workers.filter { $0.lifecycleState == .running }
+        let liveKeys = Set(runningWorkers.map(\.instanceName))
+        for (key, subscription) in guiEventSubscriptions where !liveKeys.contains(key) {
+            subscription.stop()
+            guiEventSubscriptions.removeValue(forKey: key)
+        }
+        for worker in runningWorkers {
+            if let existing = guiEventSubscriptions[worker.instanceName],
+               existing.eventSocketPath == worker.eventSocketPath {
+                continue
+            }
+            guiEventSubscriptions[worker.instanceName]?.stop()
+            let subscription = DesktopDaemonEventSubscription(
+                instanceName: worker.instanceName,
+                eventSocketPath: worker.eventSocketPath
+            ) { [weak self] event in
+                Task { @MainActor in
+                    self?.handleGUIEvent(event)
+                }
+            }
+            guiEventSubscriptions[worker.instanceName] = subscription
+            subscription.start()
+        }
+    }
+
+    private func handleGUIEvent(_ event: DesktopDaemonEventEnvelope) {
+        if event.topic == "gui_cursor" {
+            handleGUICursorEvent(event)
+            return
+        }
+        if event.topic == "gui_ime" {
+            handleGUIIMEEvent(event)
+            return
+        }
+        if event.topic == "gui_session" {
+            refreshGUISessions()
+            return
+        }
+        if event.topic == "gui_window_event" {
+            handleGUIWindowEvent(event)
+            return
+        }
+        handleGUIFrameEvent(event)
+    }
+
+    private func handleGUIFrameEvent(_ event: DesktopDaemonEventEnvelope) {
+        guard event.topic == "gui_frame",
+              event.type == "frame_available",
+              let guiSessionID = event.meta?["guiSessionId"] else {
+            return
+        }
+        NSLog("wayland_frame_event_received instance=%@ guiSessionId=%@", event.instance ?? "", guiSessionID)
+        refreshGUISessions()
+        guard let worker = workers.first(where: { $0.instanceName == event.instance }) ?? workers.first(where: { $0.lifecycleState == .running }) else {
+            NSLog("wayland_frame_fetch_failed guiSessionId=%@ reason=no_worker", guiSessionID)
+            return
+        }
+        fetchLatestGUIFrame(
+            worker: worker,
+            guiSessionID: guiSessionID,
+            snapshotPath: event.meta?["frameSnapshotPath"],
+            sharedFrame: sharedFrame(from: event.meta)
+        )
+    }
+
+    private func handleGUIIMEEvent(_ event: DesktopDaemonEventEnvelope) {
+        guard event.topic == "gui_ime",
+              event.type == "ime_state",
+              let dataBase64 = event.meta?["dataBase64"],
+              let data = Data(base64Encoded: dataBase64),
+              let state = try? JSONDecoder().decode(RuntimeGUIIMEState.self, from: data) else {
+            return
+        }
+        NSLog("wayland_ime_event_received instance=%@ guiSessionId=%@ enabled=%@", event.instance ?? "", state.sessionId, String(state.enabled))
+        NotificationCenter.default.post(
+            name: .waylandIME,
+            object: nil,
+            userInfo: ["envelope": RuntimeGUIDisplayEnvelope(kind: .imeState, imeState: state)]
+        )
+    }
+
+    private func handleGUICursorEvent(_ event: DesktopDaemonEventEnvelope) {
+        guard event.type == "cursor_available",
+              let cursor = cursor(from: event.meta) else {
+            return
+        }
+        NSLog("wayland_cursor_event_received instance=%@ guiSessionId=%@ width=%d height=%d", event.instance ?? "", cursor.sessionId, cursor.width, cursor.height)
+        NotificationCenter.default.post(
+            name: .waylandCursor,
+            object: nil,
+            userInfo: ["cursor": cursor]
+        )
+    }
+
+    private func handleGUIWindowEvent(_ event: DesktopDaemonEventEnvelope) {
+        guard let windowEvent = windowEvent(from: event.meta) else {
+            return
+        }
+        NSLog("wayland_window_event_received instance=%@ guiSessionId=%@ type=%@", event.instance ?? "", windowEvent.sessionId, windowEvent.eventType)
+        NotificationCenter.default.post(
+            name: .waylandWindowEvent,
+            object: nil,
+            userInfo: ["event": windowEvent]
+        )
+        if windowEvent.eventType == "closed" || windowEvent.eventType == "unmapped" {
+            refreshGUISessions()
+        }
+    }
+
+    private func fetchLatestGUIFrame(
+        worker: AppManagerWorkerRecord,
+        guiSessionID: String,
+        snapshotPath: String?,
+        sharedFrame: RuntimeGUISharedFrame?
+    ) {
+        Task {
+            do {
+                let client = RuntimeControlClient(socketPath: worker.controlSocketPath)
+                if let sessions = try? client.send(RuntimeControlRequest(op: "gui_session_list", instance: worker.instanceName)).guiSessions {
+                    await MainActor.run {
+                        self.mergeGUISessions(sessions, for: worker.instanceName)
+                    }
+                }
+                if let sharedFrame {
+                    await MainActor.run {
+                        self.postWaylandSharedFrame(sharedFrame, source: "shm")
+                    }
+                    return
+                }
+                if let snapshotPath,
+                   let envelope = self.loadWaylandFrameSnapshot(path: snapshotPath),
+                   let frame = envelope.frame {
+                    await MainActor.run {
+                        self.postWaylandFrame(envelope, frame: frame, source: "file")
+                    }
+                    return
+                }
+                let response = try client.send(RuntimeControlRequest(
+                    op: "gui_frame_latest",
+                    instance: worker.instanceName,
+                    guiSessionId: guiSessionID
+                ))
+                if response.ok, let sharedFrame = response.sharedFrame {
+                    await MainActor.run {
+                        self.postWaylandSharedFrame(sharedFrame, source: "shm")
+                    }
+                    return
+                }
+                guard response.ok, let frame = response.frame else {
+                    if let fallbackPath = response.meta?["frameSnapshotPath"],
+                       let envelope = self.loadWaylandFrameSnapshot(path: fallbackPath),
+                       let frame = envelope.frame {
+                        await MainActor.run {
+                            self.postWaylandFrame(envelope, frame: frame, source: "file")
+                        }
+                        return
+                    }
+                    NSLog("wayland_frame_fetch_failed guiSessionId=%@ error=%@", guiSessionID, response.error ?? "frame unavailable")
+                    return
+                }
+                let envelope = RuntimeGUIDisplayEnvelope(kind: .frame, frame: frame)
+                await MainActor.run {
+                    self.postWaylandFrame(envelope, frame: frame, source: "rpc")
+                }
+            } catch {
+                NSLog("wayland_frame_fetch_failed guiSessionId=%@ error=%@", guiSessionID, String(describing: error))
+            }
+        }
+    }
+
+    private func sharedFrame(from meta: [String: String]?) -> RuntimeGUISharedFrame? {
+        guard let meta,
+              meta["frameEncoding"] == "posixShm",
+              let sessionId = meta["guiSessionId"],
+              let shmName = meta["shmName"],
+              let width = Int(meta["width"] ?? ""),
+              let height = Int(meta["height"] ?? ""),
+              let stride = Int(meta["stride"] ?? ""),
+              let pixelFormatRaw = meta["pixelFormat"],
+              let pixelFormat = RuntimeGUIFramePixelFormat(rawValue: pixelFormatRaw),
+              let slot = Int(meta["slot"] ?? ""),
+              let slotOffset = Int(meta["slotOffset"] ?? ""),
+              let slotSize = Int(meta["slotSize"] ?? ""),
+              let mappedSize = Int(meta["mappedSize"] ?? ""),
+              let generation = UInt64(meta["generation"] ?? ""),
+              let layoutGeneration = UInt64(meta["layoutGeneration"] ?? ""),
+              let epochMs = Int64(meta["epochMs"] ?? "") else {
+            return nil
+        }
+        let damageRects = (meta["damageRects"] ?? "")
+            .split(separator: ";")
+            .compactMap { entry -> RuntimeGUIFrameDamageRect? in
+                let parts = entry.split(separator: ",").compactMap { Int($0) }
+                guard parts.count == 4 else { return nil }
+                return RuntimeGUIFrameDamageRect(x: parts[0], y: parts[1], width: parts[2], height: parts[3])
+            }
+        return RuntimeGUISharedFrame(
+            sessionId: sessionId,
+            shmName: shmName,
+            width: width,
+            height: height,
+            stride: stride,
+            pixelFormat: pixelFormat,
+            damageRects: damageRects,
+            slot: slot,
+            slotOffset: slotOffset,
+            slotSize: slotSize,
+            mappedSize: mappedSize,
+            generation: generation,
+            layoutGeneration: layoutGeneration,
+            epochMs: epochMs
+        )
+    }
+
+    private func cursor(from meta: [String: String]?) -> RuntimeGUICursor? {
+        guard let meta,
+              let sessionId = meta["guiSessionId"],
+              let width = Int(meta["width"] ?? ""),
+              let height = Int(meta["height"] ?? ""),
+              let stride = Int(meta["stride"] ?? ""),
+              let hotspotX = Int(meta["hotspotX"] ?? ""),
+              let hotspotY = Int(meta["hotspotY"] ?? ""),
+              let pixelFormatRaw = meta["pixelFormat"],
+              let pixelFormat = RuntimeGUIFramePixelFormat(rawValue: pixelFormatRaw),
+              let dataBase64 = meta["dataBase64"],
+              let epochMs = Int64(meta["epochMs"] ?? "") else {
+            return nil
+        }
+        return RuntimeGUICursor(
+            sessionId: sessionId,
+            width: width,
+            height: height,
+            stride: stride,
+            hotspotX: hotspotX,
+            hotspotY: hotspotY,
+            pixelFormat: pixelFormat,
+            dataBase64: dataBase64,
+            epochMs: epochMs
+        )
+    }
+
+    private func windowEvent(from meta: [String: String]?) -> RuntimeGUIWindowEvent? {
+        guard let meta,
+              let sessionId = meta["guiSessionId"],
+              let eventType = meta["eventType"],
+              let epochMs = Int64(meta["epochMs"] ?? "") else {
+            return nil
+        }
+        return RuntimeGUIWindowEvent(
+            sessionId: sessionId,
+            eventType: eventType,
+            title: meta["title"],
+            appId: meta["appId"],
+            serial: meta["serial"].flatMap(UInt32.init),
+            seat: meta["seat"].flatMap(UInt32.init),
+            edge: meta["edge"].flatMap(UInt32.init),
+            pointerX: meta["pointerX"].flatMap(Double.init),
+            pointerY: meta["pointerY"].flatMap(Double.init),
+            epochMs: epochMs
+        )
+    }
+
+    private func loadWaylandFrameSnapshot(path: String) -> RuntimeGUIDisplayEnvelope? {
+        do {
+            let data = try Data(contentsOf: URL(fileURLWithPath: path, isDirectory: false))
+            let envelope = try RuntimeGUIDisplayEnvelope.decode(data)
+            guard envelope.frame != nil else {
+                NSLog("wayland_frame_snapshot_failed path=%@ reason=missing_frame", path)
+                return nil
+            }
+            return envelope
+        } catch {
+            NSLog("wayland_frame_snapshot_failed path=%@ error=%@", path, String(describing: error))
+            return nil
+        }
+    }
+
+    @MainActor
+    private func postWaylandFrame(_ envelope: RuntimeGUIDisplayEnvelope, frame: RuntimeGUIFrame, source: String) {
+        NSLog("wayland_frame_fetched guiSessionId=%@ width=%d height=%d source=%@", frame.sessionId, frame.width, frame.height, source)
+        NotificationCenter.default.post(
+            name: .waylandFrame,
+            object: nil,
+            userInfo: [
+                "envelope": envelope,
+                "source": source
+            ]
+        )
+    }
+
+    @MainActor
+    private func postWaylandSharedFrame(_ sharedFrame: RuntimeGUISharedFrame, source: String) {
+        NSLog("wayland_frame_fetched guiSessionId=%@ width=%d height=%d source=%@", sharedFrame.sessionId, sharedFrame.width, sharedFrame.height, source)
+        NotificationCenter.default.post(
+            name: .waylandFrame,
+            object: nil,
+            userInfo: [
+                "sharedFrame": sharedFrame,
+                "source": source
+            ]
+        )
+    }
+
+    private func mergeGUISessions(_ sessions: [RuntimeGUISession], for instanceName: String) {
+        var merged = latestGUISessions.filter { $0.instanceName != instanceName }
+        merged.append(contentsOf: sessions)
+        latestGUISessions = Dictionary(grouping: merged, by: \.id).compactMap { $0.value.last }
+            .sorted { $0.startedAtEpochMs < $1.startedAtEpochMs }
+        guiSessionsUpdateHandler?(latestGUISessions)
     }
 }
 
@@ -1089,6 +1504,161 @@ struct DashboardStatusSummary {
     let buttonTitle: String
     let toolTip: String
     let hasError: Bool
+}
+
+private struct DesktopDaemonEventEnvelope: Codable {
+    var seq: Int64
+    var topic: String
+    var type: String
+    var instance: String?
+    var state: String?
+    var epochMs: Int64
+    var meta: [String: String]?
+}
+
+private final class DesktopDaemonEventSubscription {
+    let instanceName: String
+    let eventSocketPath: String
+
+    private let handler: (DesktopDaemonEventEnvelope) -> Void
+    private let lock = NSLock()
+    private var fd: Int32 = -1
+    private var running = false
+    private var thread: Thread?
+
+    init(
+        instanceName: String,
+        eventSocketPath: String,
+        handler: @escaping (DesktopDaemonEventEnvelope) -> Void
+    ) {
+        self.instanceName = instanceName
+        self.eventSocketPath = eventSocketPath
+        self.handler = handler
+    }
+
+    func start() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !running else { return }
+        running = true
+        let thread = Thread { [weak self] in
+            self?.run()
+        }
+        thread.name = "msl.desktop.gui-events.\(instanceName)"
+        self.thread = thread
+        thread.start()
+    }
+
+    func stop() {
+        lock.lock()
+        running = false
+        let currentFD = fd
+        fd = -1
+        lock.unlock()
+        if currentFD >= 0 {
+            _ = shutdown(currentFD, SHUT_RDWR)
+            _ = close(currentFD)
+        }
+    }
+
+    private func run() {
+        let socketFD = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard socketFD >= 0 else {
+            NSLog("wayland_frame_event_subscribe_failed instance=%@ reason=socket", instanceName)
+            return
+        }
+        lock.lock()
+        fd = socketFD
+        lock.unlock()
+        defer {
+            lock.lock()
+            if fd == socketFD { fd = -1 }
+            lock.unlock()
+            _ = shutdown(socketFD, SHUT_RDWR)
+            _ = close(socketFD)
+        }
+
+        guard connect(fd: socketFD, path: eventSocketPath) else {
+            NSLog("wayland_frame_event_subscribe_failed instance=%@ reason=connect path=%@", instanceName, eventSocketPath)
+            return
+        }
+        let subscribe = #"{"op":"subscribe","topics":["gui_frame","gui_cursor","gui_ime","gui_session","gui_window_event"]}"# + "\n"
+        guard writeAll(fd: socketFD, data: Data(subscribe.utf8)) else {
+            NSLog("wayland_frame_event_subscribe_failed instance=%@ reason=write", instanceName)
+            return
+        }
+        NSLog("wayland_frame_event_subscribed instance=%@ path=%@", instanceName, eventSocketPath)
+        readLoop(fd: socketFD)
+    }
+
+    private func readLoop(fd: Int32) {
+        var pending = Data()
+        var chunk = [UInt8](repeating: 0, count: 4096)
+        while isRunning {
+            let n = read(fd, &chunk, chunk.count)
+            if n <= 0 {
+                if errno == EINTR { continue }
+                break
+            }
+            pending.append(chunk, count: n)
+            while let newline = pending.firstIndex(of: UInt8(ascii: "\n")) {
+                let line = pending[..<newline]
+                pending.removeSubrange(...newline)
+                guard !line.isEmpty,
+                      let event = try? JSONDecoder().decode(DesktopDaemonEventEnvelope.self, from: line) else {
+                    continue
+                }
+                handler(event)
+            }
+        }
+    }
+
+    private var isRunning: Bool {
+        lock.withLock { running }
+    }
+
+    private func connect(fd: Int32, path: String) -> Bool {
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        let pathBytes = Array(path.utf8)
+        guard pathBytes.count < MemoryLayout.size(ofValue: addr.sun_path) else { return false }
+        withUnsafeMutableBytes(of: &addr.sun_path) { raw in
+            raw.initializeMemory(as: CChar.self, repeating: 0)
+            for (index, byte) in pathBytes.enumerated() {
+                raw[index] = byte
+            }
+        }
+        let addrLen = socklen_t(MemoryLayout.size(ofValue: addr))
+        return withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.connect(fd, $0, addrLen) == 0
+            }
+        }
+    }
+
+    private func writeAll(fd: Int32, data: Data) -> Bool {
+        data.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return true }
+            var offset = 0
+            while offset < raw.count {
+                let written = write(fd, base.advanced(by: offset), raw.count - offset)
+                if written < 0 {
+                    if errno == EINTR { continue }
+                    return false
+                }
+                offset += written
+            }
+            return true
+        }
+    }
+}
+
+private extension NSLock {
+    func withLock<T>(_ body: () -> T) -> T {
+        lock()
+        defer { unlock() }
+        return body()
+    }
 }
 
 struct DashboardView: View {

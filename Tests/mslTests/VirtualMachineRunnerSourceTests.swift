@@ -10,6 +10,29 @@ final class VirtualMachineRunnerSourceTests: XCTestCase {
         XCTAssertFalse(source.contains("targetKind: .environment,\n                flags: 0,\n                entry: \"TZ=\\(hostTimeZoneID)\""))
     }
 
+    func testBootloaderTransferSendsWaylandDefaultsAsExecEnv() throws {
+        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+        let source = try String(contentsOf: root.appendingPathComponent("Sources/mslCore/VirtualMachineRunner.swift"), encoding: .utf8)
+
+        XCTAssertTrue(source.contains("let waylandEnv = defaultWaylandEnvironment()"))
+        XCTAssertTrue(source.contains("entry: \"\\(key)=\\(value)\""))
+        XCTAssertTrue(source.contains("targetKind: .execEnv"))
+    }
+
+    func testWaylandDefaultDisplayDiagnosticsAreLogged() throws {
+        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+        let source = try String(contentsOf: root.appendingPathComponent("Sources/mslCore/VirtualMachineRunner.swift"), encoding: .utf8)
+
+        XCTAssertTrue(source.contains("wayland_default_display_listener_state"))
+        XCTAssertTrue(source.contains("\"default_display_listener_state\": port == 38000 ? \"installed\" : \"session\""))
+        XCTAssertTrue(source.contains("wayland_display_listener_requested"))
+        XCTAssertTrue(source.contains("wayland_display_listener_install_requested"))
+        XCTAssertTrue(source.contains("wayland_display_connection_retained"))
+        XCTAssertTrue(source.contains("wayland_display_fd_duplicated"))
+        XCTAssertTrue(source.contains("wayland_display_core_attached"))
+        XCTAssertTrue(source.contains("wayland_display_core_attach_failed"))
+    }
+
     func testBootloaderTransferSendsEphemeralTmpBootstrapMetadata() throws {
         let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
         let source = try String(contentsOf: root.appendingPathComponent("Sources/mslCore/VirtualMachineRunner.swift"), encoding: .utf8)

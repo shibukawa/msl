@@ -274,6 +274,7 @@ public final class DaemonServer {
     private var procSubscriptionSources: [String: DispatchSourceRead] = [:]
     private var ptySubscriptionSources: [String: DispatchSourceRead] = [:]
     private var guiSessions: [String: RuntimeGUISession] = [:]
+    private var closedSyntheticGUISessionIDs: Set<String> = []
     private let metricsSampleLock = NSLock()
     private var previousMetricsSamples: [String: GuestMetricsRawSample] = [:]
     private var previousContainerCPUSamples: [String: (sampledAtEpochMs: Int64, usageUsec: UInt64)] = [:]
@@ -1291,6 +1292,21 @@ public final class DaemonServer {
             updateStateStarting(step: .eventSocketStart, instanceName: instanceName)
             try bus.start()
             logger.log("daemon_event_socket_started", fields: ["path": eventSocketPath])
+            WaylandCoreHostBridge.shared.setFrameEventHandler { [weak self] frame in
+                self?.publishGUIFrameEvent(frame)
+            }
+            WaylandCoreHostBridge.shared.setSharedFrameEventHandler { [weak self] sharedFrame in
+                self?.publishGUISharedFrameEvent(sharedFrame)
+            }
+            WaylandCoreHostBridge.shared.setCursorEventHandler { [weak self] cursor in
+                self?.publishGUICursorEvent(cursor)
+            }
+            WaylandCoreHostBridge.shared.setIMEEventHandler { [weak self] state in
+                self?.publishGUIIMEEvent(state)
+            }
+            WaylandCoreHostBridge.shared.setWindowEventHandler { [weak self] event in
+                self?.handleGUIWindowEvent(event)
+            }
             updateStateStepCompleted(step: .eventSocketStart, instanceName: instanceName)
             if !isContainerRuntime {
                 let runtimeUser = instanceContext.runtimeUser?.name ?? "root"
@@ -2067,8 +2083,26 @@ public final class DaemonServer {
             return handleGUISessionStop(request)
         case "gui_session_list":
             return handleGUISessionList(request)
+        case "gui_frame_latest":
+            return handleGUIFrameLatest(request)
         case "gui_window_focus":
             return handleGUIWindowFocus(request)
+        case "gui_send_pointer":
+            return handleGUISendPointer(request)
+        case "gui_send_keyboard":
+            return handleGUISendKeyboard(request)
+        case "gui_send_ime_state":
+            return handleGUISendIMEState(request)
+        case "gui_keyboard_status":
+            return handleGUIKeyboardStatus(request)
+        case "gui_keyboard_inject":
+            return handleGUIKeyboardInject(request)
+        case "gui_send_focus":
+            return handleGUISendFocus(request)
+        case "gui_set_geometry":
+            return handleGUISetGeometry(request)
+        case "gui_request_close":
+            return handleGUIRequestClose(request)
 
         // --- port forwarding (existing) ---
         case "port_add":
@@ -4086,9 +4120,10 @@ public final class DaemonServer {
         }
 
         let instanceName: String
+        let context: InstanceRuntimeContext
         do {
             instanceName = resolveTargetInstanceName(request)
-            _ = try ensureInstanceRunning(instanceName: instanceName, callerCwd: request.callerCwd)
+            context = try ensureInstanceRunning(instanceName: instanceName, callerCwd: request.callerCwd)
         } catch {
             return RuntimeControlResponse(ok: false, error: String(describing: error))
         }
@@ -4114,6 +4149,19 @@ public final class DaemonServer {
                 mergedEnv[key] = value
             }
         }
+        do {
+            try ensureWaylandProfileInstalled(instanceName: instanceName)
+            try context.vmRunner?.startWaylandDisplayListener(port: displayPort, sessionID: guiSessionID)
+            try startWaylandProxy(
+                instanceName: instanceName,
+                displayName: displayName,
+                displayPort: displayPort,
+                runtimeDir: mergedEnv["XDG_RUNTIME_DIR"] ?? "/tmp"
+            )
+        } catch {
+            _ = handleSessionUnregister(RuntimeControlRequest(op: "session_unregister", instance: instanceName, sessionId: sessionID))
+            return RuntimeControlResponse(ok: false, error: String(describing: error))
+        }
         let now = nowEpochMs()
         var guiSession = RuntimeGUISession(
             id: guiSessionID,
@@ -4133,15 +4181,10 @@ public final class DaemonServer {
         )
         storeGUISession(guiSession)
 
-        let launchCommand = guiLaunchCommand(
-            argv: argv,
-            displayName: displayName,
-            displayPort: displayPort
-        )
         let procResponse = handleProcOpen(RuntimeControlRequest(
             op: "proc_open",
             instance: instanceName,
-            argv: launchCommand,
+            argv: argv,
             sessionId: sessionID,
             cwd: request.cwd,
             envAdditions: mergedEnv
@@ -4162,7 +4205,10 @@ public final class DaemonServer {
         guiSession.lastUpdatedEpochMs = nowEpochMs()
         storeGUISession(guiSession)
         publishGUISessionEvent(type: "started", session: guiSession)
-        return RuntimeControlResponse(ok: true, procId: procID, sessionId: sessionID, guiSession: guiSession)
+        return RuntimeControlResponse(ok: true, procId: procID, sessionId: sessionID, guiSession: guiSession, meta: [
+            "waylandDisplay": displayName,
+            "waylandRuntimeDir": mergedEnv["XDG_RUNTIME_DIR"] ?? "/tmp"
+        ])
     }
 
     private func handleGUISessionStop(_ request: RuntimeControlRequest) -> RuntimeControlResponse {
@@ -4198,7 +4244,7 @@ public final class DaemonServer {
     }
 
     private func handleGUISessionList(_ request: RuntimeControlRequest) -> RuntimeControlResponse {
-        let sessions = guiSessionLock.withLock {
+        var sessions = guiSessionLock.withLock {
             guiSessions.values
                 .filter { session in
                     guard let instance = request.instance, !instance.isEmpty else { return true }
@@ -4206,7 +4252,277 @@ public final class DaemonServer {
                 }
                 .sorted { lhs, rhs in lhs.startedAtEpochMs < rhs.startedAtEpochMs }
         }
+        if let instanceName = request.instance, !instanceName.isEmpty {
+            let existingIDs = Set(sessions.map(\.id))
+            let defaultFrameIDs = WaylandCoreHostBridge.shared.frameSessionIDs()
+                .filter { $0 == "default-wayland-0" && !existingIDs.contains($0) && !closedSyntheticGUISessionIDs.contains($0) }
+            for sessionID in defaultFrameIDs {
+                let now = nowEpochMs()
+                sessions.append(RuntimeGUISession(
+                    id: sessionID,
+                    instanceName: instanceName,
+                    sessionId: sessionID,
+                    procId: nil,
+                    title: "MSL Wayland",
+                    command: ["wayland"],
+                    state: .running,
+                    display: RuntimeGUIDisplayDescriptor(displayName: "wayland-0", port: 38000),
+                    lastError: nil,
+                    startedAtEpochMs: now,
+                    lastUpdatedEpochMs: now
+                ))
+            }
+            sessions.sort { lhs, rhs in lhs.startedAtEpochMs < rhs.startedAtEpochMs }
+        }
         return RuntimeControlResponse(ok: true, guiSessions: sessions)
+    }
+
+    private func handleGUIFrameLatest(_ request: RuntimeControlRequest) -> RuntimeControlResponse {
+        guard let guiSessionID = request.guiSessionId else {
+            return RuntimeControlResponse(ok: false, error: "missing guiSessionId")
+        }
+        if let sharedFrame = WaylandCoreHostBridge.shared.latestSharedFrame(sessionID: guiSessionID) {
+            logger.log("gui_frame_latest_shared_served", fields: [
+                "guiSessionId": guiSessionID,
+                "width": String(sharedFrame.width),
+                "height": String(sharedFrame.height),
+                "shmName": sharedFrame.shmName,
+                "generation": String(sharedFrame.generation)
+            ])
+            return RuntimeControlResponse(
+                ok: true,
+                sharedFrame: sharedFrame,
+                meta: ["frameEncoding": "posixShm"]
+            )
+        }
+        guard let frame = WaylandCoreHostBridge.shared.latestFrame(sessionID: guiSessionID) else {
+            return RuntimeControlResponse(ok: false, error: "frame unavailable")
+        }
+        let encodedSize = (try? JSONEncoder().encode(RuntimeControlResponse(ok: true, frame: frame)).count) ?? 0
+        if encodedSize >= 4_100_000 {
+            var meta: [String: String] = [:]
+            if let snapshotPath = WaylandCoreHostBridge.shared.frameSnapshotPath(sessionID: guiSessionID) {
+                meta["frameSnapshotPath"] = snapshotPath
+                meta["frameEncoding"] = "jsonSnapshot"
+            }
+            logger.log("gui_frame_latest_too_large", fields: [
+                "guiSessionId": guiSessionID,
+                "bytes": String(encodedSize),
+                "frameSnapshotPath": meta["frameSnapshotPath"] ?? ""
+            ])
+            return RuntimeControlResponse(
+                ok: false,
+                error: "frame too large for control channel",
+                meta: meta.isEmpty ? nil : meta
+            )
+        }
+        logger.log("gui_frame_latest_served", fields: [
+            "guiSessionId": guiSessionID,
+            "width": String(frame.width),
+            "height": String(frame.height),
+            "bytes": String(encodedSize)
+        ])
+        return RuntimeControlResponse(ok: true, frame: frame)
+    }
+
+    private func handleGUISendPointer(_ request: RuntimeControlRequest) -> RuntimeControlResponse {
+        guard let guiSessionID = request.guiSessionId else {
+            return RuntimeControlResponse(ok: false, error: "missing guiSessionId")
+        }
+        let args = request.argv ?? []
+        guard args.count >= 8,
+              let kind = Int32(args[0]),
+              let x = Double(args[1]),
+              let y = Double(args[2]),
+              let button = UInt32(args[3]),
+              let axisX = Double(args[4]),
+              let axisY = Double(args[5]),
+              let modifiers = UInt32(args[6]),
+              let timestampMs = UInt32(args[7]) else {
+            return RuntimeControlResponse(ok: false, error: "invalid pointer arguments")
+        }
+        let ok = WaylandCoreHostBridge.shared.sendPointer(
+            sessionID: guiSessionID,
+            kind: kind,
+            x: x,
+            y: y,
+            button: button,
+            axisX: axisX,
+            axisY: axisY,
+            modifiers: modifiers,
+            timestampMs: timestampMs
+        )
+        logger.log("gui_send_pointer", fields: [
+            "guiSessionId": guiSessionID,
+            "kind": String(kind),
+            "x": String(x),
+            "y": String(y),
+            "sent": String(ok)
+        ])
+        return RuntimeControlResponse(ok: ok, error: ok ? nil : "wayland core unavailable")
+    }
+
+    private func handleGUISendKeyboard(_ request: RuntimeControlRequest) -> RuntimeControlResponse {
+        guard let guiSessionID = request.guiSessionId else {
+            return RuntimeControlResponse(ok: false, error: "missing guiSessionId")
+        }
+        let args = request.argv ?? []
+        guard args.count >= 4,
+              let kind = Int32(args[0]),
+              let keycode = UInt32(args[1]),
+              let modifiers = UInt32(args[2]),
+              let timestampMs = UInt32(args[3]) else {
+            return RuntimeControlResponse(ok: false, error: "invalid keyboard arguments")
+        }
+        let traceID = args.count >= 5 && !args[4].isEmpty
+            ? args[4]
+            : "daemon-key-\(guiSessionID)-\(kind)-\(keycode)-\(timestampMs)"
+        let ok = WaylandCoreHostBridge.shared.sendKeyboard(
+            sessionID: guiSessionID,
+            kind: kind,
+            keycode: keycode,
+            modifiers: modifiers,
+            timestampMs: timestampMs,
+            traceID: traceID
+        )
+        logger.log("gui_send_keyboard", fields: [
+            "traceId": traceID,
+            "guiSessionId": guiSessionID,
+            "kind": String(kind),
+            "keycode": String(keycode),
+            "modifiers": String(modifiers),
+            "sent": String(ok)
+        ])
+        return RuntimeControlResponse(ok: ok, error: ok ? nil : "wayland core unavailable")
+    }
+
+    private func handleGUISendIMEState(_ request: RuntimeControlRequest) -> RuntimeControlResponse {
+        guard let guiSessionID = request.guiSessionId else {
+            return RuntimeControlResponse(ok: false, error: "missing guiSessionId")
+        }
+        guard let state = request.imeState else {
+            return RuntimeControlResponse(ok: false, error: "missing imeState")
+        }
+        let ok = WaylandCoreHostBridge.shared.sendIMEState(sessionID: guiSessionID, state: state)
+        logger.log("gui_send_ime_state", fields: [
+            "guiSessionId": guiSessionID,
+            "enabled": String(state.enabled),
+            "preeditLength": String(state.preedit?.count ?? 0),
+            "committedLength": String(state.committed?.count ?? 0),
+            "sent": String(ok)
+        ])
+        return RuntimeControlResponse(ok: ok, error: ok ? nil : "wayland core unavailable")
+    }
+
+    private func handleGUIKeyboardStatus(_ request: RuntimeControlRequest) -> RuntimeControlResponse {
+        guard let guiSessionID = request.guiSessionId else {
+            return RuntimeControlResponse(ok: false, error: "missing guiSessionId")
+        }
+        let snapshot = WaylandCoreHostBridge.shared.keyboardDebugSnapshot(sessionID: guiSessionID)
+        logger.log("gui_keyboard_status", fields: [
+            "guiSessionId": guiSessionID,
+            "available": String(snapshot != nil)
+        ])
+        return RuntimeControlResponse(
+            ok: snapshot != nil,
+            error: snapshot == nil ? "wayland keyboard debug unavailable" : nil,
+            meta: [
+                "keyboardDebug": snapshot ?? ""
+            ]
+        )
+    }
+
+    private func handleGUIKeyboardInject(_ request: RuntimeControlRequest) -> RuntimeControlResponse {
+        guard let guiSessionID = request.guiSessionId else {
+            return RuntimeControlResponse(ok: false, error: "missing guiSessionId")
+        }
+        let args = request.argv ?? []
+        let keycode = args.first.flatMap(UInt32.init) ?? 30
+        let traceID = "daemon-inject-\(guiSessionID)-\(keycode)-\(UInt32(truncatingIfNeeded: UInt64(Date().timeIntervalSince1970 * 1000)))"
+        let timestampDown = UInt32(truncatingIfNeeded: UInt64(Date().timeIntervalSince1970 * 1000))
+        let down = WaylandCoreHostBridge.shared.sendKeyboard(
+            sessionID: guiSessionID,
+            kind: 1,
+            keycode: keycode,
+            modifiers: 0,
+            timestampMs: timestampDown,
+            traceID: "\(traceID)-down"
+        )
+        let up = WaylandCoreHostBridge.shared.sendKeyboard(
+            sessionID: guiSessionID,
+            kind: 0,
+            keycode: keycode,
+            modifiers: 0,
+            timestampMs: timestampDown &+ 1,
+            traceID: "\(traceID)-up"
+        )
+        logger.log("gui_keyboard_inject", fields: [
+            "traceId": traceID,
+            "guiSessionId": guiSessionID,
+            "keycode": String(keycode),
+            "down": String(down),
+            "up": String(up)
+        ])
+        return RuntimeControlResponse(
+            ok: down && up,
+            error: down && up ? nil : "wayland keyboard inject failed",
+            meta: [
+                "traceId": traceID,
+                "keycode": String(keycode),
+                "down": String(down),
+                "up": String(up)
+            ]
+        )
+    }
+
+    private func handleGUISendFocus(_ request: RuntimeControlRequest) -> RuntimeControlResponse {
+        guard let guiSessionID = request.guiSessionId else {
+            return RuntimeControlResponse(ok: false, error: "missing guiSessionId")
+        }
+        let focused = request.argv?.first == "true"
+        let ok = WaylandCoreHostBridge.shared.sendFocus(sessionID: guiSessionID, focused: focused)
+        logger.log("gui_send_focus", fields: [
+            "guiSessionId": guiSessionID,
+            "focused": String(focused),
+            "sent": String(ok)
+        ])
+        return RuntimeControlResponse(ok: ok, error: ok ? nil : "wayland core unavailable")
+    }
+
+    private func handleGUISetGeometry(_ request: RuntimeControlRequest) -> RuntimeControlResponse {
+        guard let guiSessionID = request.guiSessionId else {
+            return RuntimeControlResponse(ok: false, error: "missing guiSessionId")
+        }
+        let args = request.argv ?? []
+        guard args.count >= 2,
+              let width = Int32(args[0]),
+              let height = Int32(args[1]) else {
+            return RuntimeControlResponse(ok: false, error: "invalid geometry arguments")
+        }
+        let ok = WaylandCoreHostBridge.shared.setGeometry(
+            sessionID: guiSessionID,
+            width: width,
+            height: height
+        )
+        logger.log("gui_set_geometry", fields: [
+            "guiSessionId": guiSessionID,
+            "width": String(width),
+            "height": String(height),
+            "sent": String(ok)
+        ])
+        return RuntimeControlResponse(ok: ok, error: ok ? nil : "wayland core unavailable")
+    }
+
+    private func handleGUIRequestClose(_ request: RuntimeControlRequest) -> RuntimeControlResponse {
+        guard let guiSessionID = request.guiSessionId else {
+            return RuntimeControlResponse(ok: false, error: "missing guiSessionId")
+        }
+        let ok = WaylandCoreHostBridge.shared.requestClose(sessionID: guiSessionID)
+        logger.log("gui_request_close", fields: [
+            "guiSessionId": guiSessionID,
+            "sent": String(ok)
+        ])
+        return RuntimeControlResponse(ok: ok, error: ok ? nil : "wayland core unavailable")
     }
 
     private func handleGUIWindowFocus(_ request: RuntimeControlRequest) -> RuntimeControlResponse {
@@ -4223,29 +4539,65 @@ public final class DaemonServer {
         return executable.isEmpty ? "MSL App" : executable
     }
 
-    private func guiLaunchCommand(
-        argv: [String],
+    private func ensureWaylandProfileInstalled(instanceName: String) throws {
+        let profileScript = mslWaylandProfileScript()
+        let installScript = """
+        set -eu
+        profile_path=\(shellQuote(mslGuestWaylandProfileScriptPath))
+        mkdir -p "$(dirname "$profile_path")"
+        cat > "$profile_path" <<'MSL_WAYLAND_PROFILE'
+        \(profileScript)
+        MSL_WAYLAND_PROFILE
+        chmod 0644 "$profile_path"
+        """
+        let openResponse = handleProcOpen(RuntimeControlRequest(
+            op: "proc_open",
+            instance: instanceName,
+            argv: ["/bin/sh", "-lc", installScript],
+            runAsRoot: true
+        ))
+        guard openResponse.ok, let procID = openResponse.procId else {
+            throw MSLRuntimeError("wayland_profile_failed: \(openResponse.error ?? "install proc_open failed")")
+        }
+        let deadline = Date().addingTimeInterval(30)
+        while Date() < deadline {
+            let readResponse = handleProcRead(RuntimeControlRequest(
+                op: "proc_read",
+                instance: instanceName,
+                timeoutMs: 500,
+                procId: procID
+            ))
+            if let exitCode = readResponse.exitCode {
+                guard readResponse.ok, exitCode == 0 else {
+                    let stderr = readResponse.rawStderr.flatMap { String(data: $0, encoding: .utf8) } ?? readResponse.stderr ?? readResponse.error ?? "exitCode=\(exitCode)"
+                    throw MSLRuntimeError("wayland_profile_failed: \(stderr)")
+                }
+                return
+            }
+        }
+        _ = handleProcClose(RuntimeControlRequest(op: "proc_close", instance: instanceName, procId: procID))
+        throw MSLRuntimeError("wayland_profile_failed: install timed out")
+    }
+
+    private func startWaylandProxy(
+        instanceName: String,
         displayName: String,
-        displayPort: Int
-    ) -> [String] {
-        [
-            "/bin/sh",
-            "-lc",
-            """
-            proxy_bin="$1"
-            display_name="$2"
-            display_port="$3"
-            shift 3
-            if [ -x "$proxy_bin" ]; then
-              exec "$proxy_bin" --display "$display_name" --port "$display_port" -- "$@"
-            fi
-            exec "$@"
-            """,
-            "msl-wayland-launch",
-            "/usr/local/bin/msl-wayland-proxy",
-            displayName,
-            String(displayPort)
-        ] + argv
+        displayPort: Int,
+        runtimeDir: String
+    ) throws {
+        guard let context = resolveContext(for: RuntimeControlRequest(op: "wayland_proxy_start", instance: instanceName)),
+              let client = context.initClient ?? initClient else {
+            throw MSLRuntimeError("instance_not_running")
+        }
+        let response = try client.waylandProxyStart(
+            displayName: displayName,
+            displayPort: displayPort,
+            runtimeDir: runtimeDir,
+            timeoutMs: 3_000
+        )
+        guard response.ok else {
+            throw MSLRuntimeError("wayland_proxy_start_failed: \(response.error?.message ?? "unknown")")
+        }
     }
 
     private func guiDisplayPort(for guiSessionID: String) -> Int {
@@ -4303,6 +4655,215 @@ public final class DaemonServer {
                 "displayPort": String(session.display.port)
             ]
         )
+    }
+
+    private func publishGUIWindowEvent(_ event: RuntimeGUIWindowEvent) {
+        var meta: [String: String] = [
+            "guiSessionId": event.sessionId,
+            "eventType": event.eventType,
+            "epochMs": String(event.epochMs)
+        ]
+        if let title = event.title { meta["title"] = title }
+        if let appId = event.appId { meta["appId"] = appId }
+        if let serial = event.serial { meta["serial"] = String(serial) }
+        if let seat = event.seat { meta["seat"] = String(seat) }
+        if let edge = event.edge { meta["edge"] = String(edge) }
+        if let pointerX = event.pointerX { meta["pointerX"] = String(pointerX) }
+        if let pointerY = event.pointerY { meta["pointerY"] = String(pointerY) }
+        eventBus?.publish(
+            topic: "gui_window_event",
+            type: event.eventType,
+            instance: activeInstanceName ?? explicitInstanceName,
+            state: nil,
+            meta: meta
+        )
+    }
+
+    private func publishGUIFrameEvent(_ frame: RuntimeGUIFrame) {
+        guiSessionLock.withLock {
+            closedSyntheticGUISessionIDs.remove(frame.sessionId)
+            if var session = guiSessions[frame.sessionId], session.procId == nil, session.state == .stopped {
+                session.state = .running
+                session.lastUpdatedEpochMs = nowEpochMs()
+                guiSessions[frame.sessionId] = session
+            }
+        }
+        var meta: [String: String] = [
+            "guiSessionId": frame.sessionId,
+            "width": String(frame.width),
+            "height": String(frame.height),
+            "damageCount": String(frame.damageRects.count),
+            "epochMs": String(frame.epochMs)
+        ]
+        if let snapshotPath = WaylandCoreHostBridge.shared.frameSnapshotPath(sessionID: frame.sessionId) {
+            meta["frameSnapshotPath"] = snapshotPath
+            meta["frameEncoding"] = "jsonSnapshot"
+        }
+        logger.log("wayland_frame_event_published", fields: [
+            "guiSessionId": frame.sessionId,
+            "width": String(frame.width),
+            "height": String(frame.height),
+            "damageCount": String(frame.damageRects.count),
+            "frameSnapshotPath": meta["frameSnapshotPath"] ?? ""
+        ])
+        eventBus?.publish(
+            topic: "gui_frame",
+            type: "frame_available",
+            instance: activeInstanceName ?? explicitInstanceName,
+            state: nil,
+            meta: meta
+        )
+    }
+
+    private func publishGUISharedFrameEvent(_ frame: RuntimeGUISharedFrame) {
+        guiSessionLock.withLock {
+            closedSyntheticGUISessionIDs.remove(frame.sessionId)
+            if var session = guiSessions[frame.sessionId], session.procId == nil, session.state == .stopped {
+                session.state = .running
+                session.lastUpdatedEpochMs = nowEpochMs()
+                guiSessions[frame.sessionId] = session
+            }
+        }
+        let damageSummary = frame.damageRects.map { "\($0.x),\($0.y),\($0.width),\($0.height)" }.joined(separator: ";")
+        logger.log("wayland_frame_event_published", fields: [
+            "guiSessionId": frame.sessionId,
+            "width": String(frame.width),
+            "height": String(frame.height),
+            "damageCount": String(frame.damageRects.count),
+            "frameEncoding": "posixShm",
+            "shmName": frame.shmName,
+            "generation": String(frame.generation)
+        ])
+        eventBus?.publish(
+            topic: "gui_frame",
+            type: "frame_available",
+            instance: activeInstanceName ?? explicitInstanceName,
+            state: nil,
+            meta: [
+                "guiSessionId": frame.sessionId,
+                "frameEncoding": "posixShm",
+                "shmName": frame.shmName,
+                "width": String(frame.width),
+                "height": String(frame.height),
+                "stride": String(frame.stride),
+                "pixelFormat": frame.pixelFormat.rawValue,
+                "slot": String(frame.slot),
+                "slotOffset": String(frame.slotOffset),
+                "slotSize": String(frame.slotSize),
+                "mappedSize": String(frame.mappedSize),
+                "generation": String(frame.generation),
+                "layoutGeneration": String(frame.layoutGeneration),
+                "damageCount": String(frame.damageRects.count),
+                "damageRects": damageSummary,
+                "epochMs": String(frame.epochMs)
+            ]
+        )
+    }
+
+    private func publishGUICursorEvent(_ cursor: RuntimeGUICursor) {
+        logger.log("wayland_cursor_event_published", fields: [
+            "guiSessionId": cursor.sessionId,
+            "width": String(cursor.width),
+            "height": String(cursor.height)
+        ])
+        eventBus?.publish(
+            topic: "gui_cursor",
+            type: "cursor_available",
+            instance: activeInstanceName ?? explicitInstanceName,
+            state: nil,
+            meta: [
+                "guiSessionId": cursor.sessionId,
+                "width": String(cursor.width),
+                "height": String(cursor.height),
+                "stride": String(cursor.stride),
+                "hotspotX": String(cursor.hotspotX),
+                "hotspotY": String(cursor.hotspotY),
+                "pixelFormat": cursor.pixelFormat.rawValue,
+                "dataBase64": cursor.dataBase64,
+                "epochMs": String(cursor.epochMs)
+            ]
+        )
+    }
+
+    private func publishGUIIMEEvent(_ state: RuntimeGUIIMEState) {
+        logger.log("gui_ime_event_published", fields: [
+            "guiSessionId": state.sessionId,
+            "enabled": String(state.enabled),
+            "preeditLength": String(state.preedit?.count ?? 0),
+            "committedLength": String(state.committed?.count ?? 0)
+        ])
+        let dataBase64 = (try? JSONEncoder().encode(state).base64EncodedString()) ?? ""
+        eventBus?.publish(
+            topic: "gui_ime",
+            type: "ime_state",
+            instance: activeInstanceName ?? explicitInstanceName,
+            state: nil,
+            meta: [
+                "guiSessionId": state.sessionId,
+                "enabled": String(state.enabled),
+                "dataBase64": dataBase64
+            ]
+        )
+    }
+
+    private func handleGUIWindowEvent(_ event: RuntimeGUIWindowEvent) {
+        logger.log("wayland_window_event_received", fields: [
+            "guiSessionId": event.sessionId,
+            "eventType": event.eventType
+        ])
+        publishGUIWindowEvent(event)
+        switch event.eventType {
+        case "closed", "unmapped":
+            WaylandCoreHostBridge.shared.clearSessionFrames(sessionID: event.sessionId)
+            var session = lookupGUISession(event.sessionId) ?? RuntimeGUISession(
+                id: event.sessionId,
+                instanceName: activeInstanceName ?? explicitInstanceName ?? "",
+                sessionId: event.sessionId,
+                procId: nil,
+                title: event.title ?? "MSL Wayland",
+                command: ["wayland"],
+                state: .stopped,
+                display: RuntimeGUIDisplayDescriptor(displayName: "wayland-0", port: 38000),
+                lastError: nil,
+                startedAtEpochMs: nowEpochMs(),
+                lastUpdatedEpochMs: nowEpochMs()
+            )
+            session.state = .stopped
+            session.lastUpdatedEpochMs = nowEpochMs()
+            guiSessionLock.withLock {
+                closedSyntheticGUISessionIDs.insert(event.sessionId)
+                guiSessions[event.sessionId] = session
+            }
+            publishGUISessionEvent(type: "stopped", session: session)
+        case "moveRequested", "resizeRequested":
+            break
+        case "title", "appId":
+            var session = lookupGUISession(event.sessionId) ?? RuntimeGUISession(
+                id: event.sessionId,
+                instanceName: activeInstanceName ?? explicitInstanceName ?? "",
+                sessionId: event.sessionId,
+                procId: nil,
+                title: event.title ?? "MSL Wayland",
+                command: ["wayland"],
+                state: .running,
+                display: RuntimeGUIDisplayDescriptor(displayName: "wayland-0", port: 38000),
+                lastError: nil,
+                startedAtEpochMs: nowEpochMs(),
+                lastUpdatedEpochMs: nowEpochMs()
+            )
+            _ = guiSessionLock.withLock {
+                closedSyntheticGUISessionIDs.remove(event.sessionId)
+            }
+            if let title = event.title, !title.isEmpty {
+                session.title = title
+            }
+            session.state = .running
+            session.lastUpdatedEpochMs = nowEpochMs()
+            storeGUISession(session)
+            publishGUISessionEvent(type: event.eventType, session: session)
+        default:
+            break
+        }
     }
 
     // MARK: - Port Forwarding

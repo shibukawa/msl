@@ -677,7 +677,7 @@ enum SessionStreamBridge {
                 return
             }
 
-            var chunk = Data(buffer[0..<Int(n)])
+            let chunk = Data(buffer[0..<Int(n)])
             if let detachByte, let index = chunk.firstIndex(of: detachByte) {
                 let prefix = chunk.prefix(upTo: index)
                 if !prefix.isEmpty {

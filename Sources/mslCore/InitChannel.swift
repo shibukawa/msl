@@ -68,6 +68,9 @@ public struct InitChannelRequest: Codable {
     public var initSourcePath: String?
     public var initDryRun: Bool?
     public var sidebandRole: String?
+    public var displayName: String?
+    public var displayPort: Int?
+    public var runtimeDir: String?
 
     public init(
         version: Int = 1,
@@ -114,7 +117,10 @@ public struct InitChannelRequest: Codable {
         dnsProxyListenPort: Int? = nil,
         initSourcePath: String? = nil,
         initDryRun: Bool? = nil,
-        sidebandRole: String? = nil
+        sidebandRole: String? = nil,
+        displayName: String? = nil,
+        displayPort: Int? = nil,
+        runtimeDir: String? = nil
     ) {
         self.version = version
         self.requestId = requestId
@@ -161,6 +167,9 @@ public struct InitChannelRequest: Codable {
         self.initSourcePath = initSourcePath
         self.initDryRun = initDryRun
         self.sidebandRole = sidebandRole
+        self.displayName = displayName
+        self.displayPort = displayPort
+        self.runtimeDir = runtimeDir
     }
 }
 
@@ -821,6 +830,43 @@ public final class InitChannelClient {
             op: "proc_close",
             timeoutMs: timeoutMs ?? self.timeoutMs,
             procId: procId
+        ))
+    }
+
+    public func waylandProxyStart(
+        displayName: String,
+        displayPort: Int,
+        runtimeDir: String = "/tmp",
+        timeoutMs: Int? = nil
+    ) throws -> InitChannelResponse {
+        try send(InitChannelRequest(
+            op: "wayland_proxy_start",
+            timeoutMs: timeoutMs ?? self.timeoutMs,
+            displayName: displayName,
+            displayPort: displayPort,
+            runtimeDir: runtimeDir
+        ))
+    }
+
+    public func waylandProxyStop(
+        displayName: String,
+        timeoutMs: Int? = nil
+    ) throws -> InitChannelResponse {
+        try send(InitChannelRequest(
+            op: "wayland_proxy_stop",
+            timeoutMs: timeoutMs ?? self.timeoutMs,
+            displayName: displayName
+        ))
+    }
+
+    public func waylandProxyStatus(
+        displayName: String? = nil,
+        timeoutMs: Int? = nil
+    ) throws -> InitChannelResponse {
+        try send(InitChannelRequest(
+            op: "wayland_proxy_status",
+            timeoutMs: timeoutMs ?? self.timeoutMs,
+            displayName: displayName
         ))
     }
 

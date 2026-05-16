@@ -14,4 +14,5 @@ real-smithay = ["dep:smithay"]
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+libc = "0.2"
 smithay = { version = "0.4", default-features = false, optional = true }

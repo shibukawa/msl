@@ -9,7 +9,8 @@ use tokio::task::JoinSet;
 async fn main() -> Result<(), String> {
     let mut args = env::args().skip(1);
     let mut display_name = env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "wayland-0".to_string());
-    let mut display_port = env::var("MSL_DISPLAY_VSOCK_PORT").unwrap_or_else(|_| "38000".to_string());
+    let mut display_port =
+        env::var("MSL_DISPLAY_VSOCK_PORT").unwrap_or_else(|_| "38000".to_string());
     let mut command: Vec<String> = Vec::new();
 
     while let Some(arg) = args.next() {
@@ -37,7 +38,8 @@ async fn main() -> Result<(), String> {
     if Path::new(&socket_path).exists() {
         let _ = std::fs::remove_file(&socket_path);
     }
-    let listener = UnixListener::bind(&socket_path).map_err(|e| format!("bind {} failed: {}", socket_path, e))?;
+    let listener = UnixListener::bind(&socket_path)
+        .map_err(|e| format!("bind {} failed: {}", socket_path, e))?;
     eprintln!(
         "msl-wayland-proxy listening socket={} display_port={}",
         socket_path, display_port
@@ -52,7 +54,10 @@ async fn main() -> Result<(), String> {
         cmd.stdin(Stdio::null());
         cmd.stdout(Stdio::inherit());
         cmd.stderr(Stdio::inherit());
-        Some(cmd.spawn().map_err(|e| format!("spawn {} failed: {}", command[0], e))?)
+        Some(
+            cmd.spawn()
+                .map_err(|e| format!("spawn {} failed: {}", command[0], e))?,
+        )
     };
 
     let mut tasks = JoinSet::new();

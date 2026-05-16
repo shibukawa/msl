@@ -14,6 +14,7 @@ public final class AppManager {
     private var server: ManagerControlServer?
     private var workerProcesses: [String: Process] = [:]
     private var showWindowHandler: (() -> Void)?
+    private var quitDesktopHandler: (() -> Void)?
     private var shuttingDown = false
 
     public init(
@@ -31,6 +32,10 @@ public final class AppManager {
 
     public func setShowWindowHandler(_ handler: @escaping () -> Void) {
         showWindowHandler = handler
+    }
+
+    public func setQuitDesktopHandler(_ handler: @escaping () -> Void) {
+        quitDesktopHandler = handler
     }
 
     public func start() throws {
@@ -131,6 +136,14 @@ public final class AppManager {
                     showWindowHandler?()
                 }
                 return ManagerControlResponse(ok: true, workers: snapshot().workers)
+            case "quit_desktop":
+                guard let quitDesktopHandler else {
+                    return ManagerControlResponse(ok: false, error: "desktop quit handler unavailable")
+                }
+                DispatchQueue.main.async {
+                    quitDesktopHandler()
+                }
+                return ManagerControlResponse(ok: true)
             case "ensure_instance":
                 guard let instance = request.instance?.trimmingCharacters(in: .whitespacesAndNewlines), !instance.isEmpty else {
                     return ManagerControlResponse(ok: false, error: "missing instance")

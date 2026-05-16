@@ -15,18 +15,28 @@ private struct LoadedWaylandSymbols {
     typealias StartFn = @convention(c) (UnsafeMutableRawPointer?) -> Bool
     typealias StopFn = @convention(c) (UnsafeMutableRawPointer?) -> Void
     typealias AttachSessionFn = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<CChar>?) -> Bool
+    typealias AttachDisplayFdFn = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<CChar>?, Int32) -> Bool
     typealias DetachSessionFn = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<CChar>?) -> Void
     typealias SendTextInputFn = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<CChar>?, UnsafePointer<UInt8>?, Int) -> Void
     typealias SetGeometryFn = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<CChar>?, Int32, Int32) -> Void
+    typealias SendPointerFn = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<CChar>?, Int32, Double, Double, UInt32, Double, Double, UInt32, UInt32) -> Void
+    typealias SendKeyboardFn = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<CChar>?, Int32, UInt32, UInt32, UInt32) -> Void
+    typealias SendFocusFn = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<CChar>?, Bool) -> Void
+    typealias RequestCloseFn = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<CChar>?) -> Void
 
     let create: CreateFn
     let destroy: DestroyFn
     let start: StartFn
     let stop: StopFn
     let attachSession: AttachSessionFn
+    let attachDisplayFd: AttachDisplayFdFn?
     let detachSession: DetachSessionFn
     let sendTextInput: SendTextInputFn
     let setGeometry: SetGeometryFn
+    let sendPointer: SendPointerFn?
+    let sendKeyboard: SendKeyboardFn?
+    let sendFocus: SendFocusFn?
+    let requestClose: RequestCloseFn?
 }
 
 struct WaylandCoreCallbacks {
@@ -34,6 +44,7 @@ struct WaylandCoreCallbacks {
     var onIMEState: (@convention(c) (UnsafePointer<UInt8>?, Int, UnsafeMutableRawPointer?) -> Void)?
     var onLog: (@convention(c) (UnsafePointer<CChar>?, UnsafeMutableRawPointer?) -> Void)?
     var onExit: (@convention(c) (Int32, UnsafeMutableRawPointer?) -> Void)?
+    var onFrameShared: (@convention(c) (UnsafePointer<UInt8>?, Int, UnsafeMutableRawPointer?) -> Void)?
 }
 
 final class WaylandCoreBridge {
@@ -76,6 +87,9 @@ final class WaylandCoreBridge {
             },
             onExit: { code, _ in
                 NotificationCenter.default.post(name: .waylandExit, object: nil, userInfo: ["code": Int(code)])
+            },
+            onFrameShared: { bytes, count, userData in
+                WaylandCoreBridge.dispatchEnvelope(bytes: bytes, count: count, userData: userData, name: .waylandFrame)
             }
         )
         let userData = Unmanaged.passUnretained(self).toOpaque()
@@ -124,6 +138,13 @@ final class WaylandCoreBridge {
         attachedSessions.remove(sessionID)
     }
 
+    func attachDisplayFD(sessionID: String, fd: Int32) -> Bool {
+        guard let coreHandle, let symbols, let attachDisplayFd = symbols.attachDisplayFd else { return false }
+        return sessionID.withCString { pointer in
+            attachDisplayFd(coreHandle, pointer, fd)
+        }
+    }
+
     func sendIMEState(_ state: RuntimeGUIIMEState) {
         guard let coreHandle, let symbols else { return }
         guard let data = try? RuntimeGUIDisplayEnvelope(kind: .imeState, imeState: state).encoded() else { return }
@@ -143,6 +164,50 @@ final class WaylandCoreBridge {
         guard let coreHandle, let symbols else { return }
         sessionID.withCString { pointer in
             symbols.setGeometry(coreHandle, pointer, Int32(width), Int32(height))
+        }
+    }
+
+    func sendPointer(
+        sessionID: String,
+        kind: Int32,
+        x: Double,
+        y: Double,
+        button: UInt32 = 0,
+        axisX: Double = 0,
+        axisY: Double = 0,
+        modifiers: UInt32 = 0,
+        timestampMs: UInt32 = WaylandCoreBridge.timestampMs()
+    ) {
+        guard let coreHandle, let symbols, let sendPointer = symbols.sendPointer else { return }
+        sessionID.withCString { pointer in
+            sendPointer(coreHandle, pointer, kind, x, y, button, axisX, axisY, modifiers, timestampMs)
+        }
+    }
+
+    func sendKeyboard(
+        sessionID: String,
+        kind: Int32,
+        keycode: UInt32,
+        modifiers: UInt32 = 0,
+        timestampMs: UInt32 = WaylandCoreBridge.timestampMs()
+    ) {
+        guard let coreHandle, let symbols, let sendKeyboard = symbols.sendKeyboard else { return }
+        sessionID.withCString { pointer in
+            sendKeyboard(coreHandle, pointer, kind, keycode, modifiers, timestampMs)
+        }
+    }
+
+    func sendFocus(sessionID: String, focused: Bool) {
+        guard let coreHandle, let symbols, let sendFocus = symbols.sendFocus else { return }
+        sessionID.withCString { pointer in
+            sendFocus(coreHandle, pointer, focused)
+        }
+    }
+
+    func requestClose(sessionID: String) {
+        guard let coreHandle, let symbols, let requestClose = symbols.requestClose else { return }
+        sessionID.withCString { pointer in
+            requestClose(coreHandle, pointer)
         }
     }
 
@@ -184,9 +249,14 @@ final class WaylandCoreBridge {
             start: start,
             stop: stop,
             attachSession: attachSession,
+            attachDisplayFd: load("core_attach_display_fd", as: LoadedWaylandSymbols.AttachDisplayFdFn.self),
             detachSession: detachSession,
             sendTextInput: sendTextInput,
-            setGeometry: setGeometry
+            setGeometry: setGeometry,
+            sendPointer: load("core_send_pointer", as: LoadedWaylandSymbols.SendPointerFn.self),
+            sendKeyboard: load("core_send_keyboard", as: LoadedWaylandSymbols.SendKeyboardFn.self),
+            sendFocus: load("core_send_focus", as: LoadedWaylandSymbols.SendFocusFn.self),
+            requestClose: load("core_request_toplevel_close", as: LoadedWaylandSymbols.RequestCloseFn.self)
         )
     }
 
@@ -209,5 +279,9 @@ final class WaylandCoreBridge {
         guard let envelope = try? RuntimeGUIDisplayEnvelope.decode(data) else { return }
         NotificationCenter.default.post(name: name, object: nil, userInfo: ["envelope": envelope])
         _ = userData
+    }
+
+    private static func timestampMs() -> UInt32 {
+        UInt32(truncatingIfNeeded: UInt64(Date().timeIntervalSince1970 * 1000))
     }
 }

@@ -41,6 +41,9 @@ public final class VirtualMachineRunner {
     private var timeTunnelListenerDelegate: AnyObject?
     private var codeOpenListener: AnyObject?
     private var codeOpenListenerDelegate: AnyObject?
+    private var waylandDisplayListeners: [Int: AnyObject] = [:]
+    private var waylandDisplayListenerDelegates: [Int: AnyObject] = [:]
+    private var retainedWaylandDisplayConnections: [String: AnyObject] = [:]
     private var memoryPlan: RuntimeMemoryPlan?
     public private(set) var activeNetworkTopology: VMNetNetworkTopology?
 
@@ -250,6 +253,64 @@ public final class VirtualMachineRunner {
             "elapsed_ms": String(monotonicMs() - runnerStartMs)
         ])
         return 0
+        #else
+        throw MSLRuntimeError("Virtualization.framework is unavailable in this build")
+        #endif
+    }
+
+    public func startWaylandDisplayListener(port: Int, sessionID: String) throws {
+        #if canImport(Virtualization)
+        logger?.log("wayland_display_listener_requested", fields: [
+            "port": String(port),
+            "session": sessionID,
+            "default_display_listener_state": port == 38000 ? "requested" : "session"
+        ])
+        guard port > 0, port <= 65535 else {
+            logger?.log("wayland_display_listener_failed", fields: [
+                "port": String(port),
+                "session": sessionID,
+                "reason": "invalid_port"
+            ])
+            throw MSLRuntimeError("invalid Wayland display port \(port)")
+        }
+        guard waylandDisplayListeners[port] == nil else {
+            logger?.log("wayland_display_listener_reused", fields: [
+                "port": String(port),
+                "session": sessionID,
+                "default_display_listener_state": port == 38000 ? "installed" : "session"
+            ])
+            return
+        }
+        guard let virtualMachine = runningVM,
+              let vmQueue = runningVMQueue,
+              let vsockDevice = virtualMachine.socketDevices.compactMap({ $0 as? VZVirtioSocketDevice }).first else {
+            logger?.log("wayland_display_listener_failed", fields: [
+                "port": String(port),
+                "session": sessionID,
+                "reason": "vm_not_running"
+            ])
+            throw MSLRuntimeError("wayland display listener unavailable: VM is not running")
+        }
+        let listener = VZVirtioSocketListener()
+        let delegate = WaylandDisplayListenerDelegate { [weak self] connection in
+            self?.handleWaylandDisplayConnection(connection: connection, port: port, sessionID: sessionID)
+        }
+        listener.delegate = delegate
+        vmQueue.async {
+            vsockDevice.setSocketListener(listener, forPort: UInt32(port))
+        }
+        logger?.log("wayland_display_listener_install_requested", fields: [
+            "port": String(port),
+            "session": sessionID,
+            "default_display_listener_state": port == 38000 ? "installing" : "session"
+        ])
+        waylandDisplayListeners[port] = listener
+        waylandDisplayListenerDelegates[port] = delegate
+        logger?.log("wayland_display_listener_started", fields: [
+            "port": String(port),
+            "session": sessionID,
+            "default_display_listener_state": port == 38000 ? "installed" : "session"
+        ])
         #else
         throw MSLRuntimeError("Virtualization.framework is unavailable in this build")
         #endif
@@ -745,6 +806,15 @@ public final class VirtualMachineRunner {
                 entry: "TZ=\(hostTimeZoneID)"
             )
         ]
+        let waylandEnv = defaultWaylandEnvironment()
+        for key in waylandEnv.keys.sorted() {
+            guard let value = waylandEnv[key] else { continue }
+            metadataRecords.append(.init(
+                targetKind: .execEnv,
+                flags: 0,
+                entry: "\(key)=\(value)"
+            ))
+        }
         metadataRecords.append(contentsOf: ephemeralTmpMetadataRecords(metadata: metadata))
         let metadata = try MSLInitBootTransferProtocol.encodeMetadataBlock(records: metadataRecords)
 
@@ -993,11 +1063,21 @@ public final class VirtualMachineRunner {
             self?.handleCodeOpenRequest(fd: fd)
         }
         codeOpenListener.delegate = codeOpenDelegate
+        let defaultWaylandDisplayListener = VZVirtioSocketListener()
+        let defaultWaylandDisplayDelegate = WaylandDisplayListenerDelegate { [weak self] connection in
+            self?.handleWaylandDisplayConnection(
+                connection: connection,
+                port: 38000,
+                sessionID: "default-wayland-0"
+            )
+        }
+        defaultWaylandDisplayListener.delegate = defaultWaylandDisplayDelegate
         vmQueue.async {
             vsockDevice.setSocketListener(listener, forPort: 1024)
             vsockDevice.setSocketListener(dnsTunnelListener, forPort: 1053)
             vsockDevice.setSocketListener(timeTunnelListener, forPort: 1067)
             vsockDevice.setSocketListener(codeOpenListener, forPort: 5001)
+            vsockDevice.setSocketListener(defaultWaylandDisplayListener, forPort: 38000)
         }
 
         let timeoutSec = resolveInitAttachTimeoutSec()
@@ -1044,8 +1124,15 @@ public final class VirtualMachineRunner {
         self.dnsTunnelListenerDelegate = dnsTunnelDelegate
         self.timeTunnelListener = timeTunnelListener
         self.timeTunnelListenerDelegate = timeTunnelDelegate
+        logger?.log("wayland_default_display_listener_state", fields: [
+            "port": "38000",
+            "state": waylandDisplayListeners[38000] == nil ? "missing" : "installed",
+            "session": "default"
+        ])
         self.codeOpenListener = codeOpenListener
         self.codeOpenListenerDelegate = codeOpenDelegate
+        self.waylandDisplayListeners[38000] = defaultWaylandDisplayListener
+        self.waylandDisplayListenerDelegates[38000] = defaultWaylandDisplayDelegate
         startBalloonController(client: client)
 
         return client
@@ -1142,6 +1229,9 @@ public final class VirtualMachineRunner {
         self.timeTunnelListenerDelegate = nil
         self.codeOpenListener = nil
         self.codeOpenListenerDelegate = nil
+        self.waylandDisplayListeners.removeAll()
+        self.waylandDisplayListenerDelegates.removeAll()
+        self.retainedWaylandDisplayConnections.removeAll()
         self.balloonDevice = nil
         self.balloonCurrentTargetBytes = nil
         self.balloonReturnedTotalBytes = 0
@@ -1396,6 +1486,67 @@ public final class VirtualMachineRunner {
             return
         }
         codeOpenRequestHandler?(payload)
+    }
+
+    private func handleWaylandDisplayConnection(
+        connection: VZVirtioSocketConnection,
+        port: Int,
+        sessionID: String
+    ) {
+        logger?.log("wayland_display_connection_accepted", fields: [
+            "port": String(port),
+            "session": sessionID,
+            "fd": String(connection.fileDescriptor),
+            "default_display_listener_state": port == 38000 ? "accepted" : "session"
+        ])
+        guard WaylandCoreHostBridge.shared.startIfNeeded(paths: paths, logger: logger) else {
+            logger?.log("wayland_display_core_unavailable", fields: [
+                "port": String(port),
+                "session": sessionID,
+                "default_display_listener_state": port == 38000 ? "accepted_core_unavailable" : "session"
+            ])
+            Darwin.shutdown(connection.fileDescriptor, SHUT_RDWR)
+            return
+        }
+        let fd = Darwin.dup(connection.fileDescriptor)
+        guard fd >= 0 else {
+            logger?.log("wayland_display_fd_dup_failed", fields: [
+                "port": String(port),
+                "session": sessionID,
+                "error": String(cString: strerror(errno))
+            ])
+            Darwin.shutdown(connection.fileDescriptor, SHUT_RDWR)
+            return
+        }
+        logger?.log("wayland_display_fd_duplicated", fields: [
+            "port": String(port),
+            "session": sessionID,
+            "fd": String(connection.fileDescriptor),
+            "dupFd": String(fd)
+        ])
+        let retainedKey = "\(port):\(sessionID)"
+        retainedWaylandDisplayConnections[retainedKey] = connection
+        logger?.log("wayland_display_connection_retained", fields: [
+            "port": String(port),
+            "session": sessionID,
+            "retainedKey": retainedKey
+        ])
+        let ok = WaylandCoreHostBridge.shared.attachDisplay(sessionID: sessionID, fd: fd)
+        if ok {
+            logger?.log("wayland_display_core_attached", fields: [
+                "port": String(port),
+                "session": sessionID,
+                "default_display_listener_state": port == 38000 ? "attached" : "session"
+            ])
+        } else {
+            logger?.log("wayland_display_core_attach_failed", fields: [
+                "port": String(port),
+                "session": sessionID,
+                "default_display_listener_state": port == 38000 ? "accepted_attach_failed" : "session"
+            ])
+            Darwin.close(fd)
+            Darwin.shutdown(connection.fileDescriptor, SHUT_RDWR)
+        }
     }
 
     private func readExact(handle: FileHandle, count: Int) -> Data? {
@@ -2044,6 +2195,23 @@ private final class DNSTunnelListenerDelegate: NSObject, VZVirtioSocketListenerD
             self.onAccept(connection.fileDescriptor)
             _ = retained
         }
+        return true
+    }
+}
+
+private final class WaylandDisplayListenerDelegate: NSObject, VZVirtioSocketListenerDelegate {
+    private let handler: (VZVirtioSocketConnection) -> Void
+
+    init(handler: @escaping (VZVirtioSocketConnection) -> Void) {
+        self.handler = handler
+    }
+
+    func listener(
+        _ listener: VZVirtioSocketListener,
+        shouldAcceptNewConnection connection: VZVirtioSocketConnection,
+        from socketDevice: VZVirtioSocketDevice
+    ) -> Bool {
+        handler(connection)
         return true
     }
 }

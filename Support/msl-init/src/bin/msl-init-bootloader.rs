@@ -87,7 +87,10 @@ fn main() -> Result<(), String> {
         .unwrap_or(MSL_VSOCK_PORT);
 
     let mut stream = connect_vsock_with_timeout(port, Duration::from_secs(CONNECT_TIMEOUT_SECS))?;
-    send_line(&mut stream, &format!("{MAGIC} HELLO {HELLO_VERSION} {init_mode}"))?;
+    send_line(
+        &mut stream,
+        &format!("{MAGIC} HELLO {HELLO_VERSION} {init_mode}"),
+    )?;
 
     let records = read_metadata_block(&mut stream)?;
     let exec_env_assignments = apply_metadata_records(&records)?;
@@ -130,7 +133,10 @@ fn connect_vsock_with_timeout(port: u32, timeout: Duration) -> Result<std::fs::F
     loop {
         let fd = unsafe { socket(AF_VSOCK, SOCK_STREAM, 0) };
         if fd < 0 {
-            return Err(format!("socket(AF_VSOCK) failed: {}", std::io::Error::last_os_error()));
+            return Err(format!(
+                "socket(AF_VSOCK) failed: {}",
+                std::io::Error::last_os_error()
+            ));
         }
 
         let addr = SockaddrVm {
@@ -146,9 +152,14 @@ fn connect_vsock_with_timeout(port: u32, timeout: Duration) -> Result<std::fs::F
         }
 
         let err = std::io::Error::last_os_error();
-        unsafe { close(fd); }
+        unsafe {
+            close(fd);
+        }
         if Instant::now() >= deadline {
-            return Err(format!("vsock connect to host port {} failed: {}", port, err));
+            return Err(format!(
+                "vsock connect to host port {} failed: {}",
+                port, err
+            ));
         }
         thread::sleep(Duration::from_millis(backoff_ms));
         backoff_ms = (backoff_ms * 2).min(2_000);
@@ -181,7 +192,10 @@ fn read_metadata_block<R: Read>(reader: &mut R) -> Result<Vec<MetadataRecord>, S
         }
         let reserved = read_u16_le(reader)?;
         if reserved != 0 {
-            return Err(format!("metadata reserved field must be zero, got {}", reserved));
+            return Err(format!(
+                "metadata reserved field must be zero, got {}",
+                reserved
+            ));
         }
         let entry_len = read_u32_le(reader)?;
         if entry_len > MAX_METADATA_ENTRY_BYTES {
@@ -319,7 +333,9 @@ fn escape_env_value(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-fn build_exec_environment(exec_env_assignments: Vec<String>) -> Result<Vec<(OsString, OsString)>, String> {
+fn build_exec_environment(
+    exec_env_assignments: Vec<String>,
+) -> Result<Vec<(OsString, OsString)>, String> {
     let mut map = BTreeMap::<OsString, OsString>::new();
     for (key, value) in env::vars_os() {
         map.insert(key, value);
@@ -379,19 +395,25 @@ fn is_valid_env_key(key: &str) -> bool {
 
 fn read_u8<R: Read>(reader: &mut R) -> Result<u8, String> {
     let mut buf = [0_u8; 1];
-    reader.read_exact(&mut buf).map_err(|e| format!("read u8 failed: {e}"))?;
+    reader
+        .read_exact(&mut buf)
+        .map_err(|e| format!("read u8 failed: {e}"))?;
     Ok(buf[0])
 }
 
 fn read_u16_le<R: Read>(reader: &mut R) -> Result<u16, String> {
     let mut buf = [0_u8; 2];
-    reader.read_exact(&mut buf).map_err(|e| format!("read u16 failed: {e}"))?;
+    reader
+        .read_exact(&mut buf)
+        .map_err(|e| format!("read u16 failed: {e}"))?;
     Ok(u16::from_le_bytes(buf))
 }
 
 fn read_u32_le<R: Read>(reader: &mut R) -> Result<u32, String> {
     let mut buf = [0_u8; 4];
-    reader.read_exact(&mut buf).map_err(|e| format!("read u32 failed: {e}"))?;
+    reader
+        .read_exact(&mut buf)
+        .map_err(|e| format!("read u32 failed: {e}"))?;
     Ok(u32::from_le_bytes(buf))
 }
 
@@ -419,7 +441,8 @@ fn install_payload_at(payload: &[u8], target: &Path) -> Result<(), String> {
     let parent = target
         .parent()
         .ok_or_else(|| format!("target has no parent: {}", target.display()))?;
-    fs::create_dir_all(parent).map_err(|e| format!("create parent {} failed: {e}", parent.display()))?;
+    fs::create_dir_all(parent)
+        .map_err(|e| format!("create parent {} failed: {e}", parent.display()))?;
     let temp = temp_path_for(target);
     {
         let mut file = OpenOptions::new()
@@ -437,8 +460,13 @@ fn install_payload_at(payload: &[u8], target: &Path) -> Result<(), String> {
     }
     fs::set_permissions(&temp, fs::Permissions::from_mode(0o755))
         .map_err(|e| format!("chmod temp {} failed: {e}", temp.display()))?;
-    fs::rename(&temp, target)
-        .map_err(|e| format!("rename {} -> {} failed: {e}", temp.display(), target.display()))?;
+    fs::rename(&temp, target).map_err(|e| {
+        format!(
+            "rename {} -> {} failed: {e}",
+            temp.display(),
+            target.display()
+        )
+    })?;
     Ok(())
 }
 
@@ -534,10 +562,22 @@ mod tests {
 
     #[test]
     fn determine_paths_from_invocation_path() {
-        assert_eq!(determine_init_mode(Path::new("/sbin/msl-init-bootloader")), "direct-init");
-        assert_eq!(determine_exec_target(Path::new("/sbin/msl-init-bootloader")), RUNTIME_INIT_BINARY);
-        assert_eq!(determine_init_mode(Path::new("/usr/local/bin/msl-init-bootloader")), "service-managed-init");
-        assert_eq!(determine_exec_target(Path::new("/usr/local/bin/msl-init-bootloader")), RUNTIME_INIT_BINARY);
+        assert_eq!(
+            determine_init_mode(Path::new("/sbin/msl-init-bootloader")),
+            "direct-init"
+        );
+        assert_eq!(
+            determine_exec_target(Path::new("/sbin/msl-init-bootloader")),
+            RUNTIME_INIT_BINARY
+        );
+        assert_eq!(
+            determine_init_mode(Path::new("/usr/local/bin/msl-init-bootloader")),
+            "service-managed-init"
+        );
+        assert_eq!(
+            determine_exec_target(Path::new("/usr/local/bin/msl-init-bootloader")),
+            RUNTIME_INIT_BINARY
+        );
     }
 
     #[test]
@@ -587,10 +627,14 @@ mod tests {
 
     #[test]
     fn patch_environment_text_replaces_or_adds_assignments() {
-        let updated = patch_environment_text("PATH=\"/usr/bin\"\nTZ=\"UTC\"\n", &[
-            "TZ=Asia/Tokyo".to_string(),
-            "DISPLAY=/tmp/.X11-unix/X0".to_string()
-        ]).unwrap();
+        let updated = patch_environment_text(
+            "PATH=\"/usr/bin\"\nTZ=\"UTC\"\n",
+            &[
+                "TZ=Asia/Tokyo".to_string(),
+                "DISPLAY=/tmp/.X11-unix/X0".to_string(),
+            ],
+        )
+        .unwrap();
         assert!(updated.contains("PATH=\"/usr/bin\""));
         assert!(updated.contains("TZ=\"Asia/Tokyo\""));
         assert!(updated.contains("DISPLAY=\"/tmp/.X11-unix/X0\""));
@@ -600,14 +644,21 @@ mod tests {
     #[test]
     fn build_exec_environment_includes_exec_env_without_persisting() {
         env::set_var("PATH", "/usr/bin");
-        let envs = build_exec_environment(vec!["TZ=Asia/Tokyo".to_string(), "DISPLAY=:0".to_string()]).unwrap();
-        assert!(envs.iter().any(|(k, v)| k == &OsString::from("TZ") && v == &OsString::from("Asia/Tokyo")));
-        assert!(envs.iter().any(|(k, v)| k == &OsString::from("DISPLAY") && v == &OsString::from(":0")));
+        let envs =
+            build_exec_environment(vec!["TZ=Asia/Tokyo".to_string(), "DISPLAY=:0".to_string()])
+                .unwrap();
+        assert!(envs
+            .iter()
+            .any(|(k, v)| k == &OsString::from("TZ") && v == &OsString::from("Asia/Tokyo")));
+        assert!(envs
+            .iter()
+            .any(|(k, v)| k == &OsString::from("DISPLAY") && v == &OsString::from(":0")));
     }
 
     #[test]
     fn install_payload_uses_runtime_path() {
-        let temp_dir = std::env::temp_dir().join(format!("msl-init-bootloader-test-{}", std::process::id()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("msl-init-bootloader-test-{}", std::process::id()));
         let target = temp_dir.join("msl-init");
         let payload = vec![0_u8; MIN_PAYLOAD_BYTES];
         fs::create_dir_all(&temp_dir).unwrap();

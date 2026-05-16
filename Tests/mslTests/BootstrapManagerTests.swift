@@ -27,6 +27,7 @@ final class BootstrapManagerTests: XCTestCase {
 
         let initBinary = ctx.root.appendingPathComponent("msl-init")
         let bootloaderBinary = ctx.root.appendingPathComponent("msl-init-bootloader")
+        let waylandProxyBinary = ctx.root.appendingPathComponent("msl-wayland-proxy")
         let mkfsHelper = ctx.root.appendingPathComponent("msl-ext4-mkfs")
         let ext4Helper = ctx.root.appendingPathComponent("msl-ext4-image")
         var fakeElf = Data(repeating: 0, count: 64)
@@ -40,6 +41,7 @@ final class BootstrapManagerTests: XCTestCase {
         fakeElf[19] = 0x00 // e_machine high byte
         try fakeElf.write(to: initBinary)
         try fakeElf.write(to: bootloaderBinary)
+        try fakeElf.write(to: waylandProxyBinary)
         try Data("helper".utf8).write(to: mkfsHelper)
         try Data("helper".utf8).write(to: ext4Helper)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: bootloaderBinary.path)
@@ -48,8 +50,16 @@ final class BootstrapManagerTests: XCTestCase {
 
         setenv("MSL_INIT_BINARY_PATH", initBinary.path, 1)
         setenv("MSL_INIT_BOOTLOADER_BINARY_PATH", bootloaderBinary.path, 1)
+        setenv("MSL_WAYLAND_PROXY_BINARY_PATH", waylandProxyBinary.path, 1)
         setenv("MSL_EXT4_MKFS_HELPER_PATH", mkfsHelper.path, 1)
         setenv("MSL_EXT4_HELPER_PATH", ext4Helper.path, 1)
+        defer {
+            unsetenv("MSL_INIT_BINARY_PATH")
+            unsetenv("MSL_INIT_BOOTLOADER_BINARY_PATH")
+            unsetenv("MSL_WAYLAND_PROXY_BINARY_PATH")
+            unsetenv("MSL_EXT4_MKFS_HELPER_PATH")
+            unsetenv("MSL_EXT4_HELPER_PATH")
+        }
 
         let logger = MSLLogger(logFile: ctx.paths.logs.appendingPathComponent("test.log"))
         let bootstrap = BootstrapManager(paths: ctx.paths, logger: logger)
@@ -58,14 +68,10 @@ final class BootstrapManagerTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: ctx.paths.distroDirectory(named: "default").path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: ctx.paths.mslHostInitBinaryFile.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: ctx.paths.mslHostInitBootloaderBinaryFile.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: ctx.paths.mslHostWaylandProxyBinaryFile.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: ctx.paths.mslHostExt4MkfsHelperBinaryFile.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: ctx.paths.mslHostExt4HelperBinaryFile.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: ctx.paths.compressionCachePolicyCatalogFile.path))
-
-        unsetenv("MSL_INIT_BINARY_PATH")
-        unsetenv("MSL_INIT_BOOTLOADER_BINARY_PATH")
-        unsetenv("MSL_EXT4_MKFS_HELPER_PATH")
-        unsetenv("MSL_EXT4_HELPER_PATH")
     }
 }
 

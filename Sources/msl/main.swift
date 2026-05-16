@@ -246,7 +246,8 @@ struct AppCommand: ParsableCommand {
 struct AppRunCommand: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "run",
-        abstract: "Run a Wayland-native GUI application in the VM."
+        abstract: "Run a Wayland-native GUI application in the VM.",
+        discussion: "Use this command instead of running GUI apps directly in a guest shell when you want MSL to create and manage the host Wayland window."
     )
 
     @Option(name: [.customLong("title")], help: "Window title override for the host child window.")
@@ -442,10 +443,13 @@ struct StopCommand: ParsableCommand {
         abstract: "Stop runtime."
     )
 
-    @Flag(name: [.customLong("app")], help: "Stop the desktop app manager.")
+    @Flag(name: [.customLong("app")], help: "Deprecated alias for --desktop.")
     var app = false
 
-    @Flag(name: [.short, .long], help: "Stop all running instances.")
+    @Flag(name: [.customLong("desktop")], help: "Stop MSL Desktop.")
+    var desktop = false
+
+    @Flag(name: [.short, .long], help: "Stop all running instances and the desktop app manager.")
     var all = false
 
     @Argument(help: "Instance name.")
@@ -459,15 +463,15 @@ struct StopCommand: ParsableCommand {
             throw ValidationError("Specify target instance with either global `--instance`/`-i` or `stop <instance>`, not both")
         }
         let targetInstance = instance ?? CLIInvocationContext.instanceName
-        if app, targetInstance != nil {
-            throw ValidationError("`stop --app` cannot be combined with an instance argument")
+        if (app || desktop), targetInstance != nil {
+            throw ValidationError("`stop --app`/`--desktop` cannot be combined with an instance argument")
         }
     }
 
     mutating func run() throws {
         let targetInstance = instance ?? CLIInvocationContext.instanceName
         withRuntimeManager { manager in
-            if app {
+            if app || desktop {
                 try manager.stopAppManager()
                 return
             }

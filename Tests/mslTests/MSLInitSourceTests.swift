@@ -21,10 +21,11 @@ final class MSLInitSourceTests: XCTestCase {
     func testEarlyInitExposesBtrfsStateRootForDedupe() throws {
         let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
         let source = try String(contentsOf: root.appendingPathComponent("Support/msl-init/src/bin/msl-early-init.rs"), encoding: .utf8)
+        let compactSource = source.replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
 
         XCTAssertTrue(source.contains("\"/sysroot/run/msl/state-root\""))
         XCTAssertTrue(source.contains("expose state root /sysroot/run/msl/state-root"))
-        XCTAssertTrue(source.contains("mount_fs(\"/dev/vdb\", \"/sysroot/run/msl/state-root\", \"btrfs\", MS_NOSUID | MS_NODEV, Some(\"compress=zstd\"))"))
+        XCTAssertTrue(compactSource.contains("mount_fs( \"/dev/vdb\", \"/sysroot/run/msl/state-root\", \"btrfs\", MS_NOSUID | MS_NODEV, Some(\"compress=zstd\"), )"))
     }
 
     func testPersistentVsockConnectionDoesNotDependOnTryClone() throws {

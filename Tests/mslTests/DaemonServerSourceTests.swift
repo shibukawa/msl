@@ -68,6 +68,67 @@ final class DaemonServerSourceTests: XCTestCase {
         XCTAssertTrue(source.contains("containerStatsList"))
     }
 
+    func testWaylandLaunchUsesInitIntegratedProxy() throws {
+        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+        let source = try String(contentsOf: root.appendingPathComponent("Sources/mslCore/DaemonServer.swift"), encoding: .utf8)
+
+        XCTAssertTrue(source.contains("startWaylandProxy"))
+        XCTAssertTrue(source.contains("waylandProxyStart"))
+        XCTAssertTrue(source.contains("mslWaylandProfileScript()"))
+        XCTAssertFalse(source.contains("missing_wayland_proxy"))
+        XCTAssertFalse(source.contains("exec \"$proxy_bin\" --display \"$display_name\" --port \"$display_port\" -- \"$@\""))
+    }
+
+    func testWaylandFrameEventsArePublishedAndServed() throws {
+        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+        let source = try String(contentsOf: root.appendingPathComponent("Sources/mslCore/DaemonServer.swift"), encoding: .utf8)
+
+        XCTAssertTrue(source.contains("setFrameEventHandler"))
+        XCTAssertTrue(source.contains("publishGUIFrameEvent"))
+        XCTAssertTrue(source.contains("topic: \"gui_frame\""))
+        XCTAssertTrue(source.contains("type: \"frame_available\""))
+        XCTAssertTrue(source.contains("wayland_frame_event_published"))
+        XCTAssertTrue(source.contains("gui_frame_latest_served"))
+        XCTAssertTrue(source.contains("gui_frame_latest_shared_served"))
+        XCTAssertTrue(source.contains("publishGUISharedFrameEvent"))
+        XCTAssertTrue(source.contains("publishGUIWindowEvent"))
+        XCTAssertTrue(source.contains("publishGUIIMEEvent"))
+        XCTAssertTrue(source.contains("topic: \"gui_window_event\""))
+        XCTAssertTrue(source.contains("clearSessionFrames(sessionID: event.sessionId)"))
+        XCTAssertTrue(source.contains("\"frameEncoding\": \"posixShm\""))
+        XCTAssertTrue(source.contains("frame too large for control channel"))
+        XCTAssertTrue(source.contains("frameSnapshotPath"))
+        XCTAssertTrue(source.contains("\"frameEncoding\"] = \"jsonSnapshot\""))
+    }
+
+    func testWaylandInputOpsForwardToHostCore() throws {
+        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+        let source = try String(contentsOf: root.appendingPathComponent("Sources/mslCore/DaemonServer.swift"), encoding: .utf8)
+        let bridge = try String(contentsOf: root.appendingPathComponent("Sources/mslCore/WaylandCoreHostBridge.swift"), encoding: .utf8)
+
+        XCTAssertTrue(source.contains(#"case "gui_send_pointer":"#))
+        XCTAssertTrue(source.contains(#"case "gui_send_keyboard":"#))
+        XCTAssertTrue(source.contains(#"case "gui_send_ime_state":"#))
+        XCTAssertTrue(source.contains(#"case "gui_keyboard_status":"#))
+        XCTAssertTrue(source.contains(#"case "gui_keyboard_inject":"#))
+        XCTAssertTrue(source.contains(#"case "gui_send_focus":"#))
+        XCTAssertTrue(source.contains(#"case "gui_set_geometry":"#))
+        XCTAssertTrue(source.contains(#"case "gui_request_close":"#))
+        XCTAssertTrue(source.contains("WaylandCoreHostBridge.shared.sendPointer"))
+        XCTAssertTrue(source.contains("WaylandCoreHostBridge.shared.sendKeyboard"))
+        XCTAssertTrue(source.contains("WaylandCoreHostBridge.shared.sendIMEState"))
+        XCTAssertTrue(source.contains("WaylandCoreHostBridge.shared.keyboardDebugSnapshot"))
+        XCTAssertTrue(source.contains("handleGUIKeyboardInject"))
+        XCTAssertTrue(source.contains("WaylandCoreHostBridge.shared.requestClose"))
+        XCTAssertTrue(source.contains(#""traceId": traceID"#))
+        XCTAssertTrue(source.contains(#""modifiers": String(modifiers)"#))
+        XCTAssertTrue(bridge.contains("core_send_pointer"))
+        XCTAssertTrue(bridge.contains("core_send_keyboard"))
+        XCTAssertTrue(bridge.contains("core_send_keyboard_trace"))
+        XCTAssertTrue(bridge.contains("core_keyboard_debug_snapshot"))
+        XCTAssertTrue(bridge.contains("core_request_toplevel_close"))
+    }
+
     func testContainerRuntimeSummaryReportsDedupeWithoutBlockingRuntimeHealth() throws {
         let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
         let source = try String(contentsOf: root.appendingPathComponent("Sources/mslCore/DaemonServer.swift"), encoding: .utf8)

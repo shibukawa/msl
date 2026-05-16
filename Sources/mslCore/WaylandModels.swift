@@ -138,8 +138,58 @@ public struct RuntimeGUIFrame: Codable, Equatable {
     }
 }
 
+public struct RuntimeGUISharedFrame: Codable, Equatable {
+    public var sessionId: String
+    public var shmName: String
+    public var width: Int
+    public var height: Int
+    public var stride: Int
+    public var pixelFormat: RuntimeGUIFramePixelFormat
+    public var damageRects: [RuntimeGUIFrameDamageRect]
+    public var slot: Int
+    public var slotOffset: Int
+    public var slotSize: Int
+    public var mappedSize: Int
+    public var generation: UInt64
+    public var layoutGeneration: UInt64
+    public var epochMs: Int64
+
+    public init(
+        sessionId: String,
+        shmName: String,
+        width: Int,
+        height: Int,
+        stride: Int,
+        pixelFormat: RuntimeGUIFramePixelFormat,
+        damageRects: [RuntimeGUIFrameDamageRect],
+        slot: Int,
+        slotOffset: Int,
+        slotSize: Int,
+        mappedSize: Int,
+        generation: UInt64,
+        layoutGeneration: UInt64,
+        epochMs: Int64
+    ) {
+        self.sessionId = sessionId
+        self.shmName = shmName
+        self.width = width
+        self.height = height
+        self.stride = stride
+        self.pixelFormat = pixelFormat
+        self.damageRects = damageRects
+        self.slot = slot
+        self.slotOffset = slotOffset
+        self.slotSize = slotSize
+        self.mappedSize = mappedSize
+        self.generation = generation
+        self.layoutGeneration = layoutGeneration
+        self.epochMs = epochMs
+    }
+}
+
 public struct RuntimeGUIIMEState: Codable, Equatable {
     public var sessionId: String
+    public var enabled: Bool
     public var surroundingText: String
     public var cursorUTF16Offset: Int
     public var anchorUTF16Offset: Int
@@ -147,18 +197,34 @@ public struct RuntimeGUIIMEState: Codable, Equatable {
     public var committed: String?
     public var deleteLeftUTF16Count: Int
     public var deleteRightUTF16Count: Int
+    public var markedRangeUTF16: RuntimeGUITextRange?
+    public var preeditSelectionUTF16: RuntimeGUITextRange?
+    public var replacementRangeUTF16: RuntimeGUITextRange?
+    public var preeditCursorBeginUTF16: Int?
+    public var preeditCursorEndUTF16: Int?
+    public var compositionActive: Bool?
+    public var cursorRect: RuntimeGUICursorRect?
 
     public init(
         sessionId: String,
+        enabled: Bool = false,
         surroundingText: String,
         cursorUTF16Offset: Int,
         anchorUTF16Offset: Int,
         preedit: String? = nil,
         committed: String? = nil,
         deleteLeftUTF16Count: Int = 0,
-        deleteRightUTF16Count: Int = 0
+        deleteRightUTF16Count: Int = 0,
+        markedRangeUTF16: RuntimeGUITextRange? = nil,
+        preeditSelectionUTF16: RuntimeGUITextRange? = nil,
+        replacementRangeUTF16: RuntimeGUITextRange? = nil,
+        preeditCursorBeginUTF16: Int? = nil,
+        preeditCursorEndUTF16: Int? = nil,
+        compositionActive: Bool? = nil,
+        cursorRect: RuntimeGUICursorRect? = nil
     ) {
         self.sessionId = sessionId
+        self.enabled = enabled
         self.surroundingText = surroundingText
         self.cursorUTF16Offset = cursorUTF16Offset
         self.anchorUTF16Offset = anchorUTF16Offset
@@ -166,6 +232,112 @@ public struct RuntimeGUIIMEState: Codable, Equatable {
         self.committed = committed
         self.deleteLeftUTF16Count = deleteLeftUTF16Count
         self.deleteRightUTF16Count = deleteRightUTF16Count
+        self.markedRangeUTF16 = markedRangeUTF16
+        self.preeditSelectionUTF16 = preeditSelectionUTF16
+        self.replacementRangeUTF16 = replacementRangeUTF16
+        self.preeditCursorBeginUTF16 = preeditCursorBeginUTF16
+        self.preeditCursorEndUTF16 = preeditCursorEndUTF16
+        self.compositionActive = compositionActive
+        self.cursorRect = cursorRect
+    }
+}
+
+public struct RuntimeGUITextRange: Codable, Equatable {
+    public var location: Int
+    public var length: Int
+
+    public init(location: Int, length: Int) {
+        self.location = location
+        self.length = length
+    }
+}
+
+public struct RuntimeGUICursorRect: Codable, Equatable {
+    public var x: Int
+    public var y: Int
+    public var width: Int
+    public var height: Int
+
+    public init(x: Int, y: Int, width: Int, height: Int) {
+        self.x = x
+        self.y = y
+        self.width = width
+        self.height = height
+    }
+}
+
+public struct RuntimeGUICursor: Codable, Equatable {
+    public var sessionId: String
+    public var width: Int
+    public var height: Int
+    public var stride: Int
+    public var hotspotX: Int
+    public var hotspotY: Int
+    public var pixelFormat: RuntimeGUIFramePixelFormat
+    public var dataBase64: String
+    public var epochMs: Int64
+
+    public init(
+        sessionId: String,
+        width: Int,
+        height: Int,
+        stride: Int,
+        hotspotX: Int,
+        hotspotY: Int,
+        pixelFormat: RuntimeGUIFramePixelFormat,
+        dataBase64: String,
+        epochMs: Int64
+    ) {
+        self.sessionId = sessionId
+        self.width = width
+        self.height = height
+        self.stride = stride
+        self.hotspotX = hotspotX
+        self.hotspotY = hotspotY
+        self.pixelFormat = pixelFormat
+        self.dataBase64 = dataBase64
+        self.epochMs = epochMs
+    }
+
+    public var decodedData: Data {
+        Data(base64Encoded: dataBase64) ?? Data()
+    }
+}
+
+public struct RuntimeGUIWindowEvent: Codable, Equatable {
+    public var sessionId: String
+    public var eventType: String
+    public var title: String?
+    public var appId: String?
+    public var serial: UInt32?
+    public var seat: UInt32?
+    public var edge: UInt32?
+    public var pointerX: Double?
+    public var pointerY: Double?
+    public var epochMs: Int64
+
+    public init(
+        sessionId: String,
+        eventType: String,
+        title: String? = nil,
+        appId: String? = nil,
+        serial: UInt32? = nil,
+        seat: UInt32? = nil,
+        edge: UInt32? = nil,
+        pointerX: Double? = nil,
+        pointerY: Double? = nil,
+        epochMs: Int64
+    ) {
+        self.sessionId = sessionId
+        self.eventType = eventType
+        self.title = title
+        self.appId = appId
+        self.serial = serial
+        self.seat = seat
+        self.edge = edge
+        self.pointerX = pointerX
+        self.pointerY = pointerY
+        self.epochMs = epochMs
     }
 }
 
@@ -173,6 +345,8 @@ public enum RuntimeGUIDisplayEnvelopeKind: String, Codable {
     case hello
     case frame
     case imeState
+    case cursor
+    case windowEvent
     case focus
     case ping
 }
@@ -181,20 +355,29 @@ public struct RuntimeGUIDisplayEnvelope: Codable, Equatable {
     public var kind: RuntimeGUIDisplayEnvelopeKind
     public var session: RuntimeGUISession?
     public var frame: RuntimeGUIFrame?
+    public var sharedFrame: RuntimeGUISharedFrame?
     public var imeState: RuntimeGUIIMEState?
+    public var cursor: RuntimeGUICursor?
+    public var windowEvent: RuntimeGUIWindowEvent?
     public var meta: [String: String]?
 
     public init(
         kind: RuntimeGUIDisplayEnvelopeKind,
         session: RuntimeGUISession? = nil,
         frame: RuntimeGUIFrame? = nil,
+        sharedFrame: RuntimeGUISharedFrame? = nil,
         imeState: RuntimeGUIIMEState? = nil,
+        cursor: RuntimeGUICursor? = nil,
+        windowEvent: RuntimeGUIWindowEvent? = nil,
         meta: [String: String]? = nil
     ) {
         self.kind = kind
         self.session = session
         self.frame = frame
+        self.sharedFrame = sharedFrame
         self.imeState = imeState
+        self.cursor = cursor
+        self.windowEvent = windowEvent
         self.meta = meta
     }
 
@@ -212,6 +395,13 @@ public func managedGUIEnvironment(
     sessionID: String,
     port: Int
 ) -> [String: String] {
+    var env = defaultWaylandEnvironment(displayName: displayName)
+    env["MSL_GUI_SESSION_ID"] = sessionID
+    env["MSL_DISPLAY_VSOCK_PORT"] = String(port)
+    return env
+}
+
+public func defaultWaylandEnvironment(displayName: String = "wayland-0") -> [String: String] {
     [
         "WAYLAND_DISPLAY": displayName,
         "GDK_BACKEND": "wayland",
@@ -220,11 +410,26 @@ public func managedGUIEnvironment(
         "CLUTTER_BACKEND": "wayland",
         "MOZ_ENABLE_WAYLAND": "1",
         "XDG_SESSION_TYPE": "wayland",
-        "MSL_GUI_SESSION_ID": sessionID,
+        "XDG_RUNTIME_DIR": "/tmp",
         "MSL_WAYLAND_DISPLAY": displayName,
-        "MSL_DISPLAY_VSOCK_PORT": String(port),
-        "MSL_GUEST_WAYLAND_PROXY_BIN": "/usr/local/bin/msl-wayland-proxy"
     ]
+}
+
+public let mslGuestWaylandProfileScriptPath = "/etc/profile.d/msl-wayland.sh"
+
+public func mslWaylandProfileScript(displayName: String = "wayland-0") -> String {
+    """
+    # Installed by MSL. Enables Wayland defaults for interactive guest shells.
+    export WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-\(displayName)}"
+    export MSL_WAYLAND_DISPLAY="${MSL_WAYLAND_DISPLAY:-$WAYLAND_DISPLAY}"
+    export GDK_BACKEND="${GDK_BACKEND:-wayland}"
+    export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-wayland}"
+    export SDL_VIDEODRIVER="${SDL_VIDEODRIVER:-wayland}"
+    export CLUTTER_BACKEND="${CLUTTER_BACKEND:-wayland}"
+    export MOZ_ENABLE_WAYLAND="${MOZ_ENABLE_WAYLAND:-1}"
+    export XDG_SESSION_TYPE="${XDG_SESSION_TYPE:-wayland}"
+    export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}"
+    """
 }
 
 public func applyDamageRects(

@@ -12,10 +12,7 @@ CONTAINER_TOOLS_STAGE_DIR ?= $(HOME)/Library/Application Support/msl/tools/bundl
 REGCTL_VERSION ?= latest
 UMOCI_VERSION ?= latest
 
-build:
-	$(MAKE) build-init
-	$(MAKE) build-wayland
-	$(MAKE) build-ext4-helper
+build: build-init build-wayland build-ext4-helper
 	./scripts/build-signed.sh
 
 build-init:
