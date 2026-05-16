@@ -2,6 +2,7 @@ import Foundation
 
 struct RuntimeMemoryPlan {
     static let mebibyte: UInt64 = 1024 * 1024
+    private static let defaultDynamicFloorBytes: UInt64 = 2 * 1024 * 1024 * 1024
 
     let maxBytes: UInt64
     let startupBytes: UInt64
@@ -58,7 +59,8 @@ struct RuntimeMemoryPlan {
         let requested = withHeadroom.overflow ? UInt64.max : withHeadroom.partialValue
 
         let rounded = Self.roundUpToMiB(requested)
-        let clamped = Self.clamp(rounded, lower: startupBytes, upper: maxBytes)
+        let dynamicFloor = min(maxBytes, max(startupBytes, Self.defaultDynamicFloorBytes))
+        let clamped = Self.clamp(rounded, lower: dynamicFloor, upper: maxBytes)
 
         let delta: UInt64
         if clamped > currentTargetBytes {

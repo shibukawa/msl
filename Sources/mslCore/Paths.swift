@@ -53,6 +53,8 @@ public struct MSLPaths {
     public let mslHostInitBootloaderBinaryFile: URL
     public let mslHostEarlyInitBinaryFile: URL
     public let mslHostExt4HelperBinaryFile: URL
+    public let mslHostWaylandDir: URL
+    public let mslHostWaylandProxyBinaryFile: URL
     public let mslHostInitBootstrapLogFile: URL
     public let serialConsoleLogFile: URL
 
@@ -93,6 +95,8 @@ public struct MSLPaths {
         self.mslHostInitBootloaderBinaryFile = mslHostToolsDir.appendingPathComponent("msl-init-bootloader", isDirectory: false)
         self.mslHostEarlyInitBinaryFile = mslHostToolsDir.appendingPathComponent("msl-early-init", isDirectory: false)
         self.mslHostExt4HelperBinaryFile = mslHostToolsDir.appendingPathComponent("msl-ext4-image", isDirectory: false)
+        self.mslHostWaylandDir = mslHostToolsDir.appendingPathComponent("wayland", isDirectory: true)
+        self.mslHostWaylandProxyBinaryFile = mslHostWaylandDir.appendingPathComponent("msl-wayland-proxy", isDirectory: false)
         self.mslHostInitBootstrapLogFile = mslHostToolsDir.appendingPathComponent("init-bootstrap.log", isDirectory: false)
         self.serialConsoleLogFile = logs.appendingPathComponent("serial-console.log", isDirectory: false)
         let uid = getuid()

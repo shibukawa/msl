@@ -289,9 +289,32 @@ final class DistributionManagerTests: XCTestCase {
         let bootloaderInUsrLocal = rootfs.appendingPathComponent("usr/local/bin/msl-init-bootloader", isDirectory: false)
         let bootloaderInSbin = rootfs.appendingPathComponent("sbin/msl-init-bootloader", isDirectory: false)
         let initInUsrLocal = rootfs.appendingPathComponent("usr/local/bin/msl-init", isDirectory: false)
+        let waylandProfile = rootfs.appendingPathComponent("etc/profile.d/msl-wayland.sh", isDirectory: false)
         XCTAssertTrue(FileManager.default.fileExists(atPath: bootloaderInUsrLocal.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: bootloaderInSbin.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: initInUsrLocal.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: waylandProfile.path))
+        XCTAssertTrue(try String(contentsOf: waylandProfile, encoding: .utf8).contains("WAYLAND_DISPLAY"))
+    }
+
+    func testStageInitBinaryInstallsWaylandProfileWithoutProxyBinary() throws {
+        let ctx = try DistributionContext.make()
+        defer { ctx.cleanup() }
+
+        let fakeInit = ctx.root.appendingPathComponent("msl-init-bootloader-fake", isDirectory: false)
+        try Data(repeating: 0x41, count: 64).write(to: fakeInit)
+        setenv("MSL_INIT_BOOTLOADER_BINARY_PATH", fakeInit.path, 1)
+        defer { unsetenv("MSL_INIT_BOOTLOADER_BINARY_PATH") }
+
+        let rootfs = ctx.root.appendingPathComponent("rootfs", isDirectory: true)
+        try FileManager.default.createDirectory(at: rootfs, withIntermediateDirectories: true)
+
+        try ctx.makeManager().stageInitBinary(intoRootfs: rootfs)
+
+        let profile = rootfs.appendingPathComponent("etc/profile.d/msl-wayland.sh", isDirectory: false)
+        let proxy = rootfs.appendingPathComponent("usr/local/bin/msl-wayland-proxy", isDirectory: false)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: profile.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: proxy.path))
     }
 
     func testParseSHA256FromChecksumFile() throws {

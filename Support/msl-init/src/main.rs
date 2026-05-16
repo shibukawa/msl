@@ -1,18 +1,18 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Write};
-use std::os::fd::AsRawFd;
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
+use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::fs::symlink;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::fs::symlink;
 use std::os::unix::io::FromRawFd;
 use std::os::unix::net::UnixListener;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicI8, AtomicU64, Ordering};
 use std::sync::mpsc::{self as std_mpsc, Receiver};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -22,7 +22,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{unix::AsyncFd, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command as TokioCommand;
 use tokio::runtime::{Builder as TokioRuntimeBuilder, Runtime as TokioRuntime};
-use tokio::sync::{mpsc as tokio_mpsc, Mutex as TokioMutex};
+use tokio::sync::{mpsc as tokio_mpsc, oneshot, Mutex as TokioMutex};
 use tokio::time::{timeout as tokio_timeout, Duration as TokioDuration};
 
 const MAX_READ_BYTES: usize = 16 * 1024;
@@ -231,10 +231,12 @@ static PTY_SESSIONS: OnceLock<Mutex<HashMap<String, PtySession>>> = OnceLock::ne
 static PTY_SEQ: AtomicU64 = AtomicU64::new(1);
 static PROC_SESSIONS: OnceLock<Mutex<HashMap<String, ProcSession>>> = OnceLock::new();
 static PROC_SEQ: AtomicU64 = AtomicU64::new(1);
+static WAYLAND_TRACE_SEQ: AtomicU64 = AtomicU64::new(1);
 static LOG_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static DIAG_LOCK: OnceLock<Mutex<Option<std::fs::File>>> = OnceLock::new();
 static RUNTIME_USER: OnceLock<Mutex<RuntimeUserContext>> = OnceLock::new();
 static DNS_PROXY_STATE: OnceLock<Mutex<Option<DNSProxyRuntime>>> = OnceLock::new();
+static WAYLAND_PROXIES: OnceLock<Mutex<HashMap<String, WaylandProxyRuntime>>> = OnceLock::new();
 static NTP_UPSTREAM_HEALTH: AtomicI8 = AtomicI8::new(0);
 
 #[derive(Clone)]
@@ -251,6 +253,24 @@ struct DNSProxyRuntime {
     upstreams: Vec<SocketAddr>,
     stop_tx: std_mpsc::Sender<()>,
     handle: JoinHandle<()>,
+}
+
+struct WaylandProxyRuntime {
+    display_name: String,
+    display_port: u32,
+    runtime_dir: String,
+    socket_path: String,
+    active_clients: usize,
+    default_proxy_started: bool,
+    build_marker: String,
+    last_trace_id: Option<String>,
+    last_error: Option<String>,
+    last_client_event: Option<String>,
+    last_host_event: Option<String>,
+    bytes_client_to_host: u64,
+    bytes_host_to_client: u64,
+    keymap_sent: bool,
+    stop_tx: Option<oneshot::Sender<()>>,
 }
 
 struct RawAsyncFD(i32);
@@ -325,6 +345,23 @@ fn runtime_context_for_request(run_as_root: bool) -> RuntimeUserContext {
 
 fn dns_proxy_state() -> &'static Mutex<Option<DNSProxyRuntime>> {
     DNS_PROXY_STATE.get_or_init(|| Mutex::new(None))
+}
+
+fn wayland_proxies() -> &'static Mutex<HashMap<String, WaylandProxyRuntime>> {
+    WAYLAND_PROXIES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn update_wayland_proxy_state(display_name: &str, update: impl FnOnce(&mut WaylandProxyRuntime)) {
+    if let Ok(mut proxies) = wayland_proxies().lock() {
+        if let Some(proxy) = proxies.get_mut(display_name) {
+            update(proxy);
+        }
+    }
+}
+
+fn next_wayland_trace_id() -> String {
+    let seq = WAYLAND_TRACE_SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("wl-{}-{}", now_epoch_ms(), seq)
 }
 
 fn normalize_dns_upstream(raw: &str) -> Option<SocketAddr> {
@@ -515,7 +552,18 @@ exit 0
     ];
     if command_exists("udhcpc") {
         return Command::new("udhcpc")
-            .args(["-i", iface, "-n", "-q", "-t", "3", "-T", "1", "-s", script_path])
+            .args([
+                "-i",
+                iface,
+                "-n",
+                "-q",
+                "-t",
+                "3",
+                "-T",
+                "1",
+                "-s",
+                script_path,
+            ])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
@@ -576,7 +624,10 @@ fn stop_dns_proxy() {
     }
 }
 
-fn ensure_dns_proxy(listen: SocketAddr, upstreams: Vec<SocketAddr>) -> Result<(bool, bool), String> {
+fn ensure_dns_proxy(
+    listen: SocketAddr,
+    upstreams: Vec<SocketAddr>,
+) -> Result<(bool, bool), String> {
     ensure_loopback_interface_up();
     let mut state = dns_proxy_state().lock().unwrap();
     if let Some(current) = state.as_ref() {
@@ -639,7 +690,10 @@ fn run_dns_proxy_loop(
                 if err.kind() == std::io::ErrorKind::WouldBlock
                     || err.kind() == std::io::ErrorKind::TimedOut => {}
             Err(err) => {
-                log_line(&format!("dns proxy recv failed listen={} err={}", listen, err));
+                log_line(&format!(
+                    "dns proxy recv failed listen={} err={}",
+                    listen, err
+                ));
             }
         }
     }
@@ -657,7 +711,10 @@ fn resolve_dns_tunnel_port() -> u32 {
 fn connect_vsock(fd_port: u32) -> Result<std::fs::File, String> {
     let fd = unsafe { socket(AF_VSOCK, SOCK_STREAM, 0) };
     if fd < 0 {
-        return Err(format!("socket(AF_VSOCK) failed: {}", std::io::Error::last_os_error()));
+        return Err(format!(
+            "socket(AF_VSOCK) failed: {}",
+            std::io::Error::last_os_error()
+        ));
     }
     let addr = SockaddrVm {
         svm_family: AF_VSOCK as u16,
@@ -669,7 +726,9 @@ fn connect_vsock(fd_port: u32) -> Result<std::fs::File, String> {
     let ret = unsafe { connect(fd, &addr, std::mem::size_of::<SockaddrVm>() as u32) };
     if ret < 0 {
         let err = std::io::Error::last_os_error();
-        unsafe { close(fd); }
+        unsafe {
+            close(fd);
+        }
         return Err(format!("vsock connect failed port={} err={}", fd_port, err));
     }
     let file: std::fs::File = unsafe { FromRawFd::from_raw_fd(fd) };
@@ -929,7 +988,10 @@ fn start_local_ntp_server() {
     let socket = match UdpSocket::bind(&bind_addr) {
         Ok(v) => v,
         Err(e) => {
-            log_line(&format!("local ntp bind failed addr={} err={}", bind_addr, e));
+            log_line(&format!(
+                "local ntp bind failed addr={} err={}",
+                bind_addr, e
+            ));
             return;
         }
     };
@@ -1030,7 +1092,21 @@ fn main() -> Result<(), String> {
     ensure_guest_network_ready();
     start_local_control_server();
     start_local_ntp_server();
+    start_default_wayland_proxy();
     init_diagnostic_channel();
+    log_wayland_boot_identity("after_diagnostic_channel");
+    if let Ok(proxies) = wayland_proxies().lock() {
+        if let Some(proxy) = proxies.get("wayland-0") {
+            log_line(&format!(
+                "wayland_default_proxy_diagnostic display={} socket={} port={} defaultProxyStarted={} buildMarker={}",
+                proxy.display_name,
+                proxy.socket_path,
+                proxy.display_port,
+                proxy.default_proxy_started,
+                proxy.build_marker
+            ));
+        }
+    }
     start_diagnostic_forwarders();
 
     // Optionally start file handoff in background for external commands
@@ -1045,7 +1121,10 @@ fn main() -> Result<(), String> {
                     log_line(&format!("file handoff loop error: {e}"));
                 }
             });
-            log_line(&format!("file handoff background started handoff={} ack={}", hf, af));
+            log_line(&format!(
+                "file handoff background started handoff={} ack={}",
+                hf, af
+            ));
         }
     }
 
@@ -1109,7 +1188,11 @@ fn guest_code_usage() -> String {
 }
 
 fn resolve_code_target(raw: &str) -> Result<String, String> {
-    let trimmed = if raw.trim().is_empty() { "." } else { raw.trim() };
+    let trimmed = if raw.trim().is_empty() {
+        "."
+    } else {
+        raw.trim()
+    };
     let candidate = Path::new(trimmed);
     let absolute = if candidate.is_absolute() {
         candidate.to_path_buf()
@@ -1174,9 +1257,18 @@ fn print_guest_memory_status() {
             println!("  availableMB: unknown");
         }
     }
-    println!("  compactCount: {}", format_u64_with_commas(stats.compact_count));
-    println!("  compactLast: {}", format_last_event(stats.compact_last_epoch_ms));
-    println!("  dropCacheCount: {}", format_u64_with_commas(stats.drop_cache_count));
+    println!(
+        "  compactCount: {}",
+        format_u64_with_commas(stats.compact_count)
+    );
+    println!(
+        "  compactLast: {}",
+        format_last_event(stats.compact_last_epoch_ms)
+    );
+    println!(
+        "  dropCacheCount: {}",
+        format_u64_with_commas(stats.drop_cache_count)
+    );
     println!(
         "  dropCacheLast: {}",
         format_last_event(stats.drop_cache_last_epoch_ms)
@@ -1307,8 +1399,14 @@ fn execute_memory_reclaim_with_auto_elevation(action: MemoryCliAction) -> Result
 
     let action_arg = action.as_str();
     let attempts = [
-        ("sudo", vec!["-n", "/usr/local/bin/msl-init", "memory", action_arg]),
-        ("doas", vec!["/usr/local/bin/msl-init", "memory", action_arg]),
+        (
+            "sudo",
+            vec!["-n", "/usr/local/bin/msl-init", "memory", action_arg],
+        ),
+        (
+            "doas",
+            vec!["/usr/local/bin/msl-init", "memory", action_arg],
+        ),
     ];
 
     for (program, args) in attempts {
@@ -1348,7 +1446,11 @@ fn start_local_control_server() {
     let socket_path = Path::new(LOCAL_CONTROL_SOCKET);
     if let Some(parent) = socket_path.parent() {
         if let Err(e) = fs::create_dir_all(parent) {
-            log_line(&format!("local control mkdir failed {}: {}", parent.display(), e));
+            log_line(&format!(
+                "local control mkdir failed {}: {}",
+                parent.display(),
+                e
+            ));
             return;
         }
     }
@@ -1368,7 +1470,10 @@ fn start_local_control_server() {
         }
     };
     let _ = fs::set_permissions(socket_path, fs::Permissions::from_mode(0o666));
-    log_line(&format!("local control socket ready at {}", socket_path.display()));
+    log_line(&format!(
+        "local control socket ready at {}",
+        socket_path.display()
+    ));
 
     thread::spawn(move || {
         for accepted in listener.incoming() {
@@ -1425,13 +1530,8 @@ fn parse_local_control_memory_action(line: &str) -> Option<MemoryCliAction> {
 }
 
 fn delegate_memory_reclaim_to_local_service(action: MemoryCliAction) -> Result<(), String> {
-    let mut stream = UnixStream::connect(LOCAL_CONTROL_SOCKET).map_err(|e| {
-        format!(
-            "connect {} failed: {}",
-            LOCAL_CONTROL_SOCKET,
-            e
-        )
-    })?;
+    let mut stream = UnixStream::connect(LOCAL_CONTROL_SOCKET)
+        .map_err(|e| format!("connect {} failed: {}", LOCAL_CONTROL_SOCKET, e))?;
     let request = format!("memory {}\n", action.as_str());
     stream
         .write_all(request.as_bytes())
@@ -1474,8 +1574,13 @@ fn update_memory_stats_at_path(path: &Path, action: MemoryCliAction) -> Result<(
     }
 
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("failed to create memory stats dir {}: {}", parent.display(), e))?;
+        fs::create_dir_all(parent).map_err(|e| {
+            format!(
+                "failed to create memory stats dir {}: {}",
+                parent.display(),
+                e
+            )
+        })?;
     }
 
     let payload = format!(
@@ -1545,7 +1650,10 @@ fn write_proc_control(path: &str, value: &str) -> Result<(), String> {
 
 fn ensure_process_environment() {
     if env::var_os("PATH").is_none() {
-        env::set_var("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+        env::set_var(
+            "PATH",
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        );
     }
     if env::var_os("HOME").is_none() {
         env::set_var("HOME", "/root");
@@ -1555,6 +1663,9 @@ fn ensure_process_environment() {
     }
     if env::var_os("TERM").is_none() {
         env::set_var("TERM", "xterm-256color");
+    }
+    if env::var_os("XDG_RUNTIME_DIR").is_none() {
+        env::set_var("XDG_RUNTIME_DIR", "/tmp");
     }
     if env::var_os("TZ").is_none() {
         if let Some(time_zone_id) = load_timezone_from_process_or_etc_environment() {
@@ -1593,9 +1704,1009 @@ fn load_timezone_from_text(text: &str) -> Option<String> {
     None
 }
 
+fn wayland_socket_path(runtime_dir: &str, display_name: &str) -> String {
+    format!("{}/{}", runtime_dir.trim_end_matches('/'), display_name)
+}
+
+fn start_default_wayland_proxy() {
+    log_wayland_boot_identity("before_default_proxy_start");
+    match start_wayland_proxy("wayland-0".to_string(), 38000, "/tmp".to_string()) {
+        Ok(proxy) => {
+            update_wayland_proxy_state(&proxy.display_name, |state| {
+                state.default_proxy_started = true;
+                state.last_client_event = Some("default_proxy_started".to_string());
+            });
+            log_line(&format!(
+                "wayland_default_proxy_started display={} socket={} port={} build_marker={}",
+                proxy.display_name, proxy.socket_path, proxy.display_port, proxy.build_marker
+            ));
+        }
+        Err(err) => log_line(&format!("wayland_default_proxy_start_failed err={}", err)),
+    }
+}
+
+fn log_wayland_boot_identity(phase: &str) {
+    let keys = [
+        "WAYLAND_DISPLAY",
+        "MSL_WAYLAND_DISPLAY",
+        "XDG_RUNTIME_DIR",
+        "GDK_BACKEND",
+        "QT_QPA_PLATFORM",
+        "SDL_VIDEODRIVER",
+        "MOZ_ENABLE_WAYLAND",
+    ];
+    let env_summary = keys
+        .iter()
+        .map(|key| format!("{}={}", key, env::var(key).unwrap_or_default()))
+        .collect::<Vec<_>>()
+        .join(",");
+    log_line(&format!(
+        "wayland_proxy_fd_support=enabled build_marker=fd-aware-keymap phase={} build_git={} build_ts={} build_target={} env={}",
+        phase, BUILD_GIT_COMMIT, BUILD_TIMESTAMP, BUILD_TARGET, env_summary
+    ));
+}
+
+fn start_wayland_proxy(
+    display_name: String,
+    display_port: u32,
+    runtime_dir: String,
+) -> Result<WaylandProxyRuntime, String> {
+    validate_wayland_display_name(&display_name)?;
+    if display_port == 0 || display_port > 65535 {
+        return Err("displayPort must be in 1..65535".to_string());
+    }
+    let socket_path = wayland_socket_path(&runtime_dir, &display_name);
+    {
+        let mut proxies = wayland_proxies()
+            .lock()
+            .map_err(|_| "wayland proxy lock poisoned".to_string())?;
+        if let Some(existing) = proxies.get(&display_name) {
+            return Ok(WaylandProxyRuntime {
+                display_name: existing.display_name.clone(),
+                display_port: existing.display_port,
+                runtime_dir: existing.runtime_dir.clone(),
+                socket_path: existing.socket_path.clone(),
+                active_clients: existing.active_clients,
+                default_proxy_started: existing.default_proxy_started,
+                build_marker: existing.build_marker.clone(),
+                last_trace_id: existing.last_trace_id.clone(),
+                last_error: existing.last_error.clone(),
+                last_client_event: existing.last_client_event.clone(),
+                last_host_event: existing.last_host_event.clone(),
+                bytes_client_to_host: existing.bytes_client_to_host,
+                bytes_host_to_client: existing.bytes_host_to_client,
+                keymap_sent: existing.keymap_sent,
+                stop_tx: None,
+            });
+        }
+        fs::create_dir_all(&runtime_dir)
+            .map_err(|e| format!("create wayland runtime dir {} failed: {}", runtime_dir, e))?;
+        if Path::new(&socket_path).exists() {
+            log_line(&format!(
+                "wayland_proxy_stale_socket_replaced display={} socket={}",
+                display_name, socket_path
+            ));
+            let _ = fs::remove_file(&socket_path);
+        }
+        let std_listener = UnixListener::bind(&socket_path)
+            .map_err(|e| format!("bind {} failed: {}", socket_path, e))?;
+        fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o666))
+            .map_err(|e| format!("chmod {} failed: {}", socket_path, e))?;
+        std_listener
+            .set_nonblocking(true)
+            .map_err(|e| format!("set nonblocking {} failed: {}", socket_path, e))?;
+        let _runtime_guard = io_runtime().enter();
+        let listener = tokio::net::UnixListener::from_std(std_listener)
+            .map_err(|e| format!("register {} failed: {}", socket_path, e))?;
+        let (stop_tx, stop_rx) = oneshot::channel::<()>();
+        let runtime = WaylandProxyRuntime {
+            display_name: display_name.clone(),
+            display_port,
+            runtime_dir: runtime_dir.clone(),
+            socket_path: socket_path.clone(),
+            active_clients: 0,
+            default_proxy_started: false,
+            build_marker: "fd-aware-keymap".to_string(),
+            last_trace_id: None,
+            last_error: None,
+            last_client_event: None,
+            last_host_event: None,
+            bytes_client_to_host: 0,
+            bytes_host_to_client: 0,
+            keymap_sent: false,
+            stop_tx: Some(stop_tx),
+        };
+        proxies.insert(display_name.clone(), runtime);
+        spawn_wayland_proxy_task(
+            display_name.clone(),
+            display_port,
+            socket_path.clone(),
+            listener,
+            stop_rx,
+        );
+    }
+    Ok(WaylandProxyRuntime {
+        display_name,
+        display_port,
+        runtime_dir,
+        socket_path,
+        active_clients: 0,
+        default_proxy_started: false,
+        build_marker: "fd-aware-keymap".to_string(),
+        last_trace_id: None,
+        last_error: None,
+        last_client_event: None,
+        last_host_event: None,
+        bytes_client_to_host: 0,
+        bytes_host_to_client: 0,
+        keymap_sent: false,
+        stop_tx: None,
+    })
+}
+
+fn spawn_wayland_proxy_task(
+    display_name: String,
+    display_port: u32,
+    socket_path: String,
+    listener: tokio::net::UnixListener,
+    mut stop_rx: oneshot::Receiver<()>,
+) {
+    io_runtime().spawn(async move {
+        log_line(&format!(
+            "wayland_proxy_listening display={} socket={} port={}",
+            display_name, socket_path, display_port
+        ));
+        loop {
+            tokio::select! {
+                accept = listener.accept() => {
+                    match accept {
+                        Ok((stream, _)) => {
+                            let trace_id = next_wayland_trace_id();
+                            let accepted = match wayland_proxies().lock() {
+                                Ok(mut proxies) => {
+                                    if let Some(proxy) = proxies.get_mut(&display_name) {
+                                        if proxy.active_clients == 0 {
+                                            proxy.active_clients = 1;
+                                            proxy.last_trace_id = Some(trace_id.clone());
+                                            proxy.last_client_event = Some("client_accepted".to_string());
+                                            true
+                                        } else {
+                                            proxy.last_error = Some("client_rejected_already_active".to_string());
+                                            proxy.last_trace_id = Some(trace_id.clone());
+                                            proxy.last_client_event = Some("client_rejected_already_active".to_string());
+                                            false
+                                        }
+                                    } else {
+                                        false
+                                    }
+                                }
+                                Err(_) => false,
+                            };
+                            if !accepted {
+                                log_line(&format!(
+                                    "wayland_proxy_client_rejected trace_id={} display={} reason=client_already_active",
+                                    trace_id, display_name
+                                ));
+                                drop(stream);
+                                continue;
+                            }
+                            let task_display_name = display_name.clone();
+                            tokio::spawn(async move {
+                                let result = proxy_wayland_client(stream, display_port, task_display_name.clone(), trace_id.clone()).await;
+                                if let Ok(mut proxies) = wayland_proxies().lock() {
+                                    if let Some(proxy) = proxies.get_mut(&task_display_name) {
+                                        proxy.active_clients = proxy.active_clients.saturating_sub(1);
+                                        proxy.last_client_event = Some("client_closed".to_string());
+                                        if let Err(err) = result.as_ref() {
+                                            proxy.last_error = Some(err.clone());
+                                        }
+                                    }
+                                }
+                                if let Err(err) = result {
+                                    log_line(&format!("wayland_proxy_client_failed trace_id={} port={} err={}", trace_id, display_port, err));
+                                }
+                            });
+                        }
+                        Err(err) => {
+                            log_line(&format!("wayland_proxy_accept_failed display={} err={}", display_name, err));
+                            tokio::time::sleep(TokioDuration::from_millis(50)).await;
+                        }
+                    }
+                }
+                _ = &mut stop_rx => {
+                    break;
+                }
+            }
+        }
+        let _ = fs::remove_file(&socket_path);
+        if let Ok(mut proxies) = wayland_proxies().lock() {
+            proxies.remove(&display_name);
+        }
+        log_line(&format!("wayland_proxy_stopped display={} socket={}", display_name, socket_path));
+    });
+}
+
+async fn proxy_wayland_client(
+    mut stream: tokio::net::UnixStream,
+    display_port: u32,
+    display_name: String,
+    trace_id: String,
+) -> Result<(), String> {
+    log_line(&format!(
+        "wayland_proxy_client_accepted trace_id={} display={} port={}",
+        trace_id, display_name, display_port
+    ));
+    log_line(&format!(
+        "wayland_proxy_transport_connect_start trace_id={} display={} port={}",
+        trace_id, display_name, display_port
+    ));
+    let vsock = match connect_vsock_stream(display_port) {
+        Ok(vsock) => vsock,
+        Err(err) => {
+            log_line(&format!(
+                "wayland_proxy_transport_unavailable trace_id={} display={} port={} err={}",
+                trace_id, display_name, display_port, err
+            ));
+            let _ = stream.shutdown().await;
+            update_wayland_proxy_state(&display_name, |proxy| {
+                proxy.last_trace_id = Some(trace_id.clone());
+                proxy.last_host_event = Some("transport_unavailable".to_string());
+                proxy.last_error = Some(format!("display_transport_unavailable: {}", err));
+            });
+            return Err(format!("display_transport_unavailable: {}", err));
+        }
+    };
+    log_line(&format!(
+        "wayland_proxy_transport_connected trace_id={} display={} port={}",
+        trace_id, display_name, display_port
+    ));
+    update_wayland_proxy_state(&display_name, |proxy| {
+        proxy.last_trace_id = Some(trace_id.clone());
+        proxy.last_host_event = Some("transport_connected".to_string());
+    });
+    let client = stream
+        .into_std()
+        .map_err(|e| format!("wayland client into_std failed: {}", e))?;
+    let relay_trace_id = trace_id.clone();
+    let (client_to_host, host_to_client) = tokio::task::spawn_blocking(move || {
+        relay_wayland_transport(&display_name, &relay_trace_id, client, vsock)
+    })
+    .await
+    .map_err(|e| format!("wayland relay join failed: {}", e))??;
+    log_line(&format!(
+        "wayland_proxy_client_closed trace_id={} port={} client_to_host={} host_to_client={}",
+        trace_id, display_port, client_to_host, host_to_client
+    ));
+    Ok(())
+}
+
+fn relay_wayland_transport(
+    display_name: &str,
+    trace_id: &str,
+    client: std::os::unix::net::UnixStream,
+    vsock: std::fs::File,
+) -> Result<(u64, u64), String> {
+    client
+        .set_nonblocking(false)
+        .map_err(|e| format!("set client blocking failed: {}", e))?;
+    let vsock_fd = vsock.as_raw_fd();
+    let client_fd = client.as_raw_fd();
+
+    let mut client_reader = client
+        .try_clone()
+        .map_err(|e| format!("clone client reader failed: {}", e))?;
+    let mut client_writer = client;
+    let mut vsock_reader = vsock
+        .try_clone()
+        .map_err(|e| format!("clone vsock reader failed: {}", e))?;
+    let mut vsock_writer = vsock;
+
+    let client_display_name = display_name.to_string();
+    let client_trace_id = trace_id.to_string();
+    let client_to_host = thread::spawn(move || {
+        relay_wayland_client_to_host(
+            &client_display_name,
+            &client_trace_id,
+            &mut client_reader,
+            &mut vsock_writer,
+        )
+    });
+    let host_display_name = display_name.to_string();
+    let host_trace_id = trace_id.to_string();
+    let host_to_client = thread::spawn(move || {
+        relay_host_to_wayland_client(
+            &host_display_name,
+            &host_trace_id,
+            &mut vsock_reader,
+            &mut client_writer,
+        )
+    });
+
+    let client_to_host = client_to_host
+        .join()
+        .map_err(|_| "client_to_host relay panicked".to_string())?
+        .map_err(|e| format!("client_to_host relay failed: {}", e))?;
+    unsafe {
+        libc::shutdown(client_fd, libc::SHUT_RDWR);
+        libc::shutdown(vsock_fd, libc::SHUT_RDWR);
+    }
+    let host_to_client = host_to_client
+        .join()
+        .map_err(|_| "host_to_client relay panicked".to_string())?
+        .map_err(|e| format!("host_to_client relay failed: {}", e))?;
+    Ok((client_to_host, host_to_client))
+}
+
+fn relay_wayland_client_to_host(
+    display_name: &str,
+    trace_id: &str,
+    client_reader: &mut std::os::unix::net::UnixStream,
+    vsock_writer: &mut std::fs::File,
+) -> std::io::Result<u64> {
+    let mut total = 0_u64;
+    let mut first = true;
+    let mut state = GuestWaylandParseState::new();
+    loop {
+        let received = recv_wayland_client_chunk(client_reader.as_raw_fd())?;
+        if received.bytes.is_empty() && received.fds.is_empty() {
+            log_line(&format!(
+                "wayland_proxy_guest_eof trace_id={} display={} bytes={}",
+                trace_id, display_name, total
+            ));
+            break;
+        }
+        if first {
+            first = false;
+            log_line(&format!(
+                "wayland_proxy_first_guest_bytes trace_id={} display={} count={}",
+                trace_id,
+                display_name,
+                received.bytes.len()
+            ));
+            update_wayland_proxy_state(display_name, |proxy| {
+                proxy.last_trace_id = Some(trace_id.to_string());
+                proxy.last_client_event =
+                    Some(format!("first_guest_bytes:{}", received.bytes.len()));
+            });
+        }
+        state.pending.extend_from_slice(&received.bytes);
+        state.pending_fds.extend(received.fds);
+        let forwarded =
+            drain_guest_wayland_messages(display_name, trace_id, &mut state, vsock_writer)?;
+        total += forwarded;
+        update_wayland_proxy_state(display_name, |proxy| {
+            proxy.bytes_client_to_host = proxy.bytes_client_to_host.saturating_add(forwarded);
+            proxy.last_client_event = Some(format!("guest_bytes_forwarded:{}", forwarded));
+        });
+    }
+    let _ = vsock_writer.flush();
+    unsafe {
+        libc::shutdown(vsock_writer.as_raw_fd(), libc::SHUT_RDWR);
+    }
+    log_line(&format!(
+        "wayland_proxy_guest_to_host_shutdown trace_id={} display={} bytes={}",
+        trace_id, display_name, total
+    ));
+    Ok(total)
+}
+
+struct GuestWaylandChunk {
+    bytes: Vec<u8>,
+    fds: Vec<RawFd>,
+}
+
+struct GuestWaylandParseState {
+    pending: Vec<u8>,
+    pending_fds: VecDeque<RawFd>,
+    objects: HashMap<u32, String>,
+    registry_globals: HashMap<u32, String>,
+    shm_pool_fds: HashMap<u32, RawFd>,
+}
+
+impl GuestWaylandParseState {
+    fn new() -> Self {
+        let mut objects = HashMap::new();
+        objects.insert(1, "wl_display".to_string());
+        Self {
+            pending: Vec::new(),
+            pending_fds: VecDeque::new(),
+            objects,
+            registry_globals: HashMap::new(),
+            shm_pool_fds: HashMap::new(),
+        }
+    }
+}
+
+impl Drop for GuestWaylandParseState {
+    fn drop(&mut self) {
+        for (_, fd) in self.shm_pool_fds.drain() {
+            unsafe {
+                libc::close(fd);
+            }
+        }
+        while let Some(fd) = self.pending_fds.pop_front() {
+            unsafe {
+                libc::close(fd);
+            }
+        }
+    }
+}
+
+fn recv_wayland_client_chunk(socket_fd: RawFd) -> std::io::Result<GuestWaylandChunk> {
+    let mut buffer = vec![0_u8; 16 * 1024];
+    let mut iov = libc::iovec {
+        iov_base: buffer.as_mut_ptr() as *mut libc::c_void,
+        iov_len: buffer.len(),
+    };
+    let control_len =
+        unsafe { libc::CMSG_SPACE((std::mem::size_of::<RawFd>() * 8) as u32) } as usize;
+    let mut control = vec![0_u8; control_len];
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
+    msg.msg_controllen = control.len() as _;
+
+    let count = unsafe { libc::recvmsg(socket_fd, &mut msg, 0) };
+    if count < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    buffer.truncate(count as usize);
+
+    let mut fds = Vec::new();
+    unsafe {
+        let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+        while !cmsg.is_null() {
+            if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
+                let data = libc::CMSG_DATA(cmsg) as *const RawFd;
+                let data_len =
+                    ((*cmsg).cmsg_len as usize).saturating_sub(libc::CMSG_LEN(0) as usize);
+                let fd_count = data_len / std::mem::size_of::<RawFd>();
+                for index in 0..fd_count {
+                    fds.push(*data.add(index));
+                }
+            }
+            cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
+        }
+    }
+    Ok(GuestWaylandChunk { bytes: buffer, fds })
+}
+
+fn drain_guest_wayland_messages(
+    display_name: &str,
+    trace_id: &str,
+    state: &mut GuestWaylandParseState,
+    vsock_writer: &mut std::fs::File,
+) -> std::io::Result<u64> {
+    let mut forwarded = 0_u64;
+    loop {
+        if state.pending.len() < 8 {
+            break;
+        }
+        let object_id = read_wayland_u32(&state.pending, 0)?;
+        let word = read_wayland_u32(&state.pending, 4)?;
+        let opcode = (word & 0xffff) as u16;
+        let size = (word >> 16) as usize;
+        if size < 8 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid wayland request size {}", size),
+            ));
+        }
+        if state.pending.len() < size {
+            break;
+        }
+        let message = state.pending[..size].to_vec();
+        state.pending.drain(..size);
+        let interface = state
+            .objects
+            .get(&object_id)
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_string());
+
+        if interface == "wl_shm" && opcode == 0 {
+            let fd = state.pending_fds.pop_front().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "missing fd for wl_shm.create_pool object={} opcode={}",
+                        object_id, opcode
+                    ),
+                )
+            })?;
+            let pool_id = read_wayland_u32(&message, 8)?;
+            let size = read_wayland_i32(&message, 12)?.max(0) as usize;
+            let data = read_fd_payload_from_dup(fd, size)?;
+            if let Some(old_fd) = state.shm_pool_fds.insert(pool_id, fd) {
+                unsafe {
+                    libc::close(old_fd);
+                }
+            }
+            write_display_transport_json(
+                vsock_writer,
+                &format!(
+                    r#"{{"type":"shmPoolCreate","poolId":{},"size":{},"dataBase64":"{}"}}"#,
+                    pool_id,
+                    size,
+                    b64_encode(&data)
+                ),
+            )?;
+            log_line(&format!(
+                "wayland_proxy_shm_pool_create_sent trace_id={} display={} pool={} size={}",
+                trace_id, display_name, pool_id, size
+            ));
+        } else if interface == "wl_shm_pool" && opcode == 2 {
+            let size = read_wayland_i32(&message, 8)?.max(0) as usize;
+            let fd = *state.shm_pool_fds.get(&object_id).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("missing shm pool fd for resize pool={}", object_id),
+                )
+            })?;
+            let data = read_fd_payload_from_dup(fd, size)?;
+            write_display_transport_json(
+                vsock_writer,
+                &format!(
+                    r#"{{"type":"shmPoolResize","poolId":{},"size":{},"dataBase64":"{}"}}"#,
+                    object_id,
+                    size,
+                    b64_encode(&data)
+                ),
+            )?;
+            log_line(&format!(
+                "wayland_proxy_shm_pool_resize_sent trace_id={} display={} pool={} size={}",
+                trace_id, display_name, object_id, size
+            ));
+        }
+        handle_guest_wayland_tracking(state, object_id, opcode, &message);
+        write_display_transport_json(
+            vsock_writer,
+            &format!(
+                r#"{{"type":"waylandBytes","dataBase64":"{}"}}"#,
+                b64_encode(&message)
+            ),
+        )?;
+        forwarded = forwarded.saturating_add(message.len() as u64);
+    }
+    Ok(forwarded)
+}
+
+fn handle_guest_wayland_tracking(
+    state: &mut GuestWaylandParseState,
+    object_id: u32,
+    opcode: u16,
+    message: &[u8],
+) {
+    let interface = state.objects.get(&object_id).cloned().unwrap_or_default();
+    let body = &message[8..];
+    if interface == "wl_display" && opcode == 1 && body.len() >= 4 {
+        let registry_id = u32::from_ne_bytes([body[0], body[1], body[2], body[3]]);
+        state.objects.insert(registry_id, "wl_registry".to_string());
+    } else if interface == "wl_registry" && opcode == 0 && body.len() >= 16 {
+        let name = u32::from_ne_bytes([body[0], body[1], body[2], body[3]]);
+        if let Ok((requested, next)) = read_guest_wayland_string(body, 4) {
+            if body.len() >= next + 8 {
+                let new_id = u32::from_ne_bytes([
+                    body[next + 4],
+                    body[next + 5],
+                    body[next + 6],
+                    body[next + 7],
+                ]);
+                state.objects.insert(new_id, requested);
+            }
+        }
+        let _ = state.registry_globals.get(&name);
+    } else if interface == "wl_compositor" && opcode == 0 && body.len() >= 4 {
+        let surface_id = u32::from_ne_bytes([body[0], body[1], body[2], body[3]]);
+        state.objects.insert(surface_id, "wl_surface".to_string());
+    } else if interface == "wl_shm" && opcode == 0 && body.len() >= 4 {
+        let pool_id = u32::from_ne_bytes([body[0], body[1], body[2], body[3]]);
+        state.objects.insert(pool_id, "wl_shm_pool".to_string());
+    } else if interface == "wl_shm_pool" && opcode == 1 {
+        state.objects.remove(&object_id);
+        if let Some(fd) = state.shm_pool_fds.remove(&object_id) {
+            unsafe {
+                libc::close(fd);
+            }
+        }
+    }
+}
+
+fn read_fd_payload_from_dup(fd: RawFd, size: usize) -> std::io::Result<Vec<u8>> {
+    let dup_fd = unsafe { libc::dup(fd) };
+    if dup_fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut file = unsafe { std::fs::File::from_raw_fd(dup_fd) };
+    let _ = file.seek(SeekFrom::Start(0));
+    let mut data = Vec::new();
+    file.take(size as u64).read_to_end(&mut data)?;
+    if data.len() < size {
+        data.resize(size, 0);
+    }
+    Ok(data)
+}
+
+fn write_display_transport_json(writer: &mut std::fs::File, json: &str) -> std::io::Result<()> {
+    let payload = json.as_bytes();
+    writer.write_all(&(payload.len() as u32).to_le_bytes())?;
+    writer.write_all(payload)?;
+    writer.flush()
+}
+
+fn read_wayland_u32(bytes: &[u8], offset: usize) -> std::io::Result<u32> {
+    let slice = bytes.get(offset..offset + 4).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "short wayland u32")
+    })?;
+    Ok(u32::from_ne_bytes([slice[0], slice[1], slice[2], slice[3]]))
+}
+
+fn read_wayland_i32(bytes: &[u8], offset: usize) -> std::io::Result<i32> {
+    let slice = bytes.get(offset..offset + 4).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "short wayland i32")
+    })?;
+    Ok(i32::from_ne_bytes([slice[0], slice[1], slice[2], slice[3]]))
+}
+
+fn read_guest_wayland_string(bytes: &[u8], offset: usize) -> Result<(String, usize), String> {
+    let len = read_wayland_u32(bytes, offset).map_err(|e| e.to_string())? as usize;
+    let start = offset + 4;
+    let end = start + len;
+    let raw = bytes
+        .get(start..end)
+        .ok_or_else(|| "short wayland string".to_string())?;
+    let value = if raw.last() == Some(&0) {
+        &raw[..raw.len() - 1]
+    } else {
+        raw
+    };
+    Ok((String::from_utf8_lossy(value).into_owned(), (end + 3) & !3))
+}
+
+fn relay_host_to_wayland_client(
+    display_name: &str,
+    trace_id: &str,
+    vsock_reader: &mut std::fs::File,
+    client_writer: &mut std::os::unix::net::UnixStream,
+) -> std::io::Result<u64> {
+    let mut total = 0_u64;
+    let mut first = true;
+    let mut pending = Vec::<u8>::new();
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let count = vsock_reader.read(&mut buffer)?;
+        if count == 0 {
+            log_line(&format!(
+                "wayland_proxy_host_eof trace_id={} display={} bytes={}",
+                trace_id, display_name, total
+            ));
+            break;
+        }
+        if first {
+            first = false;
+            log_line(&format!(
+                "wayland_proxy_first_host_bytes trace_id={} display={} count={}",
+                trace_id, display_name, count
+            ));
+        }
+        pending.extend_from_slice(&buffer[..count]);
+        update_wayland_proxy_state(display_name, |proxy| {
+            proxy.last_trace_id = Some(trace_id.to_string());
+            proxy.last_host_event = Some(format!("raw_or_control_bytes_received:{}", count));
+        });
+        drain_host_wayland_bytes(
+            display_name,
+            trace_id,
+            client_writer,
+            &mut pending,
+            &mut total,
+        )?;
+    }
+    if !pending.is_empty() {
+        client_writer.write_all(&pending)?;
+        total += pending.len() as u64;
+    }
+    let _ = client_writer.flush();
+    let _ = client_writer.shutdown(std::net::Shutdown::Both);
+    log_line(&format!(
+        "wayland_proxy_host_to_guest_shutdown trace_id={} display={} bytes={}",
+        trace_id, display_name, total
+    ));
+    Ok(total)
+}
+
+fn drain_host_wayland_bytes(
+    display_name: &str,
+    trace_id: &str,
+    client_writer: &mut std::os::unix::net::UnixStream,
+    pending: &mut Vec<u8>,
+    total: &mut u64,
+) -> std::io::Result<()> {
+    loop {
+        if pending.is_empty() {
+            return Ok(());
+        }
+        if pending.starts_with(b"MSLW") {
+            if pending.len() < 8 {
+                return Ok(());
+            }
+            let len = u32::from_le_bytes([pending[4], pending[5], pending[6], pending[7]]) as usize;
+            if pending.len() < 8 + len {
+                return Ok(());
+            }
+            let payload = pending[8..8 + len].to_vec();
+            pending.drain(..8 + len);
+            log_line(&format!(
+                "wayland_proxy_control_frame_received trace_id={} display={} size={}",
+                trace_id, display_name, len
+            ));
+            update_wayland_proxy_state(display_name, |proxy| {
+                proxy.last_trace_id = Some(trace_id.to_string());
+                proxy.last_host_event = Some(format!("control_frame_received:{}", len));
+            });
+            if let Err(err) =
+                handle_wayland_control_frame(display_name, trace_id, client_writer, &payload)
+            {
+                log_line(&format!(
+                    "wayland_proxy_control_frame_failed trace_id={} display={} err={}",
+                    trace_id, display_name, err
+                ));
+                update_wayland_proxy_state(display_name, |proxy| {
+                    proxy.last_error = Some(format!("control_frame_failed: {}", err));
+                    proxy.last_host_event = Some("control_frame_failed".to_string());
+                });
+            }
+            continue;
+        }
+
+        if pending.len() < 8 {
+            return Ok(());
+        }
+
+        let object_id = u32::from_ne_bytes([pending[0], pending[1], pending[2], pending[3]]);
+        let header = u32::from_ne_bytes([pending[4], pending[5], pending[6], pending[7]]);
+        let raw_len = (header >> 16) as usize;
+        let opcode = header & 0xffff;
+        if object_id == 0 || raw_len < 8 || raw_len > 16 * 1024 * 1024 {
+            log_line(&format!(
+                "wayland_proxy_host_event_invalid trace_id={} display={} object={} opcode={} size={} pending={}",
+                trace_id,
+                display_name,
+                object_id,
+                opcode,
+                raw_len,
+                pending.len()
+            ));
+            let raw_len = pending.len();
+            client_writer.write_all(pending)?;
+            client_writer.flush()?;
+            *total += raw_len as u64;
+            update_wayland_proxy_state(display_name, |proxy| {
+                proxy.bytes_host_to_client =
+                    proxy.bytes_host_to_client.saturating_add(raw_len as u64);
+                proxy.last_host_event = Some(format!("raw_bytes_forwarded_invalid:{}", raw_len));
+            });
+            pending.clear();
+            return Ok(());
+        }
+        if pending.len() < raw_len {
+            return Ok(());
+        }
+
+        client_writer.write_all(&pending[..raw_len])?;
+        client_writer.flush()?;
+        *total += raw_len as u64;
+        log_line(&format!(
+            "wayland_proxy_raw_event_forwarded trace_id={} display={} object={} opcode={} size={}",
+            trace_id, display_name, object_id, opcode, raw_len
+        ));
+        update_wayland_proxy_state(display_name, |proxy| {
+            proxy.bytes_host_to_client = proxy.bytes_host_to_client.saturating_add(raw_len as u64);
+            proxy.last_host_event = Some(format!(
+                "raw_event_forwarded:object={},opcode={},size={}",
+                object_id, opcode, raw_len
+            ));
+        });
+        pending.drain(..raw_len);
+    }
+}
+
+fn handle_wayland_control_frame(
+    display_name: &str,
+    trace_id: &str,
+    client_writer: &mut std::os::unix::net::UnixStream,
+    payload: &[u8],
+) -> Result<(), String> {
+    let text =
+        std::str::from_utf8(payload).map_err(|e| format!("control frame utf8 failed: {}", e))?;
+    let message_type = extract_string(text, "type").unwrap_or_default();
+    if message_type != "keyboardKeymap" {
+        return Err(format!("unsupported control frame type {}", message_type));
+    }
+    let keyboard_id = extract_int(text, "keyboardId").ok_or("missing keyboardId")? as u32;
+    let format = extract_int(text, "format").unwrap_or(1) as u32;
+    let size = extract_int(text, "size").unwrap_or(0).max(0) as usize;
+    let data_base64 = extract_string(text, "dataBase64").ok_or("missing dataBase64")?;
+    let mut keymap = b64_decode(&data_base64)?;
+    if size > 0 && keymap.len() > size {
+        keymap.truncate(size);
+    }
+    send_keyboard_keymap_event(client_writer, keyboard_id, format, &keymap)?;
+    log_line(&format!(
+        "wayland_proxy_keyboard_keymap_sent trace_id={} display={} keyboard={} size={}",
+        trace_id,
+        display_name,
+        keyboard_id,
+        keymap.len()
+    ));
+    update_wayland_proxy_state(display_name, |proxy| {
+        proxy.last_trace_id = Some(trace_id.to_string());
+        proxy.keymap_sent = true;
+        proxy.last_host_event = Some("keyboard_keymap_sent".to_string());
+    });
+    Ok(())
+}
+
+fn send_keyboard_keymap_event(
+    client_writer: &mut std::os::unix::net::UnixStream,
+    keyboard_id: u32,
+    format: u32,
+    keymap: &[u8],
+) -> Result<(), String> {
+    let mut file = create_wayland_fd_payload("keymap", keymap)?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| format!("seek keymap payload failed: {}", e))?;
+    let fd = file.as_raw_fd();
+    let size = keymap.len() as u32;
+    let mut event = Vec::with_capacity(16);
+    event.extend_from_slice(&keyboard_id.to_ne_bytes());
+    event.extend_from_slice(&((16_u32 << 16) | 0_u32).to_ne_bytes());
+    event.extend_from_slice(&format.to_ne_bytes());
+    event.extend_from_slice(&size.to_ne_bytes());
+    send_wayland_message_with_fd(client_writer.as_raw_fd(), &event, fd)
+}
+
+fn create_wayland_fd_payload(prefix: &str, data: &[u8]) -> Result<std::fs::File, String> {
+    let path = format!(
+        "/tmp/msl-wayland-{}-{}-{}",
+        prefix,
+        std::process::id(),
+        now_epoch_ms()
+    );
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&path)
+        .map_err(|e| format!("create {} failed: {}", path, e))?;
+    let _ = fs::remove_file(&path);
+    file.write_all(data)
+        .map_err(|e| format!("write fd payload failed: {}", e))?;
+    file.flush()
+        .map_err(|e| format!("flush fd payload failed: {}", e))?;
+    Ok(file)
+}
+
+fn send_wayland_message_with_fd(
+    socket_fd: RawFd,
+    bytes: &[u8],
+    fd_to_send: RawFd,
+) -> Result<(), String> {
+    unsafe {
+        let mut iov = libc::iovec {
+            iov_base: bytes.as_ptr() as *mut libc::c_void,
+            iov_len: bytes.len(),
+        };
+        let control_len = libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) as usize;
+        let mut control = vec![0_u8; control_len];
+        let mut msg: libc::msghdr = std::mem::zeroed();
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
+        msg.msg_controllen = control.len() as _;
+
+        let cmsg = libc::CMSG_FIRSTHDR(&msg);
+        if cmsg.is_null() {
+            return Err("CMSG_FIRSTHDR returned null".to_string());
+        }
+        (*cmsg).cmsg_level = libc::SOL_SOCKET;
+        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<RawFd>() as u32) as _;
+        let data = libc::CMSG_DATA(cmsg) as *mut RawFd;
+        *data = fd_to_send;
+        msg.msg_controllen = (*cmsg).cmsg_len as _;
+
+        let sent = libc::sendmsg(socket_fd, &msg, libc::MSG_NOSIGNAL);
+        if sent < 0 {
+            return Err(format!(
+                "sendmsg failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        if sent as usize != bytes.len() {
+            return Err(format!("short sendmsg: {} of {}", sent, bytes.len()));
+        }
+    }
+    Ok(())
+}
+
+fn stop_wayland_proxy(display_name: &str) -> Result<Option<WaylandProxyRuntime>, String> {
+    let mut proxies = wayland_proxies()
+        .lock()
+        .map_err(|_| "wayland proxy lock poisoned".to_string())?;
+    let mut proxy = match proxies.remove(display_name) {
+        Some(proxy) => proxy,
+        None => return Ok(None),
+    };
+    if let Some(stop_tx) = proxy.stop_tx.take() {
+        let _ = stop_tx.send(());
+    }
+    let _ = fs::remove_file(&proxy.socket_path);
+    Ok(Some(WaylandProxyRuntime {
+        display_name: proxy.display_name,
+        display_port: proxy.display_port,
+        runtime_dir: proxy.runtime_dir,
+        socket_path: proxy.socket_path,
+        active_clients: proxy.active_clients,
+        default_proxy_started: proxy.default_proxy_started,
+        build_marker: proxy.build_marker,
+        last_trace_id: proxy.last_trace_id,
+        last_error: proxy.last_error,
+        last_client_event: proxy.last_client_event,
+        last_host_event: proxy.last_host_event,
+        bytes_client_to_host: proxy.bytes_client_to_host,
+        bytes_host_to_client: proxy.bytes_host_to_client,
+        keymap_sent: proxy.keymap_sent,
+        stop_tx: None,
+    }))
+}
+
+fn validate_wayland_display_name(value: &str) -> Result<(), String> {
+    if value.is_empty() || value.contains('/') || value.contains('\0') || value.contains("..") {
+        return Err("invalid displayName".to_string());
+    }
+    Ok(())
+}
+
+fn child_process_environment(
+    runtime: &RuntimeUserContext,
+    env_additions: Vec<(String, String)>,
+) -> Vec<(String, String)> {
+    let mut env_map: BTreeMap<String, String> = env::vars().collect();
+
+    env_map.insert("HOME".to_string(), runtime.home.clone());
+    env_map.insert("TERM".to_string(), "xterm-256color".to_string());
+    env_map.insert(
+        "PATH".to_string(),
+        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
+    );
+    env_map.insert("USER".to_string(), runtime.username.clone());
+    env_map.insert("LOGNAME".to_string(), runtime.username.clone());
+    env_map.insert("SHELL".to_string(), runtime.shell.clone());
+    env_map.insert("LANG".to_string(), "C.UTF-8".to_string());
+    env_map.insert("LC_ALL".to_string(), "C.UTF-8".to_string());
+
+    if !env_map.contains_key("TZ") {
+        if let Some(time_zone_id) = load_timezone_from_process_or_etc_environment() {
+            env_map.insert("TZ".to_string(), time_zone_id);
+        }
+    }
+
+    for (key, value) in env_additions {
+        if is_valid_env_key(&key) {
+            env_map.insert(key, value);
+        }
+    }
+
+    env_map.into_iter().collect()
+}
+
 fn is_valid_timezone_id(value: &str) -> bool {
     !value.is_empty()
-        && !value.chars().any(|ch| ch.is_control() || ch.is_whitespace())
+        && !value
+            .chars()
+            .any(|ch| ch.is_control() || ch.is_whitespace())
 }
 
 fn ensure_mount_prerequisites() {
@@ -1614,7 +2725,8 @@ fn bootstrap_ephemeral_tmp_storage() -> Result<(), String> {
     let device = env::var("MSL_EPHEMERAL_TMP_DEVICE")
         .map_err(|_| "stage=env detail=missing_device".to_string())?;
     let size_mib = env::var("MSL_EPHEMERAL_TMP_SIZE_MIB").unwrap_or_else(|_| "-".to_string());
-    let reset_on_stop = env::var("MSL_EPHEMERAL_TMP_RESET_ON_STOP").unwrap_or_else(|_| "-".to_string());
+    let reset_on_stop =
+        env::var("MSL_EPHEMERAL_TMP_RESET_ON_STOP").unwrap_or_else(|_| "-".to_string());
     let label = env::var("MSL_EPHEMERAL_TMP_LABEL").unwrap_or_else(|_| "-".to_string());
 
     log_line(&format!(
@@ -1639,8 +2751,7 @@ fn mount_ephemeral_tmp_storage(device: &str) -> Result<(), String> {
         .map_err(|e| format!("stage=tmp_dir_create detail=failed to create /tmp: {}", e))?;
     bind_mount_directory_if_needed("/run/msl/tmp", "/tmp")
         .map_err(|e| format!("stage=tmp_bind detail={}", e))?;
-    set_path_mode("/tmp", 0o1777)
-        .map_err(|e| format!("stage=chmod_tmp detail={}", e))?;
+    set_path_mode("/tmp", 0o1777).map_err(|e| format!("stage=chmod_tmp detail={}", e))?;
 
     if mount_fstype("/").as_deref() == Some("erofs") {
         prepare_erofs_ephemeral_state()?;
@@ -1649,8 +2760,7 @@ fn mount_ephemeral_tmp_storage(device: &str) -> Result<(), String> {
 }
 
 fn mount_ext4_if_needed(device: &str, target: &str) -> Result<(), String> {
-    fs::create_dir_all(target)
-        .map_err(|e| format!("failed to create {}: {}", target, e))?;
+    fs::create_dir_all(target).map_err(|e| format!("failed to create {}: {}", target, e))?;
     if is_mountpoint(target) {
         return Ok(());
     }
@@ -1689,8 +2799,7 @@ fn bind_mount_directory_if_needed(source: &str, target: &str) -> Result<bool, St
 
 fn bind_mount_any_if_needed(source: &str, target: &str, directory: bool) -> Result<bool, String> {
     if directory {
-        fs::create_dir_all(target)
-            .map_err(|e| format!("failed to create {}: {}", target, e))?;
+        fs::create_dir_all(target).map_err(|e| format!("failed to create {}: {}", target, e))?;
     } else {
         let target_path = Path::new(target);
         if let Some(parent) = target_path.parent() {
@@ -1725,7 +2834,10 @@ fn bind_mount_any_if_needed(source: &str, target: &str, directory: bool) -> Resu
     if err.raw_os_error() == Some(16) {
         return Ok(false);
     }
-    Err(format!("bind mount {} -> {} failed: {}", source, target, err))
+    Err(format!(
+        "bind mount {} -> {} failed: {}",
+        source, target, err
+    ))
 }
 
 fn prepare_erofs_ephemeral_state() -> Result<(), String> {
@@ -1735,9 +2847,17 @@ fn prepare_erofs_ephemeral_state() -> Result<(), String> {
         .map_err(|e| format!("stage=erofs_etc_root detail={}", e))?;
 
     copy_tree_best_effort("/var", "/run/msl/tmp/var", "erofs_var_copy");
-    for path in ["/run/msl/tmp/var/log", "/run/msl/tmp/var/tmp", "/run/msl/tmp/var/devcontainer"] {
-        fs::create_dir_all(path)
-            .map_err(|e| format!("stage=erofs_var_tree detail=failed to create {}: {}", path, e))?;
+    for path in [
+        "/run/msl/tmp/var/log",
+        "/run/msl/tmp/var/tmp",
+        "/run/msl/tmp/var/devcontainer",
+    ] {
+        fs::create_dir_all(path).map_err(|e| {
+            format!(
+                "stage=erofs_var_tree detail=failed to create {}: {}",
+                path, e
+            )
+        })?;
     }
     set_path_mode("/run/msl/tmp/var/tmp", 0o1777)
         .map_err(|e| format!("stage=erofs_var_tmp_mode detail={}", e))?;
@@ -1784,11 +2904,15 @@ fn copy_tree_entry(source: &Path, target: &Path) -> Result<(), String> {
     if file_type.is_dir() {
         fs::create_dir_all(target)
             .map_err(|e| format!("failed to create {}: {}", target.display(), e))?;
-        let _ = fs::set_permissions(target, fs::Permissions::from_mode(metadata.permissions().mode() & 0o7777));
+        let _ = fs::set_permissions(
+            target,
+            fs::Permissions::from_mode(metadata.permissions().mode() & 0o7777),
+        );
         let entries = fs::read_dir(source)
             .map_err(|e| format!("failed to read {}: {}", source.display(), e))?;
         for entry in entries {
-            let entry = entry.map_err(|e| format!("failed to read dir entry {}: {}", source.display(), e))?;
+            let entry = entry
+                .map_err(|e| format!("failed to read dir entry {}: {}", source.display(), e))?;
             copy_tree_entry(&entry.path(), &target.join(entry.file_name()))?;
         }
         return Ok(());
@@ -1799,9 +2923,18 @@ fn copy_tree_entry(source: &Path, target: &Path) -> Result<(), String> {
             fs::create_dir_all(parent)
                 .map_err(|e| format!("failed to create {}: {}", parent.display(), e))?;
         }
-        fs::copy(source, target)
-            .map_err(|e| format!("failed to copy {} to {}: {}", source.display(), target.display(), e))?;
-        let _ = fs::set_permissions(target, fs::Permissions::from_mode(metadata.permissions().mode() & 0o7777));
+        fs::copy(source, target).map_err(|e| {
+            format!(
+                "failed to copy {} to {}: {}",
+                source.display(),
+                target.display(),
+                e
+            )
+        })?;
+        let _ = fs::set_permissions(
+            target,
+            fs::Permissions::from_mode(metadata.permissions().mode() & 0o7777),
+        );
         return Ok(());
     }
 
@@ -1912,8 +3045,7 @@ fn mount_virtiofs_macos_if_needed() -> Result<bool, String> {
     if mount_fstype("/").as_deref() == Some("erofs") {
         mount_fs_if_needed("/mnt", b"tmpfs\0", b"tmpfs\0", Some(b"mode=0755\0"));
     }
-    fs::create_dir_all("/mnt/macos")
-        .map_err(|e| format!("failed to create /mnt/macos: {}", e))?;
+    fs::create_dir_all("/mnt/macos").map_err(|e| format!("failed to create /mnt/macos: {}", e))?;
     let source = b"macos\0";
     let target = b"/mnt/macos\0";
     let fstype = b"virtiofs\0";
@@ -1986,7 +3118,10 @@ fn run_vsock_client(port: u32) -> Result<(), String> {
         let stream = match connect_vsock_stream(port) {
             Ok(stream) => stream,
             Err(err) => {
-                log_line(&format!("vsock connect to host port {} failed: {}", port, err));
+                log_line(&format!(
+                    "vsock connect to host port {} failed: {}",
+                    port, err
+                ));
                 thread::sleep(Duration::from_millis(backoff_ms));
                 backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
                 continue;
@@ -2011,10 +3146,20 @@ fn run_vsock_client(port: u32) -> Result<(), String> {
 }
 
 fn connect_single_vsock_session(port: u32, role: &str) -> Result<(), String> {
-    log_line(&format!("attempting vsock connect to host port {} role={}", port, role));
-    let mut stream = connect_vsock_stream(port)
-        .map_err(|err| format!("vsock connect to host port {} failed for role={}: {}", port, role, err))?;
-    log_line(&format!("vsock connected to host port {} role={}", port, role));
+    log_line(&format!(
+        "attempting vsock connect to host port {} role={}",
+        port, role
+    ));
+    let mut stream = connect_vsock_stream(port).map_err(|err| {
+        format!(
+            "vsock connect to host port {} failed for role={}: {}",
+            port, role, err
+        )
+    })?;
+    log_line(&format!(
+        "vsock connected to host port {} role={}",
+        port, role
+    ));
     send_role_hello(&mut stream, &format!("sideband:{}", role))?;
     log_line(&format!("sideband hello sent role={}", role));
     handle_persistent_connection(stream);
@@ -2034,12 +3179,16 @@ fn connect_vsock_stream(port: u32) -> Result<std::fs::File, String> {
     let flags = unsafe { fcntl(fd, F_GETFL) };
     if flags < 0 {
         let err = std::io::Error::last_os_error();
-        unsafe { close(fd); }
+        unsafe {
+            close(fd);
+        }
         return Err(format!("fcntl(F_GETFL) failed: {}", err));
     }
     if unsafe { fcntl(fd, F_SETFL, flags | O_NONBLOCK) } < 0 {
         let err = std::io::Error::last_os_error();
-        unsafe { close(fd); }
+        unsafe {
+            close(fd);
+        }
         return Err(format!("fcntl(F_SETFL, O_NONBLOCK) failed: {}", err));
     }
 
@@ -2055,7 +3204,9 @@ fn connect_vsock_stream(port: u32) -> Result<std::fs::File, String> {
     if ret == 0 {
         if unsafe { fcntl(fd, F_SETFL, flags) } < 0 {
             let err = std::io::Error::last_os_error();
-            unsafe { close(fd); }
+            unsafe {
+                close(fd);
+            }
             return Err(format!("fcntl(F_SETFL) restore failed: {}", err));
         }
         return Ok(unsafe { FromRawFd::from_raw_fd(fd) });
@@ -2064,7 +3215,9 @@ fn connect_vsock_stream(port: u32) -> Result<std::fs::File, String> {
     let err = std::io::Error::last_os_error();
     let raw = err.raw_os_error();
     if raw != Some(libc::EINPROGRESS) && raw != Some(libc::EAGAIN) && raw != Some(libc::EINTR) {
-        unsafe { close(fd); }
+        unsafe {
+            close(fd);
+        }
         return Err(err.to_string());
     }
 
@@ -2075,12 +3228,16 @@ fn connect_vsock_stream(port: u32) -> Result<std::fs::File, String> {
     };
     let poll_ret = unsafe { poll(&mut pfd, 1, 1000) };
     if poll_ret == 0 {
-        unsafe { close(fd); }
+        unsafe {
+            close(fd);
+        }
         return Err("connect timed out waiting for writable socket".to_string());
     }
     if poll_ret < 0 {
         let poll_err = std::io::Error::last_os_error();
-        unsafe { close(fd); }
+        unsafe {
+            close(fd);
+        }
         return Err(format!("poll during connect failed: {}", poll_err));
     }
 
@@ -2088,14 +3245,18 @@ fn connect_vsock_stream(port: u32) -> Result<std::fs::File, String> {
     if retry < 0 {
         let retry_err = std::io::Error::last_os_error();
         if retry_err.raw_os_error() != Some(libc::EISCONN) {
-            unsafe { close(fd); }
+            unsafe {
+                close(fd);
+            }
             return Err(retry_err.to_string());
         }
     }
 
     if unsafe { fcntl(fd, F_SETFL, flags) } < 0 {
         let err = std::io::Error::last_os_error();
-        unsafe { close(fd); }
+        unsafe {
+            close(fd);
+        }
         return Err(format!("fcntl(F_SETFL) restore failed: {}", err));
     }
     Ok(unsafe { FromRawFd::from_raw_fd(fd) })
@@ -2110,7 +3271,11 @@ fn handle_persistent_connection(mut stream: std::fs::File) {
         // shut down msl-init by stopping the VM. No need for msl-init to
         // independently timeout the vsock connection.
         let fd = stream.as_raw_fd();
-        let mut rpfd = PollFd { fd, events: POLLIN, revents: 0 };
+        let mut rpfd = PollFd {
+            fd,
+            events: POLLIN,
+            revents: 0,
+        };
         let poll_ret = unsafe { poll(&mut rpfd, 1, -1) };
         if poll_ret == 0 {
             // Should not happen with timeout=-1, but handle gracefully
@@ -2118,7 +3283,8 @@ fn handle_persistent_connection(mut stream: std::fs::File) {
         }
         if poll_ret < 0 {
             let e = std::io::Error::last_os_error();
-            if e.raw_os_error() == Some(4) { // EINTR
+            if e.raw_os_error() == Some(4) {
+                // EINTR
                 continue;
             }
             log_line(&format!("vsock read poll error: {}", e));
@@ -2154,11 +3320,15 @@ fn handle_persistent_connection(mut stream: std::fs::File) {
                 let streamed = match decoded.opcode {
                     INIT_CHANNEL_FRAME_OPCODE_PROC_SUBSCRIBE_REQUEST => {
                         if let Some(proc_id) = extract_direct_string(&decoded_header, "procId") {
-                            log_line(&format!("proc_subscribe_stream_started proc_id={}", proc_id));
+                            log_line(&format!(
+                                "proc_subscribe_stream_started proc_id={}",
+                                proc_id
+                            ));
                         } else {
                             log_line("proc_subscribe_stream_started proc_id=unknown");
                         }
-                        if let Err(err) = handle_direct_proc_subscribe(decoded._header, &mut stream) {
+                        if let Err(err) = handle_direct_proc_subscribe(decoded._header, &mut stream)
+                        {
                             log_line(&format!("proc subscribe error: {}", err));
                         }
                         true
@@ -2169,7 +3339,8 @@ fn handle_persistent_connection(mut stream: std::fs::File) {
                         } else {
                             log_line("pty_subscribe_stream_started pty_id=unknown");
                         }
-                        if let Err(err) = handle_direct_pty_subscribe(decoded._header, &mut stream) {
+                        if let Err(err) = handle_direct_pty_subscribe(decoded._header, &mut stream)
+                        {
                             log_line(&format!("pty subscribe error: {}", err));
                         }
                         true
@@ -2177,7 +3348,10 @@ fn handle_persistent_connection(mut stream: std::fs::File) {
                     _ => false,
                 };
                 if streamed {
-                    log_line(&format!("vsock direct stream handler returning opcode={}", decoded_op));
+                    log_line(&format!(
+                        "vsock direct stream handler returning opcode={}",
+                        decoded_op
+                    ));
                     return;
                 }
             }
@@ -2252,7 +3426,12 @@ fn handle_frame(frame: Vec<u8>) -> Vec<u8> {
     match decode_frame(frame.as_slice()) {
         Ok(decoded) => {
             if decoded.magic != INIT_CHANNEL_FRAME_MAGIC {
-                let response = error_response("unknown", "unknown", "invalid_request", "invalid init channel frame magic");
+                let response = error_response(
+                    "unknown",
+                    "unknown",
+                    "invalid_request",
+                    "invalid init channel frame magic",
+                );
                 return encode_json_rpc_response(&response);
             }
             match decoded.opcode {
@@ -2260,27 +3439,51 @@ fn handle_frame(frame: Vec<u8>) -> Vec<u8> {
                     let request = match String::from_utf8(decoded.payload) {
                         Ok(v) => v,
                         Err(_) => {
-                            let response = error_response("unknown", "unknown", "invalid_request", "invalid JSON-RPC payload");
+                            let response = error_response(
+                                "unknown",
+                                "unknown",
+                                "invalid_request",
+                                "invalid JSON-RPC payload",
+                            );
                             return encode_json_rpc_response(&response);
                         }
                     };
-                    let request_op = extract_string(&request, "op").unwrap_or_else(|| "unknown".to_string());
+                    let request_op =
+                        extract_string(&request, "op").unwrap_or_else(|| "unknown".to_string());
                     log_line(&format!("control_request_received op={}", request_op));
                     let response = handle_request_line(&request);
                     encode_json_rpc_response(&response)
                 }
-                INIT_CHANNEL_FRAME_OPCODE_PTY_READ_REQUEST => handle_direct_pty_read(decoded._header),
-                INIT_CHANNEL_FRAME_OPCODE_PTY_WRITE_REQUEST => handle_direct_pty_write(decoded._header, decoded.payload),
-                INIT_CHANNEL_FRAME_OPCODE_PROC_READ_REQUEST => handle_direct_proc_read(decoded._header),
-                INIT_CHANNEL_FRAME_OPCODE_PROC_WRITE_REQUEST => handle_direct_proc_write(decoded._header, decoded.payload),
+                INIT_CHANNEL_FRAME_OPCODE_PTY_READ_REQUEST => {
+                    handle_direct_pty_read(decoded._header)
+                }
+                INIT_CHANNEL_FRAME_OPCODE_PTY_WRITE_REQUEST => {
+                    handle_direct_pty_write(decoded._header, decoded.payload)
+                }
+                INIT_CHANNEL_FRAME_OPCODE_PROC_READ_REQUEST => {
+                    handle_direct_proc_read(decoded._header)
+                }
+                INIT_CHANNEL_FRAME_OPCODE_PROC_WRITE_REQUEST => {
+                    handle_direct_proc_write(decoded._header, decoded.payload)
+                }
                 _ => {
-                    let response = error_response("unknown", "unknown", "unsupported_op", "unsupported init channel frame opcode");
+                    let response = error_response(
+                        "unknown",
+                        "unknown",
+                        "unsupported_op",
+                        "unsupported init channel frame opcode",
+                    );
                     encode_json_rpc_response(&response)
                 }
             }
         }
         Err(e) => {
-            let response = error_response("unknown", "unknown", "invalid_request", &format!("invalid init channel frame: {}", e));
+            let response = error_response(
+                "unknown",
+                "unknown",
+                "invalid_request",
+                &format!("invalid init channel frame: {}", e),
+            );
             encode_json_rpc_response(&response)
         }
     }
@@ -2339,6 +3542,9 @@ fn handle_request_line(line: &str) -> String {
         "proc_stdin_close" => proc_stdin_close_response(&request_id, &op, line),
         "proc_close" => proc_close_response(&request_id, &op, line),
         "sideband_open" => sideband_open_response(&request_id, &op, line),
+        "wayland_proxy_start" => wayland_proxy_start_response(&request_id, &op, line),
+        "wayland_proxy_stop" => wayland_proxy_stop_response(&request_id, &op, line),
+        "wayland_proxy_status" => wayland_proxy_status_response(&request_id, &op, line),
         "dns_reconcile" => dns_reconcile_response(&request_id, &op, line),
         "dns_healthcheck" => dns_healthcheck_response(&request_id, &op, line),
         _ => error_response(
@@ -2366,6 +3572,125 @@ fn sideband_open_response(request_id: &str, op: &str, line: &str) -> String {
         request_id,
         op,
         Some(format!("\"meta\":{{\"role\":\"{}\"}}", escape_json(&role))),
+    )
+}
+
+fn wayland_proxy_start_response(request_id: &str, op: &str, line: &str) -> String {
+    let display_name =
+        extract_string(line, "displayName").unwrap_or_else(|| "wayland-0".to_string());
+    let display_port = extract_int(line, "displayPort").unwrap_or(38000);
+    let runtime_dir = extract_string(line, "runtimeDir").unwrap_or_else(|| "/tmp".to_string());
+    let display_port_u32 = match u32::try_from(display_port) {
+        Ok(value) => value,
+        Err(_) => {
+            return error_response(
+                request_id,
+                op,
+                "invalid_request",
+                "displayPort must be in 1..65535",
+            )
+        }
+    };
+    match start_wayland_proxy(display_name, display_port_u32, runtime_dir) {
+        Ok(proxy) => ok_response(
+            request_id,
+            op,
+            Some(format!(
+                "\"meta\":{{\"displayName\":\"{}\",\"displayPort\":\"{}\",\"runtimeDir\":\"{}\",\"socketPath\":\"{}\",\"status\":\"running\",\"activeClients\":\"{}\",\"lastError\":\"{}\"}}",
+                escape_json(&proxy.display_name),
+                proxy.display_port,
+                escape_json(&proxy.runtime_dir),
+                escape_json(&proxy.socket_path),
+                proxy.active_clients,
+                escape_json(proxy.last_error.as_deref().unwrap_or(""))
+            )),
+        ),
+        Err(err) => error_response(request_id, op, "internal_error", &err),
+    }
+}
+
+fn wayland_proxy_stop_response(request_id: &str, op: &str, line: &str) -> String {
+    let display_name =
+        extract_string(line, "displayName").unwrap_or_else(|| "wayland-0".to_string());
+    match stop_wayland_proxy(&display_name) {
+        Ok(Some(proxy)) => ok_response(
+            request_id,
+            op,
+            Some(format!(
+                "\"meta\":{{\"displayName\":\"{}\",\"displayPort\":\"{}\",\"socketPath\":\"{}\",\"status\":\"stopped\"}}",
+                escape_json(&proxy.display_name),
+                proxy.display_port,
+                escape_json(&proxy.socket_path)
+            )),
+        ),
+        Ok(None) => ok_response(
+            request_id,
+            op,
+            Some(format!(
+                "\"meta\":{{\"displayName\":\"{}\",\"status\":\"already_stopped\"}}",
+                escape_json(&display_name)
+            )),
+        ),
+        Err(err) => error_response(request_id, op, "internal_error", &err),
+    }
+}
+
+fn wayland_proxy_status_response(request_id: &str, op: &str, line: &str) -> String {
+    let display_name = extract_string(line, "displayName");
+    let proxies = match wayland_proxies().lock() {
+        Ok(proxies) => proxies,
+        Err(_) => {
+            return error_response(
+                request_id,
+                op,
+                "internal_error",
+                "wayland proxy lock poisoned",
+            )
+        }
+    };
+    if let Some(display_name) = display_name {
+        if let Some(proxy) = proxies.get(&display_name) {
+            return ok_response(
+                request_id,
+                op,
+            Some(format!(
+                "\"meta\":{{\"displayName\":\"{}\",\"displayPort\":\"{}\",\"runtimeDir\":\"{}\",\"socketPath\":\"{}\",\"status\":\"running\",\"transportState\":\"{}\",\"activeClients\":\"{}\",\"fdSupport\":\"enabled\",\"buildMarker\":\"{}\",\"defaultProxyStarted\":\"{}\",\"lastTraceId\":\"{}\",\"keymapSent\":\"{}\",\"bytesClientToHost\":\"{}\",\"bytesHostToClient\":\"{}\",\"lastClientEvent\":\"{}\",\"lastHostEvent\":\"{}\",\"lastError\":\"{}\"}}",
+                escape_json(&proxy.display_name),
+                proxy.display_port,
+                escape_json(&proxy.runtime_dir),
+                escape_json(&proxy.socket_path),
+                if proxy.active_clients > 0 && proxy.last_error.is_none() { "active" } else if proxy.last_error.is_some() { "error" } else { "idle" },
+                proxy.active_clients,
+                escape_json(&proxy.build_marker),
+                proxy.default_proxy_started,
+                escape_json(proxy.last_trace_id.as_deref().unwrap_or("")),
+                proxy.keymap_sent,
+                proxy.bytes_client_to_host,
+                proxy.bytes_host_to_client,
+                escape_json(proxy.last_client_event.as_deref().unwrap_or("")),
+                escape_json(proxy.last_host_event.as_deref().unwrap_or("")),
+                escape_json(proxy.last_error.as_deref().unwrap_or(""))
+            )),
+        );
+        }
+        return ok_response(
+            request_id,
+            op,
+            Some(format!(
+                "\"meta\":{{\"displayName\":\"{}\",\"status\":\"stopped\"}}",
+                escape_json(&display_name)
+            )),
+        );
+    }
+    let displays = proxies.keys().cloned().collect::<Vec<String>>().join(",");
+    ok_response(
+        request_id,
+        op,
+        Some(format!(
+            "\"meta\":{{\"count\":\"{}\",\"displays\":\"{}\"}}",
+            proxies.len(),
+            escape_json(&displays)
+        )),
     )
 }
 
@@ -2499,7 +3824,12 @@ fn direct_error_header(request_id: &str, op: &str, code: &str, message: &str) ->
     .into_bytes()
 }
 
-fn encode_binary_pty_read_header(ok: bool, exit_code: Option<i32>, id: &str, text: Option<&str>) -> Vec<u8> {
+fn encode_binary_pty_read_header(
+    ok: bool,
+    exit_code: Option<i32>,
+    id: &str,
+    text: Option<&str>,
+) -> Vec<u8> {
     let id_bytes = id.as_bytes();
     let text_bytes = text.unwrap_or("").as_bytes();
     let mut flags = 0u8;
@@ -2537,7 +3867,8 @@ fn encode_binary_proc_read_header(
     if !text_bytes.is_empty() {
         flags |= 1 << 1;
     }
-    let mut header = Vec::with_capacity(20 + id_bytes.len() + text_bytes.len() + descriptors.len() * 8);
+    let mut header =
+        Vec::with_capacity(20 + id_bytes.len() + text_bytes.len() + descriptors.len() * 8);
     header.push(if ok { 1 } else { 0 });
     header.push(flags);
     header.extend_from_slice(&[0, 0]);
@@ -2576,9 +3907,7 @@ fn collect_proc_read_events(
 ) -> (Vec<ProcStreamChunk>, Option<i32>, Option<String>, bool) {
     let mut chunks: Vec<ProcStreamChunk> = Vec::new();
     let mut total_bytes = 0usize;
-    let timeout = timeout_ms
-        .map(|value| value.max(0) as u64)
-        .unwrap_or(0);
+    let timeout = timeout_ms.map(|value| value.max(0) as u64).unwrap_or(0);
 
     let mut rx = session.rx.blocking_lock();
 
@@ -2643,7 +3972,10 @@ fn recv_proc_event_blocking(
             Err(tokio_mpsc::error::TryRecvError::Disconnected) => BlockingRecvResult::Closed,
         }
     } else {
-        match io_runtime().block_on(tokio_timeout(TokioDuration::from_millis(timeout_ms), rx.recv())) {
+        match io_runtime().block_on(tokio_timeout(
+            TokioDuration::from_millis(timeout_ms),
+            rx.recv(),
+        )) {
             Ok(Some(event)) => BlockingRecvResult::Event(event),
             Ok(None) => BlockingRecvResult::Closed,
             Err(_) => BlockingRecvResult::Timeout,
@@ -2662,7 +3994,10 @@ fn recv_pty_event_blocking(
             Err(tokio_mpsc::error::TryRecvError::Disconnected) => BlockingRecvResult::Closed,
         }
     } else {
-        match io_runtime().block_on(tokio_timeout(TokioDuration::from_millis(timeout_ms), rx.recv())) {
+        match io_runtime().block_on(tokio_timeout(
+            TokioDuration::from_millis(timeout_ms),
+            rx.recv(),
+        )) {
             Ok(Some(event)) => BlockingRecvResult::Event(event),
             Ok(None) => BlockingRecvResult::Closed,
             Err(_) => BlockingRecvResult::Timeout,
@@ -2687,7 +4022,12 @@ fn handle_direct_pty_read(header: Vec<u8>) -> Vec<u8> {
         Err(_) => {
             return encode_frame(
                 INIT_CHANNEL_FRAME_OPCODE_PTY_READ_RESPONSE,
-                &encode_binary_pty_read_header(false, None, &pty_id, Some("pty session lock poisoned")),
+                &encode_binary_pty_read_header(
+                    false,
+                    None,
+                    &pty_id,
+                    Some("pty session lock poisoned"),
+                ),
                 &[],
             )
         }
@@ -2708,7 +4048,9 @@ fn handle_direct_pty_read(header: Vec<u8>) -> Vec<u8> {
         let mut rx = session.rx.blocking_lock();
         while output.len() < MAX_READ_BYTES {
             match recv_pty_event_blocking(&mut rx, 0) {
-                BlockingRecvResult::Event(PtyEvent::Output(chunk)) => output.extend_from_slice(&chunk),
+                BlockingRecvResult::Event(PtyEvent::Output(chunk)) => {
+                    output.extend_from_slice(&chunk)
+                }
                 BlockingRecvResult::Event(PtyEvent::Exited { code, reason }) => {
                     session.child_exit_code = Some(code);
                     session.child_exit_reason = Some(reason);
@@ -2727,7 +4069,9 @@ fn handle_direct_pty_read(header: Vec<u8>) -> Vec<u8> {
     let exit_code = map.get(&pty_id).and_then(|session| session.child_exit_code);
     if exit_code.is_some() && map.get(&pty_id).map(|v| v.streams_closed).unwrap_or(false) {
         if let Some(session) = map.remove(&pty_id) {
-            unsafe { close(session.master_fd); }
+            unsafe {
+                close(session.master_fd);
+            }
         }
     }
 
@@ -2739,7 +4083,8 @@ fn handle_direct_pty_read(header: Vec<u8>) -> Vec<u8> {
 }
 
 fn handle_direct_pty_write(header: Vec<u8>, payload: Vec<u8>) -> Vec<u8> {
-    let request_id = extract_direct_string(&header, "requestId").unwrap_or_else(|| "unknown".to_string());
+    let request_id =
+        extract_direct_string(&header, "requestId").unwrap_or_else(|| "unknown".to_string());
     let op = extract_direct_string(&header, "op").unwrap_or_else(|| "pty_write".to_string());
     let pty_id = match extract_direct_string(&header, "ptyId") {
         Some(v) if !v.is_empty() => v,
@@ -2751,10 +4096,19 @@ fn handle_direct_pty_write(header: Vec<u8>, payload: Vec<u8>) -> Vec<u8> {
             )
         }
     };
-    let line = format!("{{\"requestId\":\"{}\",\"op\":\"{}\",\"ptyId\":\"{}\",\"dataBase64\":\"{}\"}}",
-        escape_json(&request_id), escape_json(&op), escape_json(&pty_id), escape_json(&b64_encode(&payload)));
+    let line = format!(
+        "{{\"requestId\":\"{}\",\"op\":\"{}\",\"ptyId\":\"{}\",\"dataBase64\":\"{}\"}}",
+        escape_json(&request_id),
+        escape_json(&op),
+        escape_json(&pty_id),
+        escape_json(&b64_encode(&payload))
+    );
     let response = pty_write_response(&request_id, &op, &line);
-    encode_frame(INIT_CHANNEL_FRAME_OPCODE_PTY_WRITE_RESPONSE, response.as_bytes(), &[])
+    encode_frame(
+        INIT_CHANNEL_FRAME_OPCODE_PTY_WRITE_RESPONSE,
+        response.as_bytes(),
+        &[],
+    )
 }
 
 fn handle_direct_proc_read(header: Vec<u8>) -> Vec<u8> {
@@ -2780,7 +4134,13 @@ fn handle_direct_proc_read(header: Vec<u8>) -> Vec<u8> {
         Err(_) => {
             return encode_frame(
                 INIT_CHANNEL_FRAME_OPCODE_PROC_READ_RESPONSE,
-                &encode_binary_proc_read_header(false, None, &proc_id, Some("proc session lock poisoned"), &[]),
+                &encode_binary_proc_read_header(
+                    false,
+                    None,
+                    &proc_id,
+                    Some("proc session lock poisoned"),
+                    &[],
+                ),
                 &[],
             )
         }
@@ -2792,7 +4152,13 @@ fn handle_direct_proc_read(header: Vec<u8>) -> Vec<u8> {
             None => {
                 return encode_frame(
                     INIT_CHANNEL_FRAME_OPCODE_PROC_READ_RESPONSE,
-                    &encode_binary_proc_read_header(false, None, &proc_id, Some("unknown procId"), &[]),
+                    &encode_binary_proc_read_header(
+                        false,
+                        None,
+                        &proc_id,
+                        Some("unknown procId"),
+                        &[],
+                    ),
                     &[],
                 )
             }
@@ -2822,13 +4188,20 @@ fn handle_direct_proc_read(header: Vec<u8>) -> Vec<u8> {
 
     encode_frame(
         INIT_CHANNEL_FRAME_OPCODE_PROC_READ_RESPONSE,
-        &encode_binary_proc_read_header(true, exit_code, &proc_id, exit_reason.as_deref(), &chunk_descriptors),
+        &encode_binary_proc_read_header(
+            true,
+            exit_code,
+            &proc_id,
+            exit_reason.as_deref(),
+            &chunk_descriptors,
+        ),
         &payload,
     )
 }
 
 fn handle_direct_proc_write(header: Vec<u8>, payload: Vec<u8>) -> Vec<u8> {
-    let request_id = extract_direct_string(&header, "requestId").unwrap_or_else(|| "unknown".to_string());
+    let request_id =
+        extract_direct_string(&header, "requestId").unwrap_or_else(|| "unknown".to_string());
     let op = extract_direct_string(&header, "op").unwrap_or_else(|| "proc_write".to_string());
     let proc_id = match extract_direct_string(&header, "procId") {
         Some(v) if !v.is_empty() => v,
@@ -2847,7 +4220,12 @@ fn handle_direct_proc_write(header: Vec<u8>, payload: Vec<u8>) -> Vec<u8> {
             Err(_) => {
                 return encode_frame(
                     INIT_CHANNEL_FRAME_OPCODE_PROC_WRITE_RESPONSE,
-                    &direct_error_header(&request_id, &op, "internal_error", "proc session lock poisoned"),
+                    &direct_error_header(
+                        &request_id,
+                        &op,
+                        "internal_error",
+                        "proc session lock poisoned",
+                    ),
                     &[],
                 )
             }
@@ -2868,7 +4246,12 @@ fn handle_direct_proc_write(header: Vec<u8>, payload: Vec<u8>) -> Vec<u8> {
             None => {
                 return encode_frame(
                     INIT_CHANNEL_FRAME_OPCODE_PROC_WRITE_RESPONSE,
-                    &direct_error_header(&request_id, &op, "internal_error", "proc stdin already closed"),
+                    &direct_error_header(
+                        &request_id,
+                        &op,
+                        "internal_error",
+                        "proc stdin already closed",
+                    ),
                     &[],
                 )
             }
@@ -2880,39 +4263,74 @@ fn handle_direct_proc_write(header: Vec<u8>, payload: Vec<u8>) -> Vec<u8> {
     }) {
         return encode_frame(
             INIT_CHANNEL_FRAME_OPCODE_PROC_WRITE_RESPONSE,
-            &direct_error_header(&request_id, &op, "internal_error", &format!("proc stdin queue failed: {}", err)),
+            &direct_error_header(
+                &request_id,
+                &op,
+                "internal_error",
+                &format!("proc stdin queue failed: {}", err),
+            ),
             &[],
         );
     }
     encode_frame(
         INIT_CHANNEL_FRAME_OPCODE_PROC_WRITE_RESPONSE,
-        &direct_header(&request_id, &op, Some(format!("\"procId\":\"{}\"", escape_json(&proc_id)))),
+        &direct_header(
+            &request_id,
+            &op,
+            Some(format!("\"procId\":\"{}\"", escape_json(&proc_id))),
+        ),
         &[],
     )
 }
 
-fn encode_proc_event_frame(proc_id: &str, kind: &str, payload: &[u8], exit_code: Option<i32>, text: Option<&str>) -> Vec<u8> {
+fn encode_proc_event_frame(
+    proc_id: &str,
+    kind: &str,
+    payload: &[u8],
+    exit_code: Option<i32>,
+    text: Option<&str>,
+) -> Vec<u8> {
     let header = format!(
         "{{\"kind\":\"{}\",\"procId\":\"{}\"{}{}{}}}",
         escape_json(kind),
         escape_json(proc_id),
-        exit_code.map(|v| format!(",\"exitCode\":{}", v)).unwrap_or_default(),
-        text.map(|v| format!(",\"text\":\"{}\"", escape_json(v))).unwrap_or_default(),
+        exit_code
+            .map(|v| format!(",\"exitCode\":{}", v))
+            .unwrap_or_default(),
+        text.map(|v| format!(",\"text\":\"{}\"", escape_json(v)))
+            .unwrap_or_default(),
         ""
     );
-    encode_frame(INIT_CHANNEL_FRAME_OPCODE_PROC_EVENT, header.as_bytes(), payload)
+    encode_frame(
+        INIT_CHANNEL_FRAME_OPCODE_PROC_EVENT,
+        header.as_bytes(),
+        payload,
+    )
 }
 
-fn encode_pty_event_frame(pty_id: &str, kind: &str, payload: &[u8], exit_code: Option<i32>, text: Option<&str>) -> Vec<u8> {
+fn encode_pty_event_frame(
+    pty_id: &str,
+    kind: &str,
+    payload: &[u8],
+    exit_code: Option<i32>,
+    text: Option<&str>,
+) -> Vec<u8> {
     let header = format!(
         "{{\"kind\":\"{}\",\"ptyId\":\"{}\"{}{}{}}}",
         escape_json(kind),
         escape_json(pty_id),
-        exit_code.map(|v| format!(",\"exitCode\":{}", v)).unwrap_or_default(),
-        text.map(|v| format!(",\"text\":\"{}\"", escape_json(v))).unwrap_or_default(),
+        exit_code
+            .map(|v| format!(",\"exitCode\":{}", v))
+            .unwrap_or_default(),
+        text.map(|v| format!(",\"text\":\"{}\"", escape_json(v)))
+            .unwrap_or_default(),
         ""
     );
-    encode_frame(INIT_CHANNEL_FRAME_OPCODE_PTY_EVENT, header.as_bytes(), payload)
+    encode_frame(
+        INIT_CHANNEL_FRAME_OPCODE_PTY_EVENT,
+        header.as_bytes(),
+        payload,
+    )
 }
 
 fn handle_direct_proc_subscribe(header: Vec<u8>, writer: &mut std::fs::File) -> Result<(), String> {
@@ -2921,8 +4339,12 @@ fn handle_direct_proc_subscribe(header: Vec<u8>, writer: &mut std::fs::File) -> 
         .ok_or_else(|| "missing procId".to_string())?;
 
     let rx = {
-        let map = proc_sessions().lock().map_err(|_| "proc session lock poisoned".to_string())?;
-        let session = map.get(&proc_id).ok_or_else(|| "unknown procId".to_string())?;
+        let map = proc_sessions()
+            .lock()
+            .map_err(|_| "proc session lock poisoned".to_string())?;
+        let session = map
+            .get(&proc_id)
+            .ok_or_else(|| "unknown procId".to_string())?;
         session.rx.clone()
     };
 
@@ -2931,12 +4353,18 @@ fn handle_direct_proc_subscribe(header: Vec<u8>, writer: &mut std::fs::File) -> 
     loop {
         let event = {
             let mut guard = rx.blocking_lock();
-            guard.blocking_recv().ok_or_else(|| "proc event stream closed".to_string())?
+            guard
+                .blocking_recv()
+                .ok_or_else(|| "proc event stream closed".to_string())?
         };
         let frame = match event {
             ProcEvent::Stream(chunk) => match chunk.stream {
-                ProcStreamKind::Stdout => encode_proc_event_frame(&proc_id, "stdout", &chunk.data, None, None),
-                ProcStreamKind::Stderr => encode_proc_event_frame(&proc_id, "stderr", &chunk.data, None, None),
+                ProcStreamKind::Stdout => {
+                    encode_proc_event_frame(&proc_id, "stdout", &chunk.data, None, None)
+                }
+                ProcStreamKind::Stderr => {
+                    encode_proc_event_frame(&proc_id, "stderr", &chunk.data, None, None)
+                }
             },
             ProcEvent::Exited { code, reason } => {
                 saw_exit = true;
@@ -2947,8 +4375,12 @@ fn handle_direct_proc_subscribe(header: Vec<u8>, writer: &mut std::fs::File) -> 
                 encode_proc_event_frame(&proc_id, "streams_closed", &[], None, None)
             }
         };
-        writer.write_all(&frame).map_err(|e| format!("proc subscribe write failed: {e}"))?;
-        writer.flush().map_err(|e| format!("proc subscribe flush failed: {e}"))?;
+        writer
+            .write_all(&frame)
+            .map_err(|e| format!("proc subscribe write failed: {e}"))?;
+        writer
+            .flush()
+            .map_err(|e| format!("proc subscribe flush failed: {e}"))?;
         if saw_exit && saw_streams_closed {
             break;
         }
@@ -2962,8 +4394,12 @@ fn handle_direct_pty_subscribe(header: Vec<u8>, writer: &mut std::fs::File) -> R
         .ok_or_else(|| "missing ptyId".to_string())?;
 
     let rx = {
-        let map = sessions().lock().map_err(|_| "pty session lock poisoned".to_string())?;
-        let session = map.get(&pty_id).ok_or_else(|| "unknown ptyId".to_string())?;
+        let map = sessions()
+            .lock()
+            .map_err(|_| "pty session lock poisoned".to_string())?;
+        let session = map
+            .get(&pty_id)
+            .ok_or_else(|| "unknown ptyId".to_string())?;
         session.rx.clone()
     };
 
@@ -2972,7 +4408,9 @@ fn handle_direct_pty_subscribe(header: Vec<u8>, writer: &mut std::fs::File) -> R
     loop {
         let event = {
             let mut guard = rx.blocking_lock();
-            guard.blocking_recv().ok_or_else(|| "pty event stream closed".to_string())?
+            guard
+                .blocking_recv()
+                .ok_or_else(|| "pty event stream closed".to_string())?
         };
         let frame = match event {
             PtyEvent::Output(data) => encode_pty_event_frame(&pty_id, "output", &data, None, None),
@@ -2985,8 +4423,12 @@ fn handle_direct_pty_subscribe(header: Vec<u8>, writer: &mut std::fs::File) -> R
                 encode_pty_event_frame(&pty_id, "streams_closed", &[], None, None)
             }
         };
-        writer.write_all(&frame).map_err(|e| format!("pty subscribe write failed: {e}"))?;
-        writer.flush().map_err(|e| format!("pty subscribe flush failed: {e}"))?;
+        writer
+            .write_all(&frame)
+            .map_err(|e| format!("pty subscribe write failed: {e}"))?;
+        writer
+            .flush()
+            .map_err(|e| format!("pty subscribe flush failed: {e}"))?;
         if saw_exit && saw_streams_closed {
             break;
         }
@@ -3005,12 +4447,22 @@ fn dns_reconcile_response(request_id: &str, op: &str, line: &str) -> String {
         );
     }
     if mode != "host" && mode != "manual" {
-        return error_response(request_id, op, "invalid_request", "dnsMode must be host|manual|unmanaged");
+        return error_response(
+            request_id,
+            op,
+            "invalid_request",
+            "dnsMode must be host|manual|unmanaged",
+        );
     }
 
     let requested_nameservers = extract_string_array(line, "dnsNameservers").unwrap_or_default();
     if requested_nameservers.is_empty() {
-        return error_response(request_id, op, "invalid_request", "dnsNameservers is required for managed mode");
+        return error_response(
+            request_id,
+            op,
+            "invalid_request",
+            "dnsNameservers is required for managed mode",
+        );
     }
     let search_domains = extract_string_array(line, "dnsSearchDomains").unwrap_or_default();
     let mut nameservers_to_write = requested_nameservers.clone();
@@ -3025,23 +4477,46 @@ fn dns_reconcile_response(request_id: &str, op: &str, line: &str) -> String {
             .unwrap_or_else(|| "127.0.0.1".to_string());
         let proxy_listen_port = extract_int(line, "dnsProxyListenPort").unwrap_or(53);
         if proxy_listen_port <= 0 || proxy_listen_port > 65535 {
-            return error_response(request_id, op, "invalid_request", "dnsProxyListenPort must be in 1..65535");
+            return error_response(
+                request_id,
+                op,
+                "invalid_request",
+                "dnsProxyListenPort must be in 1..65535",
+            );
         }
         if proxy_listen_port != 53 {
-            return error_response(request_id, op, "invalid_request", "dnsProxyListenPort must be 53 for resolv.conf compatibility");
+            return error_response(
+                request_id,
+                op,
+                "invalid_request",
+                "dnsProxyListenPort must be 53 for resolv.conf compatibility",
+            );
         }
 
-        let preferred_listen = match build_listen_addr(&proxy_listen_address, proxy_listen_port as u16) {
-            Some(value) => value,
-            None => return error_response(request_id, op, "invalid_request", "dnsProxyListenAddress must be a valid IP"),
-        };
+        let preferred_listen =
+            match build_listen_addr(&proxy_listen_address, proxy_listen_port as u16) {
+                Some(value) => value,
+                None => {
+                    return error_response(
+                        request_id,
+                        op,
+                        "invalid_request",
+                        "dnsProxyListenAddress must be a valid IP",
+                    )
+                }
+            };
 
         let upstreams: Vec<SocketAddr> = proxy_upstreams_raw
             .iter()
             .filter_map(|value| normalize_dns_upstream(value))
             .collect();
         if upstreams.is_empty() {
-            return error_response(request_id, op, "invalid_request", "dnsProxyUpstreams is required for host mode");
+            return error_response(
+                request_id,
+                op,
+                "invalid_request",
+                "dnsProxyUpstreams is required for host mode",
+            );
         }
         let mut listen_candidates: Vec<SocketAddr> = vec![preferred_listen];
         if preferred_listen.ip().to_string() != "127.0.0.1" {
@@ -3051,7 +4526,10 @@ fn dns_reconcile_response(request_id: &str, op: &str, line: &str) -> String {
         }
         if let Some(detected) = detect_default_local_ip() {
             let detected_addr = SocketAddr::new(detected, proxy_listen_port as u16);
-            if !listen_candidates.iter().any(|value| *value == detected_addr) {
+            if !listen_candidates
+                .iter()
+                .any(|value| *value == detected_addr)
+            {
                 listen_candidates.push(detected_addr);
             }
         }
@@ -3110,11 +4588,21 @@ fn dns_reconcile_response(request_id: &str, op: &str, line: &str) -> String {
 
     let tmp = Path::new("/etc/resolv.conf.msl.tmp");
     if let Err(e) = fs::write(tmp, content) {
-        return error_response(request_id, op, "internal_error", &format!("failed to write resolv tmp: {}", e));
+        return error_response(
+            request_id,
+            op,
+            "internal_error",
+            &format!("failed to write resolv tmp: {}", e),
+        );
     }
     if let Err(e) = fs::rename(tmp, target) {
         let _ = fs::remove_file(tmp);
-        return error_response(request_id, op, "internal_error", &format!("failed to replace resolv.conf: {}", e));
+        return error_response(
+            request_id,
+            op,
+            "internal_error",
+            &format!("failed to replace resolv.conf: {}", e),
+        );
     }
 
     ok_response(
@@ -3204,8 +4692,7 @@ fn dns_healthcheck_response(request_id: &str, op: &str, _line: &str) -> String {
 }
 
 fn host_share_prepare_response(request_id: &str, op: &str, line: &str) -> String {
-    let workspace_path = extract_string(line, "cwd")
-        .and_then(|v| normalize_absolute_path(&v));
+    let workspace_path = extract_string(line, "cwd").and_then(|v| normalize_absolute_path(&v));
     let share_root = extract_string(line, "hostShareRoot")
         .and_then(|v| normalize_absolute_path(&v))
         .unwrap_or_else(|| "/".to_string());
@@ -3277,7 +4764,8 @@ fn host_share_prepare_response(request_id: &str, op: &str, line: &str) -> String
 }
 
 fn pty_open_response(request_id: &str, op: &str, line: &str) -> String {
-    let argv = extract_string_array(line, "argv").unwrap_or_else(|| vec!["/bin/sh".to_string(), "-l".to_string()]);
+    let argv = extract_string_array(line, "argv")
+        .unwrap_or_else(|| vec!["/bin/sh".to_string(), "-l".to_string()]);
     if argv.is_empty() {
         return error_response(request_id, op, "invalid_request", "missing argv");
     }
@@ -3295,48 +4783,65 @@ fn pty_open_response(request_id: &str, op: &str, line: &str) -> String {
     // Allocate a real PTY pair
     let mut master_fd: i32 = -1;
     let mut slave_fd: i32 = -1;
-    let ws = Winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
+    let ws = Winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
 
-    if unsafe { openpty(&mut master_fd, &mut slave_fd, std::ptr::null_mut(), std::ptr::null(), &ws) } != 0 {
-        return error_response(request_id, op, "internal_error", &format!("openpty failed: {}", std::io::Error::last_os_error()));
+    if unsafe {
+        openpty(
+            &mut master_fd,
+            &mut slave_fd,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            &ws,
+        )
+    } != 0
+    {
+        return error_response(
+            request_id,
+            op,
+            "internal_error",
+            &format!("openpty failed: {}", std::io::Error::last_os_error()),
+        );
     }
 
     // Prepare all heap allocations BEFORE fork() to avoid malloc corruption
     // in a multi-threaded process. After fork, only async-signal-safe calls are allowed.
-    let c_strings: Vec<Vec<u8>> = argv.iter().map(|s| {
-        let mut v = s.as_bytes().to_vec();
-        v.push(0);
-        v
-    }).collect();
-    let c_ptrs: Vec<*const u8> = c_strings.iter().map(|v| v.as_ptr())
-        .chain(std::iter::once(std::ptr::null())).collect();
+    let c_strings: Vec<Vec<u8>> = argv
+        .iter()
+        .map(|s| {
+            let mut v = s.as_bytes().to_vec();
+            v.push(0);
+            v
+        })
+        .collect();
+    let c_ptrs: Vec<*const u8> = c_strings
+        .iter()
+        .map(|v| v.as_ptr())
+        .chain(std::iter::once(std::ptr::null()))
+        .collect();
 
-    // Build environment as "KEY=VALUE\0" strings for execve
-    let mut env_values = vec![
-        format!("HOME={}", runtime.home),
-        "TERM=xterm-256color".to_string(),
-        "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
-        format!("USER={}", runtime.username),
-        format!("LOGNAME={}", runtime.username),
-        format!("SHELL={}", runtime.shell),
-        "LANG=C.UTF-8".to_string(),
-        "LC_ALL=C.UTF-8".to_string(),
-    ];
-    if let Some(time_zone_id) = load_timezone_from_process_or_etc_environment() {
-        env_values.push(format!("TZ={}", time_zone_id));
-    }
-    for (key, value) in env_additions {
-        if is_valid_env_key(&key) {
-            env_values.push(format!("{}={}", key, value));
-        }
-    }
-    let env_cstrings: Vec<Vec<u8>> = env_values.iter().map(|s| {
-        let mut v = s.as_bytes().to_vec();
-        v.push(0);
-        v
-    }).collect();
-    let env_ptrs: Vec<*const u8> = env_cstrings.iter().map(|v| v.as_ptr())
-        .chain(std::iter::once(std::ptr::null())).collect();
+    // Build environment as "KEY=VALUE\0" strings for execve.
+    let env_values: Vec<String> = child_process_environment(&runtime, env_additions)
+        .into_iter()
+        .map(|(key, value)| format!("{}={}", key, value))
+        .collect();
+    let env_cstrings: Vec<Vec<u8>> = env_values
+        .iter()
+        .map(|s| {
+            let mut v = s.as_bytes().to_vec();
+            v.push(0);
+            v
+        })
+        .collect();
+    let env_ptrs: Vec<*const u8> = env_cstrings
+        .iter()
+        .map(|v| v.as_ptr())
+        .chain(std::iter::once(std::ptr::null()))
+        .collect();
     let selected_cwd = requested_cwd
         .as_ref()
         .filter(|v| v.starts_with('/') && Path::new(v).is_dir())
@@ -3347,8 +4852,16 @@ fn pty_open_response(request_id: &str, op: &str, line: &str) -> String {
 
     let pid = unsafe { fork() };
     if pid < 0 {
-        unsafe { close(master_fd); close(slave_fd); }
-        return error_response(request_id, op, "internal_error", &format!("fork failed: {}", std::io::Error::last_os_error()));
+        unsafe {
+            close(master_fd);
+            close(slave_fd);
+        }
+        return error_response(
+            request_id,
+            op,
+            "internal_error",
+            &format!("fork failed: {}", std::io::Error::last_os_error()),
+        );
     }
 
     if pid == 0 {
@@ -3361,7 +4874,9 @@ fn pty_open_response(request_id: &str, op: &str, line: &str) -> String {
             dup2(slave_fd, 0);
             dup2(slave_fd, 1);
             dup2(slave_fd, 2);
-            if slave_fd > 2 { close(slave_fd); }
+            if slave_fd > 2 {
+                close(slave_fd);
+            }
             if supplementary_gids.is_empty() {
                 setgroups(0, std::ptr::null());
             } else {
@@ -3373,9 +4888,16 @@ fn pty_open_response(request_id: &str, op: &str, line: &str) -> String {
             // Close ALL inherited file descriptors > 2.
             // This prevents vsock fd, other PTY master fds, etc. from leaking
             // into the child process, which can cause subtle corruption.
-            let mut rlim = Rlimit { rlim_cur: 1024, rlim_max: 1024 };
+            let mut rlim = Rlimit {
+                rlim_cur: 1024,
+                rlim_max: 1024,
+            };
             getrlimit(RLIMIT_NOFILE, &mut rlim);
-            let max_fd = if rlim.rlim_cur > 4096 { 4096 } else { rlim.rlim_cur as i32 };
+            let max_fd = if rlim.rlim_cur > 4096 {
+                4096
+            } else {
+                rlim.rlim_cur as i32
+            };
             for fd in 3..max_fd {
                 close(fd);
             }
@@ -3391,8 +4913,14 @@ fn pty_open_response(request_id: &str, op: &str, line: &str) -> String {
     }
 
     // Parent: close slave, set up reader thread for master
-    unsafe { close(slave_fd); }
-    let pty_id = format!("pty-{}-{}", std::process::id(), PTY_SEQ.fetch_add(1, Ordering::Relaxed));
+    unsafe {
+        close(slave_fd);
+    }
+    let pty_id = format!(
+        "pty-{}-{}",
+        std::process::id(),
+        PTY_SEQ.fetch_add(1, Ordering::Relaxed)
+    );
     let _ = set_fd_nonblocking(master_fd);
 
     let (event_tx, event_rx) = tokio_mpsc::channel::<PtyEvent>(256);
@@ -3415,7 +4943,14 @@ fn pty_open_response(request_id: &str, op: &str, line: &str) -> String {
         Ok(mut map) => {
             map.insert(pty_id.clone(), session);
         }
-        Err(_) => return error_response(request_id, op, "internal_error", "pty session lock poisoned"),
+        Err(_) => {
+            return error_response(
+                request_id,
+                op,
+                "internal_error",
+                "pty session lock poisoned",
+            )
+        }
     }
 
     let duration_ms = started.elapsed().as_millis();
@@ -3469,13 +5004,17 @@ fn start_pty_output_pump(master_fd: i32, tx: tokio_mpsc::Sender<PtyEvent>) {
                 Err(_) => break,
             };
             let read_result = guard.try_io(|inner| {
-                let n = unsafe { libc_read(inner.get_ref().as_raw_fd(), buf.as_mut_ptr(), buf.len()) };
+                let n =
+                    unsafe { libc_read(inner.get_ref().as_raw_fd(), buf.as_mut_ptr(), buf.len()) };
                 if n < 0 {
                     let err = std::io::Error::last_os_error();
                     if matches!(err.kind(), std::io::ErrorKind::WouldBlock) {
                         Err(err)
                     } else {
-                        log_line(&format!("pty_output_event proc_id={} reason=read_failed message={}", master_fd, err));
+                        log_line(&format!(
+                            "pty_output_event proc_id={} reason=read_failed message={}",
+                            master_fd, err
+                        ));
                         Ok(0)
                     }
                 } else {
@@ -3485,7 +5024,11 @@ fn start_pty_output_pump(master_fd: i32, tx: tokio_mpsc::Sender<PtyEvent>) {
             match read_result {
                 Ok(Ok(0)) => break,
                 Ok(Ok(n)) => {
-                    if tx.send(PtyEvent::Output(buf[..n as usize].to_vec())).await.is_err() {
+                    if tx
+                        .send(PtyEvent::Output(buf[..n as usize].to_vec()))
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -3497,7 +5040,11 @@ fn start_pty_output_pump(master_fd: i32, tx: tokio_mpsc::Sender<PtyEvent>) {
     });
 }
 
-fn start_pty_input_pump(proc_id: String, master_fd: i32, mut rx: tokio_mpsc::Receiver<PtyInputMessage>) {
+fn start_pty_input_pump(
+    proc_id: String,
+    master_fd: i32,
+    mut rx: tokio_mpsc::Receiver<PtyInputMessage>,
+) {
     io_runtime().spawn(async move {
         let write_fd = unsafe { dup(master_fd) };
         if write_fd < 0 {
@@ -3590,7 +5137,10 @@ fn start_pty_wait_task(child_pid: i32, tx: tokio_mpsc::Sender<PtyEvent>) {
             } else {
                 None
             }
-        }).await.ok().flatten();
+        })
+        .await
+        .ok()
+        .flatten();
         if let Some(event) = waited {
             let _ = tx.send(event).await;
         }
@@ -3605,7 +5155,14 @@ fn pty_read_response(request_id: &str, op: &str, line: &str) -> String {
 
     let mut map = match sessions().lock() {
         Ok(v) => v,
-        Err(_) => return error_response(request_id, op, "internal_error", "pty session lock poisoned"),
+        Err(_) => {
+            return error_response(
+                request_id,
+                op,
+                "internal_error",
+                "pty session lock poisoned",
+            )
+        }
     };
 
     let mut output: Vec<u8> = Vec::new();
@@ -3620,7 +5177,9 @@ fn pty_read_response(request_id: &str, op: &str, line: &str) -> String {
 
         while output.len() < MAX_READ_BYTES {
             match recv_pty_event_blocking(&mut rx, 0) {
-                BlockingRecvResult::Event(PtyEvent::Output(chunk)) => output.extend_from_slice(&chunk),
+                BlockingRecvResult::Event(PtyEvent::Output(chunk)) => {
+                    output.extend_from_slice(&chunk)
+                }
                 BlockingRecvResult::Event(PtyEvent::Exited { code, reason }) => {
                     session.child_exit_code = Some(code);
                     session.child_exit_reason = Some(reason);
@@ -3635,13 +5194,14 @@ fn pty_read_response(request_id: &str, op: &str, line: &str) -> String {
                 }
             }
         }
-
     }
     let exit_code = map.get(&pty_id).and_then(|session| session.child_exit_code);
 
     if exit_code.is_some() && map.get(&pty_id).map(|v| v.streams_closed).unwrap_or(false) {
         if let Some(session) = map.remove(&pty_id) {
-            unsafe { close(session.master_fd); }
+            unsafe {
+                close(session.master_fd);
+            }
         }
     }
 
@@ -3675,12 +5235,26 @@ fn pty_write_response(request_id: &str, op: &str, line: &str) -> String {
 
     let bytes = match b64_decode(&payload) {
         Ok(v) => v,
-        Err(e) => return error_response(request_id, op, "invalid_request", &format!("invalid base64: {e}")),
+        Err(e) => {
+            return error_response(
+                request_id,
+                op,
+                "invalid_request",
+                &format!("invalid base64: {e}"),
+            )
+        }
     };
 
     let mut map = match sessions().lock() {
         Ok(v) => v,
-        Err(_) => return error_response(request_id, op, "internal_error", "pty session lock poisoned"),
+        Err(_) => {
+            return error_response(
+                request_id,
+                op,
+                "internal_error",
+                "pty session lock poisoned",
+            )
+        }
     };
 
     let session = match map.get_mut(&pty_id) {
@@ -3690,13 +5264,20 @@ fn pty_write_response(request_id: &str, op: &str, line: &str) -> String {
 
     let stdin_tx = match session.stdin_tx.as_ref() {
         Some(v) => v,
-        None => return error_response(request_id, op, "internal_error", "pty stdin already closed"),
+        None => {
+            return error_response(request_id, op, "internal_error", "pty stdin already closed")
+        }
     };
     if let Err(err) = stdin_tx.blocking_send(PtyInputMessage::Data {
         bytes,
         enqueued_at_ms: now_epoch_ms() as i64,
     }) {
-        return error_response(request_id, op, "internal_error", &format!("pty stdin queue failed: {}", err));
+        return error_response(
+            request_id,
+            op,
+            "internal_error",
+            &format!("pty stdin queue failed: {}", err),
+        );
     }
 
     ok_response(request_id, op, None)
@@ -3713,23 +5294,43 @@ fn pty_resize_response(request_id: &str, op: &str, line: &str) -> String {
 
     let map = match sessions().lock() {
         Ok(v) => v,
-        Err(_) => return error_response(request_id, op, "internal_error", "pty session lock poisoned"),
+        Err(_) => {
+            return error_response(
+                request_id,
+                op,
+                "internal_error",
+                "pty session lock poisoned",
+            )
+        }
     };
     let session = match map.get(&pty_id) {
         Some(v) => v,
         None => return error_response(request_id, op, "invalid_request", "unknown ptyId"),
     };
 
-    let ws = Winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
+    let ws = Winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
     let ret = unsafe { ioctl(session.master_fd, TIOCSWINSZ, &ws) };
     if ret < 0 {
-        return error_response(request_id, op, "internal_error", &format!("TIOCSWINSZ failed: {}", std::io::Error::last_os_error()));
+        return error_response(
+            request_id,
+            op,
+            "internal_error",
+            &format!("TIOCSWINSZ failed: {}", std::io::Error::last_os_error()),
+        );
     }
 
     ok_response(
         request_id,
         op,
-        Some(format!("\"meta\":{{\"rows\":\"{}\",\"cols\":\"{}\"}}", rows, cols)),
+        Some(format!(
+            "\"meta\":{{\"rows\":\"{}\",\"cols\":\"{}\"}}",
+            rows, cols
+        )),
     )
 }
 
@@ -3741,12 +5342,25 @@ fn pty_close_response(request_id: &str, op: &str, line: &str) -> String {
 
     let mut map = match sessions().lock() {
         Ok(v) => v,
-        Err(_) => return error_response(request_id, op, "internal_error", "pty session lock poisoned"),
+        Err(_) => {
+            return error_response(
+                request_id,
+                op,
+                "internal_error",
+                "pty session lock poisoned",
+            )
+        }
     };
 
     let mut session = match map.remove(&pty_id) {
         Some(v) => v,
-        None => return ok_response(request_id, op, Some("\"meta\":{\"closed\":\"already\"}".to_string())),
+        None => {
+            return ok_response(
+                request_id,
+                op,
+                Some("\"meta\":{\"closed\":\"already\"}".to_string()),
+            )
+        }
     };
 
     if let Some(tx) = session.stdin_tx.take() {
@@ -3754,23 +5368,42 @@ fn pty_close_response(request_id: &str, op: &str, line: &str) -> String {
     }
 
     // Close master fd first (sends EOF to child)
-    unsafe { close(session.master_fd); }
+    unsafe {
+        close(session.master_fd);
+    }
 
     // Check if child already exited
     let mut status: i32 = 0;
     let ret = unsafe { waitpid(session.child_pid, &mut status, WNOHANG) };
     let code = if ret > 0 {
-        if status & 0x7f == 0 { (status >> 8) & 0xff } else { 128 + (status & 0x7f) }
+        if status & 0x7f == 0 {
+            (status >> 8) & 0xff
+        } else {
+            128 + (status & 0x7f)
+        }
     } else {
         // Not yet exited, send SIGTERM then wait briefly
-        unsafe { kill(session.child_pid, SIGTERM); }
+        unsafe {
+            kill(session.child_pid, SIGTERM);
+        }
         thread::sleep(Duration::from_millis(100));
         let ret2 = unsafe { waitpid(session.child_pid, &mut status, WNOHANG) };
         if ret2 > 0 {
-            if status & 0x7f == 0 { (status >> 8) & 0xff } else { 128 + (status & 0x7f) }
+            if status & 0x7f == 0 {
+                (status >> 8) & 0xff
+            } else {
+                128 + (status & 0x7f)
+            }
         } else {
-            unsafe { kill(session.child_pid, SIGKILL); waitpid(session.child_pid, &mut status, 0); }
-            if status & 0x7f == 0 { (status >> 8) & 0xff } else { 128 + (status & 0x7f) }
+            unsafe {
+                kill(session.child_pid, SIGKILL);
+                waitpid(session.child_pid, &mut status, 0);
+            }
+            if status & 0x7f == 0 {
+                (status >> 8) & 0xff
+            } else {
+                128 + (status & 0x7f)
+            }
         }
     };
 
@@ -3782,12 +5415,17 @@ fn pty_close_response(request_id: &str, op: &str, line: &str) -> String {
     ok_response(
         request_id,
         op,
-        Some(format!("\"meta\":{{\"exitCode\":\"{}\"}},\"exitCode\":{}", code, code)),
+        Some(format!(
+            "\"meta\":{{\"exitCode\":\"{}\"}},\"exitCode\":{}",
+            code, code
+        )),
     )
 }
 
 fn exit_status_code(status: &std::process::ExitStatus) -> i32 {
-    status.code().unwrap_or_else(|| 128 + status.signal().unwrap_or(1))
+    status
+        .code()
+        .unwrap_or_else(|| 128 + status.signal().unwrap_or(1))
 }
 
 fn exit_status_reason(status: &std::process::ExitStatus) -> String {
@@ -3860,10 +5498,7 @@ fn log_proc_child_lifecycle(proc_id: String, root_pid: u32) {
             if !known_children.contains_key(pid) {
                 log_line(&format!(
                     "proc_child_spawn proc_id={} root_pid={} pid={} cmd={}",
-                    proc_id,
-                    root_pid,
-                    pid,
-                    cmd
+                    proc_id, root_pid, pid, cmd
                 ));
             }
         }
@@ -3872,9 +5507,7 @@ fn log_proc_child_lifecycle(proc_id: String, root_pid: u32) {
             if !current_children.contains_key(pid) {
                 log_line(&format!(
                     "proc_child_exit proc_id={} root_pid={} pid={}",
-                    proc_id,
-                    root_pid,
-                    pid
+                    proc_id, root_pid, pid
                 ));
             }
         }
@@ -3929,7 +5562,8 @@ fn is_shell_text_byte(byte: u8) -> bool {
 }
 
 fn sanitize_shell_candidate(bytes: &[u8]) -> String {
-    bytes.iter()
+    bytes
+        .iter()
         .filter(|byte| is_shell_text_byte(**byte))
         .map(|byte| *byte as char)
         .collect()
@@ -4159,7 +5793,10 @@ fn start_proc_stdin_writer(
     io_runtime().spawn(async move {
         while let Some(message) = rx.recv().await {
             match message {
-                ProcStdinMessage::Data { bytes, enqueued_at_ms } => {
+                ProcStdinMessage::Data {
+                    bytes,
+                    enqueued_at_ms,
+                } => {
                     let dequeued_at_ms = now_epoch_ms() as i64;
                     let queue_wait_ms = dequeued_at_ms.saturating_sub(enqueued_at_ms);
                     if let Err(err) = stdin.write_all(&bytes).await {
@@ -4180,7 +5817,10 @@ fn start_proc_stdin_writer(
                 }
                 ProcStdinMessage::Close => {
                     let _ = stdin.shutdown().await;
-                    log_line(&format!("proc_stdin_writer_closed proc_id={} reason=stdin_close", proc_id));
+                    log_line(&format!(
+                        "proc_stdin_writer_closed proc_id={} reason=stdin_close",
+                        proc_id
+                    ));
                     break;
                 }
             }
@@ -4368,17 +6008,27 @@ fn should_holdback_proc_stderr_chunk(data: &[u8]) -> bool {
     data == SHELL_SERVER_SENTINEL
 }
 
-fn start_proc_wait_task(proc_id: String, mut child: tokio::process::Child, tx: tokio_mpsc::Sender<ProcEvent>) {
+fn start_proc_wait_task(
+    proc_id: String,
+    mut child: tokio::process::Child,
+    tx: tokio_mpsc::Sender<ProcEvent>,
+) {
     io_runtime().spawn(async move {
         match child.wait().await {
             Ok(status) => {
                 let code = exit_status_code(&status);
                 let reason = exit_status_reason(&status);
-                log_line(&format!("proc_exited proc_id={} exit_code={} reason={}", proc_id, code, reason));
+                log_line(&format!(
+                    "proc_exited proc_id={} exit_code={} reason={}",
+                    proc_id, code, reason
+                ));
                 let _ = tx.send(ProcEvent::Exited { code, reason }).await;
             }
             Err(err) => {
-                log_line(&format!("proc_wait_error proc_id={} message={}", proc_id, err));
+                log_line(&format!(
+                    "proc_wait_error proc_id={} message={}",
+                    proc_id, err
+                ));
                 let _ = tx
                     .send(ProcEvent::Exited {
                         code: 126,
@@ -4492,22 +6142,7 @@ fn proc_open_response(request_id: &str, op: &str, line: &str) -> String {
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
-    cmd.env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
-    cmd.env("HOME", &runtime.home);
-    cmd.env("TERM", "xterm-256color");
-    cmd.env("USER", &runtime.username);
-    cmd.env("LOGNAME", &runtime.username);
-    cmd.env("SHELL", &runtime.shell);
-    cmd.env("LANG", "C.UTF-8");
-    cmd.env("LC_ALL", "C.UTF-8");
-    if let Some(time_zone_id) = load_timezone_from_process_or_etc_environment() {
-        cmd.env("TZ", time_zone_id);
-    }
-    for (key, value) in env_additions {
-        if is_valid_env_key(&key) {
-            cmd.env(key, value);
-        }
-    }
+    cmd.envs(child_process_environment(&runtime, env_additions));
     let desired_cwd = requested_cwd
         .as_ref()
         .filter(|v| v.starts_with('/') && Path::new(v).is_dir())
@@ -4526,7 +6161,7 @@ fn proc_open_response(request_id: &str, op: &str, line: &str) -> String {
                 request_id,
                 op,
                 "internal_error",
-                &format!("spawn failed: {}", err)
+                &format!("spawn failed: {}", err),
             )
         }
     };
@@ -4544,7 +6179,11 @@ fn proc_open_response(request_id: &str, op: &str, line: &str) -> String {
         None => return error_response(request_id, op, "internal_error", "missing child stderr"),
     };
 
-    let proc_id = format!("proc-{}-{}", std::process::id(), PROC_SEQ.fetch_add(1, Ordering::Relaxed));
+    let proc_id = format!(
+        "proc-{}-{}",
+        std::process::id(),
+        PROC_SEQ.fetch_add(1, Ordering::Relaxed)
+    );
     let (merged_tx, merged_rx) = tokio_mpsc::channel::<ProcEvent>(512);
     let stream_seq = Arc::new(AtomicU64::new(1));
     start_proc_output_merge_pump(
@@ -4566,35 +6205,39 @@ fn proc_open_response(request_id: &str, op: &str, line: &str) -> String {
 
     match proc_sessions().lock() {
         Ok(mut map) => {
-            map.insert(proc_id.clone(), ProcSession {
-                child_pid: pid as i32,
-                stdin_tx: Some(stdin_tx),
-                rx: Arc::new(TokioMutex::new(merged_rx)),
-                child_exit_code: None,
-                child_exit_reason: None,
-                streams_closed: false,
-                stdin_tail: String::new(),
-                stdin_text_tail: String::new(),
-                helper_trace: String::new(),
-                stdin_line_buffer: Vec::new(),
-                helper_watch_started: false,
-                helper_candidate_logged: false,
-                helper_reference_logged: false,
-                helper_tail_last_logged: String::new(),
-            });
+            map.insert(
+                proc_id.clone(),
+                ProcSession {
+                    child_pid: pid as i32,
+                    stdin_tx: Some(stdin_tx),
+                    rx: Arc::new(TokioMutex::new(merged_rx)),
+                    child_exit_code: None,
+                    child_exit_reason: None,
+                    streams_closed: false,
+                    stdin_tail: String::new(),
+                    stdin_text_tail: String::new(),
+                    helper_trace: String::new(),
+                    stdin_line_buffer: Vec::new(),
+                    helper_watch_started: false,
+                    helper_candidate_logged: false,
+                    helper_reference_logged: false,
+                    helper_tail_last_logged: String::new(),
+                },
+            );
         }
-        Err(_) => return error_response(request_id, op, "internal_error", "proc session lock poisoned"),
+        Err(_) => {
+            return error_response(
+                request_id,
+                op,
+                "internal_error",
+                "proc session lock poisoned",
+            )
+        }
     }
 
     log_line(&format!(
         "proc_session_started request_id={} proc_id={} argv0={} pid={} user={} uid={} gid={}",
-        request_id,
-        proc_id,
-        argv[0],
-        pid,
-        runtime.username,
-        runtime.uid,
-        runtime.gid
+        request_id, proc_id, argv[0], pid, runtime.username, runtime.uid, runtime.gid
     ));
     ok_response(
         request_id,
@@ -4612,7 +6255,14 @@ fn proc_read_response(request_id: &str, op: &str, line: &str) -> String {
 
     let mut map = match proc_sessions().lock() {
         Ok(v) => v,
-        Err(_) => return error_response(request_id, op, "internal_error", "proc session lock poisoned"),
+        Err(_) => {
+            return error_response(
+                request_id,
+                op,
+                "internal_error",
+                "proc session lock poisoned",
+            )
+        }
     };
 
     let mut stdout: Vec<u8> = Vec::new();
@@ -4653,10 +6303,16 @@ fn proc_read_response(request_id: &str, op: &str, line: &str) -> String {
 
     let mut extras: Vec<String> = Vec::new();
     if !stdout.is_empty() {
-        extras.push(format!("\"stdoutBase64\":\"{}\"", escape_json(&b64_encode(&stdout))));
+        extras.push(format!(
+            "\"stdoutBase64\":\"{}\"",
+            escape_json(&b64_encode(&stdout))
+        ));
     }
     if !stderr.is_empty() {
-        extras.push(format!("\"stderrBase64\":\"{}\"", escape_json(&b64_encode(&stderr))));
+        extras.push(format!(
+            "\"stderrBase64\":\"{}\"",
+            escape_json(&b64_encode(&stderr))
+        ));
     }
     if !chunks_json.is_empty() {
         extras.push(format!("\"chunks\":[{}]", chunks_json.join(",")));
@@ -4669,7 +6325,15 @@ fn proc_read_response(request_id: &str, op: &str, line: &str) -> String {
         extras.push(format!("\"meta\":{{{}}}", meta_fields.join(",")));
         extras.push(format!("\"exitCode\":{}", code));
     }
-    ok_response(request_id, op, if extras.is_empty() { None } else { Some(extras.join(",")) })
+    ok_response(
+        request_id,
+        op,
+        if extras.is_empty() {
+            None
+        } else {
+            Some(extras.join(","))
+        },
+    )
 }
 
 fn set_fd_nonblocking(fd: i32) -> bool {
@@ -4692,13 +6356,27 @@ fn proc_write_response(request_id: &str, op: &str, line: &str) -> String {
 
     let bytes = match b64_decode(&payload) {
         Ok(v) => v,
-        Err(e) => return error_response(request_id, op, "invalid_request", &format!("invalid base64: {e}")),
+        Err(e) => {
+            return error_response(
+                request_id,
+                op,
+                "invalid_request",
+                &format!("invalid base64: {e}"),
+            )
+        }
     };
 
     let stdin_tx = {
         let mut map = match proc_sessions().lock() {
             Ok(v) => v,
-            Err(_) => return error_response(request_id, op, "internal_error", "proc session lock poisoned"),
+            Err(_) => {
+                return error_response(
+                    request_id,
+                    op,
+                    "internal_error",
+                    "proc session lock poisoned",
+                )
+            }
         };
         let session = match map.get_mut(&proc_id) {
             Some(v) => v,
@@ -4708,7 +6386,14 @@ fn proc_write_response(request_id: &str, op: &str, line: &str) -> String {
 
         match session.stdin_tx.as_ref() {
             Some(v) => v.clone(),
-            None => return error_response(request_id, op, "internal_error", "proc stdin already closed"),
+            None => {
+                return error_response(
+                    request_id,
+                    op,
+                    "internal_error",
+                    "proc stdin already closed",
+                )
+            }
         }
     };
 
@@ -4718,7 +6403,12 @@ fn proc_write_response(request_id: &str, op: &str, line: &str) -> String {
         bytes,
         enqueued_at_ms: enqueue_started_ms,
     }) {
-        return error_response(request_id, op, "internal_error", &format!("proc stdin queue failed: {}", err));
+        return error_response(
+            request_id,
+            op,
+            "internal_error",
+            &format!("proc stdin queue failed: {}", err),
+        );
     }
     let meta = format!(
         "\"meta\":{{\"bytes\":\"{}\",\"queueSendMs\":\"{}\"}}",
@@ -4737,11 +6427,24 @@ fn proc_stdin_close_response(request_id: &str, op: &str, line: &str) -> String {
     let (sender, already_closed, child_alive) = {
         let mut map = match proc_sessions().lock() {
             Ok(v) => v,
-            Err(_) => return error_response(request_id, op, "internal_error", "proc session lock poisoned"),
+            Err(_) => {
+                return error_response(
+                    request_id,
+                    op,
+                    "internal_error",
+                    "proc session lock poisoned",
+                )
+            }
         };
         let session = match map.get_mut(&proc_id) {
             Some(v) => v,
-            None => return ok_response(request_id, op, Some("\"meta\":{\"closed\":\"already\"}".to_string())),
+            None => {
+                return ok_response(
+                    request_id,
+                    op,
+                    Some("\"meta\":{\"closed\":\"already\"}".to_string()),
+                )
+            }
         };
 
         log_helper_tail_snapshot(&proc_id, session, "stdin_close");
@@ -4776,11 +6479,24 @@ fn proc_close_response(request_id: &str, op: &str, line: &str) -> String {
     let mut session = {
         let mut map = match proc_sessions().lock() {
             Ok(v) => v,
-            Err(_) => return error_response(request_id, op, "internal_error", "proc session lock poisoned"),
+            Err(_) => {
+                return error_response(
+                    request_id,
+                    op,
+                    "internal_error",
+                    "proc session lock poisoned",
+                )
+            }
         };
         match map.remove(&proc_id) {
             Some(v) => v,
-            None => return ok_response(request_id, op, Some("\"meta\":{\"closed\":\"already\"}".to_string())),
+            None => {
+                return ok_response(
+                    request_id,
+                    op,
+                    Some("\"meta\":{\"closed\":\"already\"}".to_string()),
+                )
+            }
         }
     };
 
@@ -4791,10 +6507,14 @@ fn proc_close_response(request_id: &str, op: &str, line: &str) -> String {
     let mut close_action = "already_exited".to_string();
     if session.child_exit_code.is_none() {
         close_action = "killed".to_string();
-        unsafe { kill(session.child_pid, SIGKILL); }
+        unsafe {
+            kill(session.child_pid, SIGKILL);
+        }
     }
     let deadline = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < deadline && (session.child_exit_code.is_none() || !session.streams_closed) {
+    while Instant::now() < deadline
+        && (session.child_exit_code.is_none() || !session.streams_closed)
+    {
         let mut rx = session.rx.blocking_lock();
         match recv_proc_event_blocking(&mut rx, 50) {
             BlockingRecvResult::Event(ProcEvent::Stream(_)) => {}
@@ -4841,8 +6561,16 @@ fn b64_encode(data: &[u8]) -> String {
     let mut i = 0;
     while i < data.len() {
         let b0 = data[i] as u32;
-        let b1 = if i + 1 < data.len() { data[i + 1] as u32 } else { 0 };
-        let b2 = if i + 2 < data.len() { data[i + 2] as u32 } else { 0 };
+        let b1 = if i + 1 < data.len() {
+            data[i + 1] as u32
+        } else {
+            0
+        };
+        let b2 = if i + 2 < data.len() {
+            data[i + 2] as u32
+        } else {
+            0
+        };
 
         let n = (b0 << 16) | (b1 << 8) | b2;
         out.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
@@ -5117,33 +6845,74 @@ struct GroupEntry {
 fn converge_user_response(request_id: &str, op: &str, line: &str) -> String {
     let username = match extract_string(line, "convergeUsername") {
         Some(v) if !v.is_empty() => v,
-        _ => return error_response(request_id, op, "invalid_request", "missing convergeUsername"),
+        _ => {
+            return error_response(
+                request_id,
+                op,
+                "invalid_request",
+                "missing convergeUsername",
+            )
+        }
     };
     if !is_safe_identifier(&username) {
-        return error_response(request_id, op, "invalid_request", "invalid convergeUsername");
+        return error_response(
+            request_id,
+            op,
+            "invalid_request",
+            "invalid convergeUsername",
+        );
     }
 
     let uid = match extract_int(line, "convergeUID") {
         Some(v) if v >= 0 => v as u32,
-        _ => return error_response(request_id, op, "invalid_request", "missing or invalid convergeUID"),
+        _ => {
+            return error_response(
+                request_id,
+                op,
+                "invalid_request",
+                "missing or invalid convergeUID",
+            )
+        }
     };
     let gid = match extract_int(line, "convergeGID") {
         Some(v) if v >= 0 => v as u32,
-        _ => return error_response(request_id, op, "invalid_request", "missing or invalid convergeGID"),
+        _ => {
+            return error_response(
+                request_id,
+                op,
+                "invalid_request",
+                "missing or invalid convergeGID",
+            )
+        }
     };
 
     let home = match extract_string(line, "convergeHome") {
         Some(v) if !v.is_empty() && v.starts_with('/') => v,
-        _ => return error_response(request_id, op, "invalid_request", "missing or invalid convergeHome"),
+        _ => {
+            return error_response(
+                request_id,
+                op,
+                "invalid_request",
+                "missing or invalid convergeHome",
+            )
+        }
     };
     let preferred_shell = extract_string(line, "convergePreferredShell");
     let fail_on_uid_conflict = extract_bool(line, "convergeFailOnUIDConflict").unwrap_or(true);
 
-    let template_id = extract_string(line, "policyTemplateId").unwrap_or_else(|| "unknown".to_string());
-    let command_family = extract_string(line, "policyCommandFamily").unwrap_or_else(|| "useradd".to_string());
-    let admin_group = extract_string(line, "policyAdminGroup").unwrap_or_else(|| "sudo".to_string());
+    let template_id =
+        extract_string(line, "policyTemplateId").unwrap_or_else(|| "unknown".to_string());
+    let command_family =
+        extract_string(line, "policyCommandFamily").unwrap_or_else(|| "useradd".to_string());
+    let admin_group =
+        extract_string(line, "policyAdminGroup").unwrap_or_else(|| "sudo".to_string());
     if !is_safe_identifier(&admin_group) {
-        return error_response(request_id, op, "invalid_request", "invalid policyAdminGroup");
+        return error_response(
+            request_id,
+            op,
+            "invalid_request",
+            "invalid policyAdminGroup",
+        );
     }
     let sudo_enabled = extract_bool(line, "policySudoEnabled").unwrap_or(true);
     let sudo_require_binary = extract_bool(line, "policySudoRequireBinary").unwrap_or(false);
@@ -5153,19 +6922,38 @@ fn converge_user_response(request_id: &str, op: &str, line: &str) -> String {
     let sudo_drop_in = extract_string(line, "policySudoDropInPath")
         .unwrap_or_else(|| "/etc/sudoers.d/msl-user".to_string());
     if !sudo_drop_in.starts_with('/') {
-        return error_response(request_id, op, "invalid_request", "policySudoDropInPath must be absolute");
+        return error_response(
+            request_id,
+            op,
+            "invalid_request",
+            "policySudoDropInPath must be absolute",
+        );
     }
     let shell_fallbacks = extract_string_array(line, "policyShellFallbacks")
         .unwrap_or_else(|| vec!["/bin/sh".to_string()]);
 
     let welcome_enabled = extract_bool(line, "policyWelcomeEnabled").unwrap_or(true);
-    let welcome_frequency = extract_string(line, "policyWelcomeFrequency").unwrap_or_else(|| "daily".to_string());
-    let welcome_respect_hushlogin = extract_bool(line, "policyWelcomeRespectHushlogin").unwrap_or(true);
-    let welcome_instance = extract_string(line, "policyWelcomeInstance").unwrap_or_else(|| "msl".to_string());
+    let welcome_frequency =
+        extract_string(line, "policyWelcomeFrequency").unwrap_or_else(|| "daily".to_string());
+    let welcome_respect_hushlogin =
+        extract_bool(line, "policyWelcomeRespectHushlogin").unwrap_or(true);
+    let welcome_instance =
+        extract_string(line, "policyWelcomeInstance").unwrap_or_else(|| "msl".to_string());
 
     let requested_shell = preferred_shell
-        .and_then(|s| if is_executable_path(&s) { Some(s) } else { None })
-        .or_else(|| shell_fallbacks.iter().find(|s| is_executable_path(s)).cloned())
+        .and_then(|s| {
+            if is_executable_path(&s) {
+                Some(s)
+            } else {
+                None
+            }
+        })
+        .or_else(|| {
+            shell_fallbacks
+                .iter()
+                .find(|s| is_executable_path(s))
+                .cloned()
+        })
         .unwrap_or_else(|| "/bin/sh".to_string());
 
     let mut warnings: Vec<String> = Vec::new();
@@ -5180,14 +6968,29 @@ fn converge_user_response(request_id: &str, op: &str, line: &str) -> String {
                         request_id,
                         op,
                         "invalid_request",
-                        &format!("uid_conflict: uid {} already owned by {}", uid, conflict.username),
+                        &format!(
+                            "uid_conflict: uid {} already owned by {}",
+                            uid, conflict.username
+                        ),
                     );
                 }
             }
         }
 
-        if let Err(e) = create_user_from_policy(&command_family, &username, uid, gid, &home, &requested_shell) {
-            return error_response(request_id, op, "internal_error", &format!("user_create_failed: {}", e));
+        if let Err(e) = create_user_from_policy(
+            &command_family,
+            &username,
+            uid,
+            gid,
+            &home,
+            &requested_shell,
+        ) {
+            return error_response(
+                request_id,
+                op,
+                "internal_error",
+                &format!("user_create_failed: {}", e),
+            );
         }
         created = true;
     }
@@ -5214,32 +7017,39 @@ fn converge_user_response(request_id: &str, op: &str, line: &str) -> String {
     if let Err(e) = ensure_user_home(&resolved) {
         warnings.push(format!("home_setup_failed: {}", e));
     }
-    if let Err(e) = ensure_admin_group_membership(&command_family, &resolved.username, &admin_group) {
+    if let Err(e) = ensure_admin_group_membership(&command_family, &resolved.username, &admin_group)
+    {
         warnings.push(format!("admin_group_failed: {}", e));
     }
-    match apply_su_policy(
-        &admin_group,
-        su_enabled,
-        su_passwordless
-    ) {
-    Ok(Some(warning)) => warnings.push(warning),
-    Ok(None) => {}
-    Err(e) => {
-        return error_response(request_id, op, "internal_error", &format!("su_policy_failed: {}", e));
-    }
+    match apply_su_policy(&admin_group, su_enabled, su_passwordless) {
+        Ok(Some(warning)) => warnings.push(warning),
+        Ok(None) => {}
+        Err(e) => {
+            return error_response(
+                request_id,
+                op,
+                "internal_error",
+                &format!("su_policy_failed: {}", e),
+            );
+        }
     }
     match apply_sudo_policy(
         &resolved.username,
         sudo_enabled,
         sudo_require_binary,
         sudo_passwordless,
-        &sudo_drop_in
+        &sudo_drop_in,
     ) {
-    Ok(Some(warning)) => warnings.push(warning),
-    Ok(None) => {}
-    Err(e) => {
-        return error_response(request_id, op, "internal_error", &format!("sudo_policy_failed: {}", e));
-    }
+        Ok(Some(warning)) => warnings.push(warning),
+        Ok(None) => {}
+        Err(e) => {
+            return error_response(
+                request_id,
+                op,
+                "internal_error",
+                &format!("sudo_policy_failed: {}", e),
+            );
+        }
     }
     if let Err(e) = ensure_su_setuid_if_present() {
         warnings.push(format!("su_setup_failed: {}", e));
@@ -5251,7 +7061,7 @@ fn converge_user_response(request_id: &str, op: &str, line: &str) -> String {
         welcome_enabled,
         &welcome_frequency,
         welcome_respect_hushlogin,
-        &welcome_instance
+        &welcome_instance,
     ) {
         warnings.push(format!("welcome_setup_failed: {}", e));
     }
@@ -5292,7 +7102,9 @@ fn is_safe_identifier(value: &str) -> bool {
     if value.is_empty() {
         return false;
     }
-    value.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+    value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
 }
 
 fn is_executable_path(path: &str) -> bool {
@@ -5369,7 +7181,9 @@ fn supplementary_gids_for_user(username: &str, primary_gid: u32) -> Vec<u32> {
 }
 
 fn find_user_by_name(name: &str) -> Option<PasswdEntry> {
-    read_passwd_entries().into_iter().find(|u| u.username == name)
+    read_passwd_entries()
+        .into_iter()
+        .find(|u| u.username == name)
 }
 
 fn find_user_by_uid(uid: u32) -> Option<PasswdEntry> {
@@ -5435,7 +7249,10 @@ fn ensure_runtime_hostname(raw: &str) -> Result<(), String> {
     let hostname = normalize_hostname(raw);
     let ret = unsafe { sethostname(hostname.as_bytes().as_ptr(), hostname.len()) };
     if ret != 0 {
-        return Err(format!("sethostname failed: {}", std::io::Error::last_os_error()));
+        return Err(format!(
+            "sethostname failed: {}",
+            std::io::Error::last_os_error()
+        ));
     }
 
     fs::write("/etc/hostname", format!("{}\n", hostname))
@@ -5447,8 +7264,7 @@ fn ensure_runtime_hostname(raw: &str) -> Result<(), String> {
 fn ensure_hosts_hostname_mapping(hostname: &str) -> Result<(), String> {
     let hosts_path = Path::new("/etc/hosts");
     let existing = if hosts_path.exists() {
-        fs::read_to_string(hosts_path)
-            .map_err(|e| format!("read /etc/hosts failed: {}", e))?
+        fs::read_to_string(hosts_path).map_err(|e| format!("read /etc/hosts failed: {}", e))?
     } else {
         String::new()
     };
@@ -5496,8 +7312,7 @@ fn ensure_hosts_hostname_mapping(hostname: &str) -> Result<(), String> {
 
     let mut rendered = lines.join("\n");
     rendered.push('\n');
-    fs::write(hosts_path, rendered)
-        .map_err(|e| format!("write /etc/hosts failed: {}", e))?;
+    fs::write(hosts_path, rendered).map_err(|e| format!("write /etc/hosts failed: {}", e))?;
     Ok(())
 }
 
@@ -5518,7 +7333,11 @@ fn run_command(program: &str, args: &[String]) -> Result<(), String> {
         program,
         args,
         stderr,
-        if stdout.is_empty() { "".to_string() } else { format!(" ({})", stdout) }
+        if stdout.is_empty() {
+            "".to_string()
+        } else {
+            format!(" ({})", stdout)
+        }
     ))
 }
 
@@ -5610,10 +7429,7 @@ fn ensure_user_home(user: &PasswdEntry) -> Result<(), String> {
             .map_err(|e| format!("create home {} failed: {}", user.home, e))?;
     }
     if command_exists("chown") {
-        let args = vec![
-            format!("{}:{}", user.uid, user.gid),
-            user.home.clone(),
-        ];
+        let args = vec![format!("{}:{}", user.uid, user.gid), user.home.clone()];
         let _ = run_command("chown", &args);
     }
     Ok(())
@@ -5629,7 +7445,11 @@ fn ensure_admin_group_membership(
         return run_command("addgroup", &args);
     }
     if command_exists("usermod") {
-        let args = vec!["-aG".to_string(), admin_group.to_string(), username.to_string()];
+        let args = vec![
+            "-aG".to_string(),
+            admin_group.to_string(),
+            username.to_string(),
+        ];
         return run_command("usermod", &args);
     }
     if command_exists("adduser") {
@@ -5672,8 +7492,7 @@ fn apply_sudo_policy(
     } else {
         format!("{} ALL=(ALL) ALL\n", username)
     };
-    fs::write(drop_path, line)
-        .map_err(|e| format!("failed to write {}: {}", drop_in_path, e))?;
+    fs::write(drop_path, line).map_err(|e| format!("failed to write {}: {}", drop_in_path, e))?;
     let mut perms = fs::metadata(drop_path)
         .map_err(|e| format!("failed to stat {}: {}", drop_in_path, e))?
         .permissions();
@@ -5711,7 +7530,10 @@ fn apply_su_policy(
             updated.push_str(&content);
             fs::write(pam_su, updated.as_bytes())
                 .map_err(|e| format!("failed to update {}: {}", pam_su.display(), e))?;
-            log_line(&format!("su_policy_passwordless_enabled group={}", admin_group));
+            log_line(&format!(
+                "su_policy_passwordless_enabled group={}",
+                admin_group
+            ));
         }
     }
 
@@ -5848,8 +7670,8 @@ fn ensure_su_setuid_if_present() -> Result<(), String> {
         if !path.exists() {
             continue;
         }
-        let metadata = fs::metadata(path)
-            .map_err(|e| format!("failed to stat {}: {}", candidate, e))?;
+        let metadata =
+            fs::metadata(path).map_err(|e| format!("failed to stat {}: {}", candidate, e))?;
         if metadata.uid() != 0 || metadata.gid() != 0 {
             if command_exists("chown") {
                 let args = vec!["0:0".to_string(), candidate.to_string()];
@@ -5869,8 +7691,9 @@ fn ensure_su_setuid_if_present() -> Result<(), String> {
         let desired_mode = current_mode | 0o4000;
         if desired_mode != current_mode {
             perms.set_mode(desired_mode);
-            fs::set_permissions(path, perms)
-                .map_err(|e| format!("failed to chmod {} to {:o}: {}", candidate, desired_mode, e))?;
+            fs::set_permissions(path, perms).map_err(|e| {
+                format!("failed to chmod {} to {:o}: {}", candidate, desired_mode, e)
+            })?;
             log_line(&format!(
                 "su_setuid_enabled path={} mode={:o}->{:o}",
                 candidate, current_mode, desired_mode
@@ -5950,17 +7773,7 @@ fn exec_response(
     }
     cmd.uid(runtime.uid);
     cmd.gid(runtime.gid);
-    cmd.env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
-    cmd.env("HOME", &runtime.home);
-    cmd.env("TERM", "xterm-256color");
-    cmd.env("USER", &runtime.username);
-    cmd.env("LOGNAME", &runtime.username);
-    cmd.env("SHELL", &runtime.shell);
-    for (key, value) in env_additions {
-        if is_valid_env_key(&key) {
-            cmd.env(key, value);
-        }
-    }
+    cmd.envs(child_process_environment(&runtime, env_additions));
     let desired_cwd = cwd
         .as_ref()
         .filter(|v| v.starts_with('/') && Path::new(v).is_dir())
@@ -5973,7 +7786,11 @@ fn exec_response(
     // If timeout is specified, spawn and wait with timeout
     if let Some(ms) = timeout_ms {
         if ms > 0 {
-            match cmd.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn() {
+            match cmd
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+            {
                 Ok(mut child) => {
                     let timeout_dur = Duration::from_millis(ms as u64);
                     let deadline = Instant::now() + timeout_dur;
@@ -5981,18 +7798,26 @@ fn exec_response(
                         match child.try_wait() {
                             Ok(Some(status)) => {
                                 let exit = status.code().unwrap_or(1);
-                                let stdout = child.stdout.take().map(|mut s| {
-                                    let mut buf = String::new();
-                                    use std::io::Read;
-                                    let _ = s.read_to_string(&mut buf);
-                                    buf
-                                }).unwrap_or_default();
-                                let stderr = child.stderr.take().map(|mut s| {
-                                    let mut buf = String::new();
-                                    use std::io::Read;
-                                    let _ = s.read_to_string(&mut buf);
-                                    buf
-                                }).unwrap_or_default();
+                                let stdout = child
+                                    .stdout
+                                    .take()
+                                    .map(|mut s| {
+                                        let mut buf = String::new();
+                                        use std::io::Read;
+                                        let _ = s.read_to_string(&mut buf);
+                                        buf
+                                    })
+                                    .unwrap_or_default();
+                                let stderr = child
+                                    .stderr
+                                    .take()
+                                    .map(|mut s| {
+                                        let mut buf = String::new();
+                                        use std::io::Read;
+                                        let _ = s.read_to_string(&mut buf);
+                                        buf
+                                    })
+                                    .unwrap_or_default();
                                 let duration_ms = started.elapsed().as_millis();
                                 return format!(
                                     "{{\"version\":1,\"requestId\":\"{}\",\"op\":\"{}\",\"status\":\"ok\",\"exitCode\":{},\"stdout\":\"{}\",\"stderr\":\"{}\",\"durationMs\":{}}}",
@@ -6008,23 +7833,44 @@ fn exec_response(
                                 if Instant::now() >= deadline {
                                     // Timeout: SIGTERM, wait 2s, SIGKILL
                                     let pid = child.id() as i32;
-                                    unsafe { kill(pid, SIGTERM); }
+                                    unsafe {
+                                        kill(pid, SIGTERM);
+                                    }
                                     thread::sleep(Duration::from_secs(2));
                                     if child.try_wait().ok().flatten().is_none() {
-                                        unsafe { kill(pid, SIGKILL); }
+                                        unsafe {
+                                            kill(pid, SIGKILL);
+                                        }
                                         let _ = child.wait();
                                     }
-                                    return error_response(request_id, op, "timeout", &format!("command timed out after {}ms", ms));
+                                    return error_response(
+                                        request_id,
+                                        op,
+                                        "timeout",
+                                        &format!("command timed out after {}ms", ms),
+                                    );
                                 }
                                 thread::sleep(Duration::from_millis(50));
                             }
                             Err(e) => {
-                                return error_response(request_id, op, "internal_error", &format!("wait failed: {e}"));
+                                return error_response(
+                                    request_id,
+                                    op,
+                                    "internal_error",
+                                    &format!("wait failed: {e}"),
+                                );
                             }
                         }
                     }
                 }
-                Err(e) => return error_response(request_id, op, "internal_error", &format!("exec failed: {e}")),
+                Err(e) => {
+                    return error_response(
+                        request_id,
+                        op,
+                        "internal_error",
+                        &format!("exec failed: {e}"),
+                    )
+                }
             }
         }
     }
@@ -6046,7 +7892,12 @@ fn exec_response(
                 duration_ms
             )
         }
-        Err(e) => error_response(request_id, op, "internal_error", &format!("exec failed: {e}")),
+        Err(e) => error_response(
+            request_id,
+            op,
+            "internal_error",
+            &format!("exec failed: {e}"),
+        ),
     }
 }
 
@@ -6326,8 +8177,14 @@ mod tests {
     #[test]
     fn extract_string_unescapes_slash_and_quote() {
         let input = r#"{"convergeHome":"\/home\/test-user","note":"hello \"world\""}"#;
-        assert_eq!(extract_string(input, "convergeHome").as_deref(), Some("/home/test-user"));
-        assert_eq!(extract_string(input, "note").as_deref(), Some("hello \"world\""));
+        assert_eq!(
+            extract_string(input, "convergeHome").as_deref(),
+            Some("/home/test-user")
+        );
+        assert_eq!(
+            extract_string(input, "note").as_deref(),
+            Some("hello \"world\"")
+        );
     }
 
     #[test]
@@ -6401,6 +8258,374 @@ mod tests {
     }
 
     #[test]
+    fn child_process_environment_inherits_runtime_environment_without_allowlist() {
+        let _guard = test_env_lock().lock().unwrap();
+        let previous_wayland = env::var_os("WAYLAND_DISPLAY");
+        let previous_xdg_runtime_dir = env::var_os("XDG_RUNTIME_DIR");
+        let previous_custom = env::var_os("MSL_TEST_BOOT_ENV");
+        env::set_var("WAYLAND_DISPLAY", "wayland-0");
+        env::set_var("XDG_RUNTIME_DIR", "/tmp");
+        env::set_var("MSL_TEST_BOOT_ENV", "1");
+
+        let runtime = RuntimeUserContext {
+            username: "alice".to_string(),
+            uid: 1000,
+            gid: 1000,
+            home: "/home/alice".to_string(),
+            shell: "/bin/bash".to_string(),
+        };
+        let envs = child_process_environment(&runtime, Vec::new());
+
+        assert_eq!(
+            env_value(&envs, "WAYLAND_DISPLAY").as_deref(),
+            Some("wayland-0")
+        );
+        assert_eq!(env_value(&envs, "XDG_RUNTIME_DIR").as_deref(), Some("/tmp"));
+        assert_eq!(env_value(&envs, "MSL_TEST_BOOT_ENV").as_deref(), Some("1"));
+        assert_eq!(env_value(&envs, "HOME").as_deref(), Some("/home/alice"));
+        assert_eq!(env_value(&envs, "USER").as_deref(), Some("alice"));
+        assert_eq!(env_value(&envs, "LOGNAME").as_deref(), Some("alice"));
+        assert_eq!(env_value(&envs, "SHELL").as_deref(), Some("/bin/bash"));
+
+        restore_env("WAYLAND_DISPLAY", previous_wayland);
+        restore_env("XDG_RUNTIME_DIR", previous_xdg_runtime_dir);
+        restore_env("MSL_TEST_BOOT_ENV", previous_custom);
+    }
+
+    #[test]
+    fn child_process_environment_request_additions_override_runtime_environment() {
+        let _guard = test_env_lock().lock().unwrap();
+        let previous_wayland = env::var_os("WAYLAND_DISPLAY");
+        env::set_var("WAYLAND_DISPLAY", "wayland-0");
+
+        let runtime = RuntimeUserContext {
+            username: "alice".to_string(),
+            uid: 1000,
+            gid: 1000,
+            home: "/home/alice".to_string(),
+            shell: "/bin/bash".to_string(),
+        };
+        let envs = child_process_environment(
+            &runtime,
+            vec![("WAYLAND_DISPLAY".to_string(), "wayland-session".to_string())],
+        );
+
+        assert_eq!(
+            env_value(&envs, "WAYLAND_DISPLAY").as_deref(),
+            Some("wayland-session")
+        );
+
+        restore_env("WAYLAND_DISPLAY", previous_wayland);
+    }
+
+    fn env_value(envs: &[(String, String)], key: &str) -> Option<String> {
+        envs.iter()
+            .find(|(candidate, _)| candidate == key)
+            .map(|(_, value)| value.clone())
+    }
+
+    fn restore_env(key: &str, value: Option<std::ffi::OsString>) {
+        match value {
+            Some(value) => env::set_var(key, value),
+            None => env::remove_var(key),
+        }
+    }
+
+    #[test]
+    fn wayland_socket_path_uses_runtime_dir_and_display_name() {
+        assert_eq!(wayland_socket_path("/tmp", "wayland-0"), "/tmp/wayland-0");
+        assert_eq!(wayland_socket_path("/tmp/", "wayland-1"), "/tmp/wayland-1");
+    }
+
+    #[test]
+    fn wayland_proxy_start_is_idempotent_and_stop_cleans_socket() {
+        let _guard = test_env_lock().lock().unwrap();
+        let display = format!("wayland-test-{}", std::process::id());
+        let runtime_dir =
+            std::env::temp_dir().join(format!("msl-wayland-test-{}", std::process::id()));
+        let runtime_dir_string = runtime_dir.to_string_lossy().to_string();
+        let socket = wayland_socket_path(&runtime_dir_string, &display);
+        let _ = fs::remove_file(&socket);
+        let _ = fs::remove_dir_all(&runtime_dir);
+
+        let first =
+            start_wayland_proxy(display.clone(), 38123, runtime_dir_string.clone()).unwrap();
+        assert_eq!(first.socket_path, socket);
+        assert!(Path::new(&socket).exists());
+        assert_eq!(
+            fs::metadata(&socket).unwrap().permissions().mode() & 0o777,
+            0o666
+        );
+
+        let duplicate =
+            start_wayland_proxy(display.clone(), 38123, runtime_dir_string.clone()).unwrap();
+        assert_eq!(duplicate.socket_path, socket);
+        assert_eq!(wayland_proxies().lock().unwrap().len(), 1);
+
+        let status = wayland_proxy_status_response(
+            "req-status",
+            "wayland_proxy_status",
+            &format!(r#"{{"displayName":"{}"}}"#, display),
+        );
+        assert!(status.contains("\"buildMarker\":\"fd-aware-keymap\""));
+        assert!(status.contains("\"defaultProxyStarted\":\"false\""));
+        assert!(status.contains("\"lastTraceId\":\"\""));
+        assert!(status.contains("\"keymapSent\":\"false\""));
+        assert!(status.contains("\"bytesClientToHost\":\"0\""));
+        assert!(status.contains("\"bytesHostToClient\":\"0\""));
+
+        let mut client = UnixStream::connect(&socket).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        let mut byte = [0_u8; 1];
+        let read_result = client.read(&mut byte);
+        assert!(matches!(read_result, Ok(0) | Err(_)));
+        for _ in 0..20 {
+            let last_error = wayland_proxies()
+                .lock()
+                .unwrap()
+                .get(&display)
+                .and_then(|proxy| proxy.last_error.clone());
+            if last_error
+                .as_deref()
+                .is_some_and(|value| value.starts_with("display_transport_unavailable"))
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(wayland_proxies()
+            .lock()
+            .unwrap()
+            .get(&display)
+            .and_then(|proxy| proxy.last_error.clone())
+            .is_some_and(|value| value.starts_with("display_transport_unavailable")));
+
+        let stopped = stop_wayland_proxy(&display).unwrap().unwrap();
+        assert_eq!(stopped.socket_path, socket);
+        for _ in 0..20 {
+            if !Path::new(&socket).exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!Path::new(&socket).exists());
+        let _ = fs::remove_dir_all(&runtime_dir);
+    }
+
+    #[test]
+    fn wayland_proxy_converts_shm_pool_fd_to_transport_messages() {
+        let _guard = test_env_lock().lock().unwrap();
+        let (sender, receiver) = UnixStream::pair().unwrap();
+        let mut fd_payload = create_wayland_fd_payload("test-shm", &[1, 2, 3, 4]).unwrap();
+        fd_payload.seek(SeekFrom::Start(0)).unwrap();
+        let mut request = Vec::new();
+        request.extend_from_slice(&6_u32.to_ne_bytes());
+        request.extend_from_slice(&((16_u32 << 16) | 0_u32).to_ne_bytes());
+        request.extend_from_slice(&9_u32.to_ne_bytes());
+        request.extend_from_slice(&4_i32.to_ne_bytes());
+        send_wayland_message_with_fd(sender.as_raw_fd(), &request, fd_payload.as_raw_fd()).unwrap();
+
+        let chunk = recv_wayland_client_chunk(receiver.as_raw_fd()).unwrap();
+        assert_eq!(chunk.bytes, request);
+        assert_eq!(chunk.fds.len(), 1);
+
+        let mut state = GuestWaylandParseState::new();
+        state.objects.insert(6, "wl_shm".to_string());
+        state.pending.extend_from_slice(&chunk.bytes);
+        state.pending_fds.extend(chunk.fds);
+        let path =
+            std::env::temp_dir().join(format!("msl-wayland-transport-test-{}", std::process::id()));
+        let _ = fs::remove_file(&path);
+        let mut transport = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        let forwarded =
+            drain_guest_wayland_messages("wayland-test", "trace-test", &mut state, &mut transport)
+                .unwrap();
+        assert_eq!(forwarded, request.len() as u64);
+        transport.seek(SeekFrom::Start(0)).unwrap();
+        let mut bytes = Vec::new();
+        transport.read_to_end(&mut bytes).unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains(r#""type":"shmPoolCreate""#));
+        assert!(text.contains(r#""poolId":9"#));
+        assert!(text.contains(r#""dataBase64":"AQIDBA==""#));
+        assert!(text.contains(r#""type":"waylandBytes""#));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn wayland_proxy_keeps_ancillary_fd_until_shm_create_pool_message() {
+        let _guard = test_env_lock().lock().unwrap();
+        let mut fd_payload = create_wayland_fd_payload("test-shm-delayed", &[5, 6, 7, 8]).unwrap();
+        fd_payload.seek(SeekFrom::Start(0)).unwrap();
+        let retained_fd = unsafe { libc::dup(fd_payload.as_raw_fd()) };
+        assert!(retained_fd >= 0);
+
+        let mut registry_bind = Vec::new();
+        registry_bind.extend_from_slice(&2_u32.to_ne_bytes());
+        registry_bind.extend_from_slice(&((40_u32 << 16) | 0_u32).to_ne_bytes());
+        registry_bind.extend_from_slice(&1_u32.to_ne_bytes());
+        registry_bind.extend_from_slice(&14_u32.to_ne_bytes());
+        let mut interface = b"wl_compositor\0".to_vec();
+        interface.resize(16, 0);
+        registry_bind.extend_from_slice(&interface);
+        registry_bind.extend_from_slice(&3_u32.to_ne_bytes());
+        registry_bind.extend_from_slice(&4_u32.to_ne_bytes());
+
+        let mut shm_create_pool = Vec::new();
+        shm_create_pool.extend_from_slice(&6_u32.to_ne_bytes());
+        shm_create_pool.extend_from_slice(&((16_u32 << 16) | 0_u32).to_ne_bytes());
+        shm_create_pool.extend_from_slice(&9_u32.to_ne_bytes());
+        shm_create_pool.extend_from_slice(&4_i32.to_ne_bytes());
+
+        let path = std::env::temp_dir().join(format!(
+            "msl-wayland-delayed-fd-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&path);
+        let mut transport = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        let mut state = GuestWaylandParseState::new();
+        state.objects.insert(2, "wl_registry".to_string());
+        state.objects.insert(6, "wl_shm".to_string());
+        state.pending_fds.push_back(retained_fd);
+
+        state.pending.extend_from_slice(&registry_bind);
+        let forwarded = drain_guest_wayland_messages(
+            "wayland-test",
+            "trace-test",
+            &mut state,
+            &mut transport,
+        )
+        .unwrap();
+        assert_eq!(forwarded, registry_bind.len() as u64);
+        assert_eq!(state.pending_fds.len(), 1);
+
+        state.pending.extend_from_slice(&shm_create_pool);
+        let forwarded = drain_guest_wayland_messages(
+            "wayland-test",
+            "trace-test",
+            &mut state,
+            &mut transport,
+        )
+        .unwrap();
+        assert_eq!(forwarded, shm_create_pool.len() as u64);
+        assert!(state.pending_fds.is_empty());
+
+        transport.seek(SeekFrom::Start(0)).unwrap();
+        let mut bytes = Vec::new();
+        transport.read_to_end(&mut bytes).unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains(r#""type":"shmPoolCreate""#));
+        assert!(text.contains(r#""poolId":9"#));
+        assert!(text.contains(r#""dataBase64":"BQYHCA==""#));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn wayland_proxy_keyboard_keymap_event_omits_fd_placeholder_bytes() {
+        let _guard = test_env_lock().lock().unwrap();
+        let (mut sender, receiver) = UnixStream::pair().unwrap();
+
+        send_keyboard_keymap_event(&mut sender, 15, 1, b"xkb-keymap").unwrap();
+
+        let chunk = recv_wayland_client_chunk(receiver.as_raw_fd()).unwrap();
+        assert_eq!(chunk.fds.len(), 1);
+        assert_eq!(chunk.bytes.len(), 16);
+        assert_eq!(read_wayland_u32(&chunk.bytes, 0).unwrap(), 15);
+        assert_eq!(read_wayland_u32(&chunk.bytes, 4).unwrap(), 16_u32 << 16);
+        assert_eq!(read_wayland_u32(&chunk.bytes, 8).unwrap(), 1);
+        assert_eq!(read_wayland_u32(&chunk.bytes, 12).unwrap(), 10);
+    }
+
+    #[test]
+    fn wayland_proxy_delivers_raw_event_after_keyboard_keymap_fd_event() {
+        let _guard = test_env_lock().lock().unwrap();
+        let (mut writer, reader) = UnixStream::pair().unwrap();
+        reader
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+
+        send_keyboard_keymap_event(&mut writer, 15, 1, b"xkb-keymap").unwrap();
+        let first = recv_wayland_client_chunk(reader.as_raw_fd()).unwrap();
+        assert_eq!(first.bytes.len(), 16);
+        assert_eq!(first.fds.len(), 1);
+
+        let mut repeat_info = Vec::new();
+        repeat_info.extend_from_slice(&15_u32.to_ne_bytes());
+        repeat_info.extend_from_slice(&((16_u32 << 16) | 5_u32).to_ne_bytes());
+        repeat_info.extend_from_slice(&25_i32.to_ne_bytes());
+        repeat_info.extend_from_slice(&600_i32.to_ne_bytes());
+        writer.write_all(&repeat_info).unwrap();
+
+        let second = recv_wayland_client_chunk(reader.as_raw_fd()).unwrap();
+        assert_eq!(second.bytes, repeat_info);
+        assert!(second.fds.is_empty());
+    }
+
+    #[test]
+    fn wayland_proxy_forwards_complete_host_events_without_magic_suffix_delay() {
+        let _guard = test_env_lock().lock().unwrap();
+        let (mut writer, mut reader) = UnixStream::pair().unwrap();
+        reader
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+
+        let mut event = Vec::new();
+        event.extend_from_slice(&25_u32.to_ne_bytes());
+        event.extend_from_slice(&((20_u32 << 16) | 0_u32).to_ne_bytes());
+        event.extend_from_slice(&0_i32.to_ne_bytes());
+        event.extend_from_slice(&0_i32.to_ne_bytes());
+        event.extend_from_slice(&0_u32.to_ne_bytes());
+
+        let mut pending = event[..7].to_vec();
+        let mut total = 0_u64;
+        drain_host_wayland_bytes(
+            "wayland-test",
+            "trace-test",
+            &mut writer,
+            &mut pending,
+            &mut total,
+        )
+        .unwrap();
+        assert_eq!(total, 0);
+        assert_eq!(pending, event[..7]);
+
+        pending.extend_from_slice(&event[7..]);
+        drain_host_wayland_bytes(
+            "wayland-test",
+            "trace-test",
+            &mut writer,
+            &mut pending,
+            &mut total,
+        )
+        .unwrap();
+        assert_eq!(total, event.len() as u64);
+        assert!(pending.is_empty());
+
+        let mut received = vec![0_u8; event.len()];
+        reader.read_exact(&mut received).unwrap();
+        assert_eq!(received, event);
+    }
+
+    fn test_env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
     fn normalize_hostname_uses_instance_safe_form() {
         assert_eq!(normalize_hostname("Ubuntu_24.04"), "ubuntu-24-04");
         assert_eq!(normalize_hostname("___"), "msl");
@@ -6409,17 +8634,33 @@ mod tests {
 
     #[test]
     fn memory_cli_action_parses_aliases() {
-        assert_eq!(MemoryCliAction::parse("compact"), Some(MemoryCliAction::Compact));
-        assert_eq!(MemoryCliAction::parse("compat"), Some(MemoryCliAction::Compact));
-        assert_eq!(MemoryCliAction::parse("drop-cache"), Some(MemoryCliAction::DropCaches));
-        assert_eq!(MemoryCliAction::parse("drop_caches"), Some(MemoryCliAction::DropCaches));
-        assert_eq!(MemoryCliAction::parse("dropcache"), Some(MemoryCliAction::DropCaches));
+        assert_eq!(
+            MemoryCliAction::parse("compact"),
+            Some(MemoryCliAction::Compact)
+        );
+        assert_eq!(
+            MemoryCliAction::parse("compat"),
+            Some(MemoryCliAction::Compact)
+        );
+        assert_eq!(
+            MemoryCliAction::parse("drop-cache"),
+            Some(MemoryCliAction::DropCaches)
+        );
+        assert_eq!(
+            MemoryCliAction::parse("drop_caches"),
+            Some(MemoryCliAction::DropCaches)
+        );
+        assert_eq!(
+            MemoryCliAction::parse("dropcache"),
+            Some(MemoryCliAction::DropCaches)
+        );
         assert_eq!(MemoryCliAction::parse("unknown"), None);
     }
 
     #[test]
     fn memory_stats_file_updates() {
-        let root = std::env::temp_dir().join(format!("msl-init-memory-stats-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("msl-init-memory-stats-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let file = root.join("stats.env");
@@ -6624,7 +8865,9 @@ mod tests {
         );
         assert!(!session.helper_trace.contains("echo hello"));
         assert!(session.helper_trace.contains("credential.helper"));
-        assert!(session.helper_trace.contains("/tmp/vscode-remote-containers-abc.js"));
+        assert!(session
+            .helper_trace
+            .contains("/tmp/vscode-remote-containers-abc.js"));
     }
 
     #[test]

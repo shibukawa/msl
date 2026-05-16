@@ -74,12 +74,39 @@ final class MemoryBalloonPolicyTests: XCTestCase {
             snapshot: snapshot,
             currentTargetBytes: UInt64(750) * 1024 * 1024
         )
-        XCTAssertEqual(unchanged, UInt64(750) * 1024 * 1024)
+        XCTAssertEqual(unchanged, UInt64(2048) * 1024 * 1024)
 
         let changed = plan.desiredTargetBytes(
             snapshot: snapshot,
             currentTargetBytes: UInt64(600) * 1024 * 1024
         )
-        XCTAssertEqual(changed, UInt64(768) * 1024 * 1024)
+        XCTAssertEqual(changed, UInt64(2048) * 1024 * 1024)
+    }
+
+    func testDesiredTargetDoesNotShrinkBelowDynamicFloor() {
+        let plan = RuntimeMemoryPlan.resolve(
+            physicalMemoryBytes: UInt64(16) * 1024 * 1024 * 1024,
+            environment: [
+                "MSL_MEMORY_MB": "8192",
+                "MSL_MEMORY_START_MB": "256",
+                "MSL_MEMORY_HEADROOM_MB": "256",
+                "MSL_MEMORY_BALLOON_MIN_DELTA_MB": "64"
+            ],
+            minimumAllowedBytes: UInt64(64) * 1024 * 1024,
+            maximumAllowedBytes: UInt64(16) * 1024 * 1024 * 1024
+        )
+
+        let mostlyIdle = LinuxMemInfoSnapshot(
+            memTotalBytes: UInt64(8) * 1024 * 1024 * 1024,
+            memAvailableBytes: UInt64(7_500) * 1024 * 1024
+        )
+
+        XCTAssertEqual(
+            plan.desiredTargetBytes(
+                snapshot: mostlyIdle,
+                currentTargetBytes: UInt64(8) * 1024 * 1024 * 1024
+            ),
+            UInt64(2048) * 1024 * 1024
+        )
     }
 }

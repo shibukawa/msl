@@ -3095,6 +3095,7 @@ final class DistributionManager {
             try fileManager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dst.path)
         }
 
+        try installWaylandGuestArtifacts(intoRootfs: rootfsDir)
         try normalizeRootFstabForVirtualDisk(rootfsDir: rootfsDir)
 
         guard let runtimeProfile,
@@ -3105,6 +3106,13 @@ final class DistributionManager {
             rootfsDir: rootfsDir,
             serviceManager: runtimeProfile.serviceManager
         )
+    }
+
+    internal func installWaylandGuestArtifacts(intoRootfs rootfsDir: URL) throws {
+        let profileDestination = rootfsDir.appendingPathComponent(String(mslGuestWaylandProfileScriptPath.dropFirst()), isDirectory: false)
+        try fileManager.createDirectory(at: profileDestination.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data(mslWaylandProfileScript().utf8).write(to: profileDestination, options: .atomic)
+        try fileManager.setAttributes([.posixPermissions: 0o644], ofItemAtPath: profileDestination.path)
     }
 
     private func configureContainerRuntimeRootFS(rootfsDir: URL) throws {

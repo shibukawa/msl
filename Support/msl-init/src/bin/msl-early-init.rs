@@ -52,8 +52,14 @@ fn mount_overlay_root() -> Result<(), String> {
     mount_fs("/dev/vda", "/run/msl/base", "erofs", MS_RDONLY, None)
         .map_err(|e| format!("stage=mount_base detail={e}"))?;
     log_console("msl-early-init: mount state /dev/vdb");
-    mount_fs("/dev/vdb", "/run/msl/state", "btrfs", MS_NOSUID | MS_NODEV, Some("compress=zstd"))
-        .map_err(|e| format!("stage=mount_state detail={e}"))?;
+    mount_fs(
+        "/dev/vdb",
+        "/run/msl/state",
+        "btrfs",
+        MS_NOSUID | MS_NODEV,
+        Some("compress=zstd"),
+    )
+    .map_err(|e| format!("stage=mount_state detail={e}"))?;
     log_console("msl-early-init: prepare overlay upper/work");
     create_dirs(&["/run/msl/state/upper", "/run/msl/state/work"])?;
     log_console("msl-early-init: mount overlay /sysroot");
@@ -65,14 +71,24 @@ fn mount_overlay_root() -> Result<(), String> {
         Some("lowerdir=/run/msl/base,upperdir=/run/msl/state/upper,workdir=/run/msl/state/work"),
     )
     .map_err(|e| format!("stage=mount_overlay detail={e}"))?;
-    create_dirs(&["/sysroot/dev", "/sysroot/run/msl/tmp", "/sysroot/run/msl/state-root"])
-        .map_err(|e| format!("stage=prepare_merged_tmp_mountpoint detail={e}"))?;
+    create_dirs(&[
+        "/sysroot/dev",
+        "/sysroot/run/msl/tmp",
+        "/sysroot/run/msl/state-root",
+    ])
+    .map_err(|e| format!("stage=prepare_merged_tmp_mountpoint detail={e}"))?;
     log_console("msl-early-init: mount devtmpfs /sysroot/dev");
     mount_fs("devtmpfs", "/sysroot/dev", "devtmpfs", MS_NOSUID, None)
         .map_err(|e| format!("stage=mount_devtmpfs detail={e}"))?;
     log_console("msl-early-init: expose state root /sysroot/run/msl/state-root");
-    mount_fs("/dev/vdb", "/sysroot/run/msl/state-root", "btrfs", MS_NOSUID | MS_NODEV, Some("compress=zstd"))
-        .map_err(|e| format!("stage=mount_state_root detail={e}"))?;
+    mount_fs(
+        "/dev/vdb",
+        "/sysroot/run/msl/state-root",
+        "btrfs",
+        MS_NOSUID | MS_NODEV,
+        Some("compress=zstd"),
+    )
+    .map_err(|e| format!("stage=mount_state_root detail={e}"))?;
 
     Ok(())
 }
@@ -95,7 +111,8 @@ fn create_dirs(paths: &[&str]) -> Result<(), String> {
 
 fn require_dirs(paths: &[&str]) -> Result<(), String> {
     for path in paths {
-        let metadata = fs::metadata(path).map_err(|e| format!("required directory {path} is missing: {e}"))?;
+        let metadata =
+            fs::metadata(path).map_err(|e| format!("required directory {path} is missing: {e}"))?;
         if !metadata.is_dir() {
             return Err(format!("required path {path} is not a directory"));
         }
@@ -122,8 +139,18 @@ fn mount_fs(
     } else {
         fstype.as_ptr()
     };
-    let data_ptr = data.as_ref().map_or(std::ptr::null(), |value| value.as_ptr());
-    let ret = unsafe { mount(source.as_ptr(), target.as_ptr(), fstype_ptr, flags, data_ptr) };
+    let data_ptr = data
+        .as_ref()
+        .map_or(std::ptr::null(), |value| value.as_ptr());
+    let ret = unsafe {
+        mount(
+            source.as_ptr(),
+            target.as_ptr(),
+            fstype_ptr,
+            flags,
+            data_ptr,
+        )
+    };
     if ret == 0 {
         return Ok(());
     }
@@ -135,11 +162,17 @@ fn chroot_into(new_root: &str) -> Result<(), String> {
     let slash = CString::new("/").unwrap();
     let ret = unsafe { chroot(root.as_ptr()) };
     if ret != 0 {
-        return Err(format!("chroot {new_root} failed: {}", std::io::Error::last_os_error()));
+        return Err(format!(
+            "chroot {new_root} failed: {}",
+            std::io::Error::last_os_error()
+        ));
     }
     let ret = unsafe { chdir(slash.as_ptr()) };
     if ret != 0 {
-        return Err(format!("chdir / failed: {}", std::io::Error::last_os_error()));
+        return Err(format!(
+            "chdir / failed: {}",
+            std::io::Error::last_os_error()
+        ));
     }
     Ok(())
 }

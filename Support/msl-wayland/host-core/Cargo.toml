@@ -1,0 +1,18 @@
+[package]
+name = "msl-wayland-host-core"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "msl_wayland_core"
+crate-type = ["cdylib"]
+
+[features]
+default = []
+real-smithay = ["dep:smithay"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libc = "0.2"
+smithay = { version = "0.4", default-features = false, optional = true }

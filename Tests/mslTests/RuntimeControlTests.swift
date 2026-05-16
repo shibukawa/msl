@@ -124,6 +124,47 @@ final class RuntimeControlTests: XCTestCase {
         XCTAssertEqual(decoded.hostShareRoot, "/Users/alice")
     }
 
+    func testGUISessionStartRequestRoundTrip() throws {
+        let req = RuntimeControlRequest(
+            op: "gui_session_start",
+            instance: "ubuntu",
+            callerCwd: "/Users/alice/src",
+            argv: ["gedit"],
+            cwd: "/mnt/macos/Users/alice/src",
+            guiWindowTitle: "Editor",
+            displayName: "wayland-1",
+            displayPort: 38001
+        )
+        let data = try JSONEncoder().encode(req)
+        let decoded = try JSONDecoder().decode(RuntimeControlRequest.self, from: data)
+        XCTAssertEqual(decoded.op, "gui_session_start")
+        XCTAssertEqual(decoded.argv, ["gedit"])
+        XCTAssertEqual(decoded.guiWindowTitle, "Editor")
+        XCTAssertEqual(decoded.displayName, "wayland-1")
+        XCTAssertEqual(decoded.displayPort, 38001)
+    }
+
+    func testGUISessionResponseRoundTrip() throws {
+        let session = RuntimeGUISession(
+            id: "gui-1",
+            instanceName: "ubuntu",
+            sessionId: "session-1",
+            procId: "proc-1",
+            title: "gedit",
+            command: ["gedit"],
+            state: .running,
+            display: RuntimeGUIDisplayDescriptor(displayName: "wayland-1", port: 38001),
+            startedAtEpochMs: 1,
+            lastUpdatedEpochMs: 2
+        )
+        let resp = RuntimeControlResponse(ok: true, guiSession: session, guiSessions: [session])
+        let data = try JSONEncoder().encode(resp)
+        let decoded = try JSONDecoder().decode(RuntimeControlResponse.self, from: data)
+        XCTAssertEqual(decoded.guiSession?.id, "gui-1")
+        XCTAssertEqual(decoded.guiSessions?.count, 1)
+        XCTAssertEqual(decoded.guiSessions?.first?.display.port, 38001)
+    }
+
     func testDNSReconcileRequestRoundTrip() throws {
         let req = RuntimeControlRequest(op: "dns_reconcile", dnsSource: "manual")
         let data = try JSONEncoder().encode(req)

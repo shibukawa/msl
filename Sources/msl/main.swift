@@ -185,6 +185,7 @@ struct MSLCommand: ParsableCommand {
             NerdctlCommand.self,
             ContainerCommand.self,
             CpCommand.self,
+            AppCommand.self,
             ListCommand.self,
             StatusCommand.self,
             StopCommand.self,
@@ -230,6 +231,47 @@ struct MSLCommand: ParsableCommand {
                 setenv("MSL_ATTACH_SERIAL", "1", 1)
             }
             try manager.runDefaultShell(instanceName: instance)
+        }
+    }
+}
+
+struct AppCommand: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "app",
+        abstract: "Run and manage GUI applications.",
+        subcommands: [AppRunCommand.self]
+    )
+}
+
+struct AppRunCommand: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "run",
+        abstract: "Run a Wayland-native GUI application in the VM.",
+        discussion: "Use this command instead of running GUI apps directly in a guest shell when you want MSL to create and manage the host Wayland window."
+    )
+
+    @Option(name: [.customLong("title")], help: "Window title override for the host child window.")
+    var title: String?
+
+    @Argument(help: "Optional target instance name.")
+    var targetInstance: String?
+
+    @Argument(parsing: .remaining, help: "Command and arguments.")
+    var command: [String] = []
+
+    mutating func validate() throws {
+        if command.isEmpty {
+            throw ValidationError("Missing GUI command. See `msl app run --help`.")
+        }
+    }
+
+    mutating func run() throws {
+        withRuntimeManager { manager in
+            try manager.runGUICommand(
+                argv: command,
+                instanceName: targetInstance ?? CLIInvocationContext.instanceName,
+                title: title
+            )
         }
     }
 }
@@ -401,10 +443,13 @@ struct StopCommand: ParsableCommand {
         abstract: "Stop runtime."
     )
 
-    @Flag(name: [.customLong("app")], help: "Stop the desktop app manager.")
+    @Flag(name: [.customLong("app")], help: "Deprecated alias for --desktop.")
     var app = false
 
-    @Flag(name: [.short, .long], help: "Stop all running instances.")
+    @Flag(name: [.customLong("desktop")], help: "Stop MSL Desktop.")
+    var desktop = false
+
+    @Flag(name: [.short, .long], help: "Stop all running instances and the desktop app manager.")
     var all = false
 
     @Argument(help: "Instance name.")
@@ -418,15 +463,15 @@ struct StopCommand: ParsableCommand {
             throw ValidationError("Specify target instance with either global `--instance`/`-i` or `stop <instance>`, not both")
         }
         let targetInstance = instance ?? CLIInvocationContext.instanceName
-        if app, targetInstance != nil {
-            throw ValidationError("`stop --app` cannot be combined with an instance argument")
+        if (app || desktop), targetInstance != nil {
+            throw ValidationError("`stop --app`/`--desktop` cannot be combined with an instance argument")
         }
     }
 
     mutating func run() throws {
         let targetInstance = instance ?? CLIInvocationContext.instanceName
         withRuntimeManager { manager in
-            if app {
+            if app || desktop {
                 try manager.stopAppManager()
                 return
             }

@@ -20,6 +20,7 @@ public final class BootstrapManager {
         try ensureDir(paths.logs)
         try ensureDir(paths.imagesDir)
         try ensureDir(paths.distrosDir)
+        try ensureDir(paths.mslHostWaylandDir)
 
         if !fileManager.fileExists(atPath: paths.configFile.path) {
             try Data("{}\n".utf8).write(to: paths.configFile, options: .atomic)
@@ -49,6 +50,12 @@ public final class BootstrapManager {
             binaryName: "msl-early-init",
             destination: paths.mslHostEarlyInitBinaryFile,
             logPrefix: "early_init_binary"
+        )
+        try stageGuestBinaryIfAvailable(
+            envVar: "MSL_WAYLAND_PROXY_BINARY_PATH",
+            binaryName: "msl-wayland-proxy",
+            destination: paths.mslHostWaylandProxyBinaryFile,
+            logPrefix: "wayland_proxy_binary"
         )
         try stageExt4HelpersIfAvailable()
 
@@ -163,9 +170,7 @@ public final class BootstrapManager {
         for root in roots {
             var cursor = root
             for _ in 0..<8 {
-                let c = cursor
-                    .appendingPathComponent("Support", isDirectory: true)
-                    .appendingPathComponent("msl-init", isDirectory: true)
+                let c = supportDirectory(for: binaryName, under: cursor)
                     .appendingPathComponent("target", isDirectory: true)
                     .appendingPathComponent("aarch64-unknown-linux-musl", isDirectory: true)
                     .appendingPathComponent("release", isDirectory: true)
@@ -185,6 +190,17 @@ public final class BootstrapManager {
             }
         }
         return nil
+    }
+
+    private func supportDirectory(for binaryName: String, under root: URL) -> URL {
+        if binaryName == "msl-wayland-proxy" {
+            return root
+                .appendingPathComponent("Support", isDirectory: true)
+                .appendingPathComponent("msl-wayland", isDirectory: true)
+        }
+        return root
+            .appendingPathComponent("Support", isDirectory: true)
+            .appendingPathComponent("msl-init", isDirectory: true)
     }
 
     private func stageExt4HelpersIfAvailable() throws {

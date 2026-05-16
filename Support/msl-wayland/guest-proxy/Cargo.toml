@@ -1,0 +1,11 @@
+[package]
+name = "msl-wayland-guest-proxy"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "msl-wayland-proxy"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread", "net", "io-util", "process", "sync", "time", "signal"] }
