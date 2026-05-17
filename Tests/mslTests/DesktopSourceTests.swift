@@ -1,11 +1,44 @@
 import XCTest
 
 final class DesktopSourceTests: XCTestCase {
+    func testDesktopDefinesSettingsSceneForCLIAndMaintenance() throws {
+        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+        let source = try String(contentsOf: root.appendingPathComponent("Sources/MSLDesktop/MSLDesktopApp.swift"), encoding: .utf8)
+        XCTAssertTrue(source.contains("Settings {"))
+        XCTAssertTrue(source.contains("Install CLI"))
+        XCTAssertTrue(source.contains("Uninstall CLI"))
+        XCTAssertTrue(source.contains("if model.cliStatus.cliInstalled"))
+        XCTAssertTrue(source.contains("Toggle(\n                        \"Docker shim\""))
+        XCTAssertTrue(source.contains("appDelegate.showSettingsWindow()"))
+        XCTAssertTrue(source.contains("private var settingsWindowController: NSWindowController?"))
+        XCTAssertTrue(source.contains("func showSettingsWindow()"))
+        XCTAssertTrue(source.contains("systemImage: \"gearshape\""))
+        XCTAssertTrue(source.contains("Text(\"Command Line\")"))
+        XCTAssertTrue(source.contains("Text(\"Maintenance\")"))
+        XCTAssertTrue(source.contains(".fontWeight(.semibold)"))
+        XCTAssertTrue(source.contains("Complete Reset Container"))
+        XCTAssertTrue(source.contains("confirmationDialog"))
+    }
     func testDesktopHidesInternalContainerInstance() throws {
         let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
         let source = try String(contentsOf: root.appendingPathComponent("Sources/MSLDesktop/MSLDesktopApp.swift"), encoding: .utf8)
 
         XCTAssertTrue(source.contains("\"_imagewriter\", \"_container\", \"_podman\""))
+    }
+
+    func testDesktopCountsVisibleWorkloadsInsteadOfInternalRuntimeWorkers() throws {
+        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+        let source = try String(contentsOf: root.appendingPathComponent("Sources/MSLDesktop/MSLDesktopApp.swift"), encoding: .utf8)
+
+        XCTAssertTrue(source.contains("var activeUserVMWorkers: [AppManagerWorkerRecord]"))
+        XCTAssertTrue(source.contains("var runningContainers: [RuntimeContainerListItem]"))
+        XCTAssertTrue(source.contains("guard isContainerRuntimeRunning else { return [] }"))
+        XCTAssertTrue(source.contains("var hasActiveWorkloads: Bool"))
+        XCTAssertTrue(source.contains("fetchContainersIfPossible(force: false)"))
+        XCTAssertTrue(source.contains("let runningContainerCount = runningContainers.count"))
+        XCTAssertTrue(source.contains("!Self.hiddenInstanceNames.contains($0.instanceName) && $0.lastErrorMessage?.isEmpty == false"))
+        XCTAssertTrue(source.contains("Running workloads:"))
+        XCTAssertTrue(source.contains("The following workloads are still active and will be stopped:"))
     }
 
     func testDesktopExposesSyntheticContainerNavigation() throws {

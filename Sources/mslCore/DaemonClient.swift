@@ -243,7 +243,7 @@ public final class DaemonClient {
     private func launchDesktopApp() throws {
         let appBundlePath = resolveDesktopAppBundlePath()
         guard FileManager.default.fileExists(atPath: appBundlePath) else {
-            throw MSLRuntimeError("MSLDesktop.app was not found at \(appBundlePath). Build the desktop app first.")
+            throw MSLRuntimeError("MSL.app was not found at \(appBundlePath). Build the desktop app first.")
         }
         try terminateStaleDesktopApps(appBundlePath: appBundlePath)
         let process = Process()
@@ -265,7 +265,7 @@ public final class DaemonClient {
         if executableDir.lastPathComponent == "MacOS" {
             return executableDir.deletingLastPathComponent().deletingLastPathComponent().path
         }
-        return executableDir.appendingPathComponent("MSLDesktop.app", isDirectory: true).path
+        return executableDir.appendingPathComponent("MSL.app", isDirectory: true).path
     }
 
     private func terminateStaleDesktopApps(appBundlePath: String) throws {

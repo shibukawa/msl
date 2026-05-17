@@ -110,6 +110,7 @@ final class RuntimeManagerSourceTests: XCTestCase {
         let source = try String(contentsOf: root.appendingPathComponent("Sources/mslCore/RuntimeManager.swift"), encoding: .utf8)
 
         XCTAssertTrue(source.contains("public func runContainerReset(instanceName rawName: String?) throws -> Never"))
+        XCTAssertTrue(source.contains("public func resetContainerState(instanceName rawName: String?) throws -> URL"))
         XCTAssertTrue(source.contains("distributionManager.resolveContainerRuntimeInstanceName()"))
         XCTAssertTrue(source.contains("try resolveContainerRuntimeTarget(explicitInstanceName: resolvedName)"))
         XCTAssertTrue(source.contains("distributionManager.resetWritableState(name: resolvedName)"))
@@ -120,6 +121,18 @@ final class RuntimeManagerSourceTests: XCTestCase {
         let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
         let source = try String(contentsOf: root.appendingPathComponent("Sources/mslCore/RuntimeManager.swift"), encoding: .utf8)
         XCTAssertTrue(source.contains("if distributionManager.isReservedInternalInstanceName(name)"))
+    }
+
+    func testStatusUsesPublicDefaultAndMergedEntries() throws {
+        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+        let source = try String(contentsOf: root.appendingPathComponent("Sources/mslCore/RuntimeManager.swift"), encoding: .utf8)
+
+        XCTAssertTrue(source.contains("var statusEntriesByInstance = Dictionary(uniqueKeysWithValues: instances.map"))
+        XCTAssertTrue(source.contains("statusEntriesByInstance[entry.instance] = entry"))
+        XCTAssertTrue(source.contains("let publicBootableInstances = Set("))
+        XCTAssertTrue(source.contains("for instance in publicBootableInstances where statusEntriesByInstance[instance] == nil"))
+        XCTAssertTrue(source.contains("targetInstance = try resolveRuntimeTarget(explicitInstanceName: nil).instanceName"))
+        XCTAssertTrue(source.contains("let searchableEntries = instanceName == nil ? publicStatusEntries : allStatusEntries"))
     }
 
     func testExecutablePathResolutionDoesNotFollowSwiftPMBuildSymlink() throws {

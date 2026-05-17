@@ -151,6 +151,14 @@ Notes:
 - release builds bundle `regctl` and `umoci`; end users do not need a separate install step
 - runtime prefers bundled helpers, extracts them into `~/.msl-system/tools/<bundle-version>/`, and only falls back to `PATH` for developer setups
 
+Release packaging:
+
+```bash
+make installer
+```
+
+`make installer` assembles `MSL.app` and writes `dist/MSLDesktop.dmg`. Release prebuilds live inside the app bundle under `Contents/Resources/prebuilds`; `~/Library/Application Support/msl` remains the higher-priority override root for power users and the storage root for distros, logs, and writable runtime state.
+
 List installed instances:
 
 ```bash

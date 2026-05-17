@@ -31,7 +31,9 @@ struct RuntimeBootProfileResolver {
             )
         }
 
-        let kernelDir = paths.kernelsDir.appendingPathComponent(kernelID, isDirectory: true)
+        let kernelDir = PrebuildResolver(paths: paths, environment: environment)
+            .kernelDirectory(profile: kernelID)
+            ?? paths.kernelsDir.appendingPathComponent(kernelID, isDirectory: true)
         let kernelURL = kernelDir.appendingPathComponent("vmlinuz", isDirectory: false)
         guard FileManager.default.fileExists(atPath: kernelURL.path) else {
             throw MSLRuntimeError("Step6 kernel not found: \(kernelURL.path)")

@@ -1,4 +1,4 @@
-.PHONY: build build-init build-wayland build-ext4-helper build-image build-imagewriter build-imagewriter-help imagewriter-help imagewriter-setup imagewriter \
+.PHONY: build installer build-init build-wayland build-ext4-helper build-image build-imagewriter build-imagewriter-help imagewriter-help imagewriter-setup imagewriter \
 	build-container-runtime \
 	stage-container-tools package-container-tools install-container-tools \
 	reset reset-disk reset-full clean-alpine clean-ubuntu run \
@@ -14,6 +14,9 @@ UMOCI_VERSION ?= latest
 
 build: build-init build-wayland build-ext4-helper
 	./scripts/build-signed.sh
+
+installer: build-init build-wayland build-ext4-helper package-container-tools kernel-stage build-imagewriter build-container-runtime
+	./scripts/build-installer.sh
 
 build-init:
 	./scripts/build-msl-init.sh
@@ -88,7 +91,11 @@ build-imagewriter:
 	IMAGE_FS="erofs" \
 	OUTPUT_RAW="$$OUTPUT_PATH" \
 	MSL_BIN="$(MSL)" \
-	./scripts/imagewriter-build.sh
+	./scripts/imagewriter-build.sh; \
+	ARTIFACT_DIR="tmp/imagewriter-runtime-artifact/$$INSTANCE_NAME"; \
+	mkdir -p "$$ARTIFACT_DIR"; \
+	cp "$$APP_SUPPORT_DIR/distros/$$INSTANCE_NAME/disk.raw" "$$ARTIFACT_DIR/disk.raw"; \
+	cp "$$APP_SUPPORT_DIR/distros/$$INSTANCE_NAME/metadata.json" "$$ARTIFACT_DIR/metadata.json"
 
 reset: reset-disk
 

@@ -29,6 +29,7 @@ final class ImagewriterScriptTests: XCTestCase {
         XCTAssertTrue(script.contains("stage2_${IMAGE_FS}"))
         XCTAssertTrue(script.contains("ALLOW_SETUP_WHEN_MISSING"))
         XCTAssertTrue(script.contains("REQUIRED_IMAGEWRITER_FS"))
+        XCTAssertTrue(script.contains("IMAGEWRITER_DISK_PATH"))
         XCTAssertTrue(script.contains("IMAGEWRITER_ROOTFS_PACKAGES"))
         XCTAssertTrue(script.contains("IMAGEWRITER_ROOTFS_PACKAGES=\"$IMAGEWRITER_PACKAGES\""))
         XCTAssertTrue(script.contains("[ -f \"$(instance_disk_path)\" ]"))
@@ -117,10 +118,28 @@ final class ImagewriterScriptTests: XCTestCase {
         let script = try String(contentsOf: root.appendingPathComponent("scripts/build-desktop-app.sh"), encoding: .utf8)
 
         XCTAssertTrue(script.contains("CONTAINER_TOOLS_DEST_DIR"))
+        XCTAssertTrue(script.contains("prebuilds"))
         XCTAssertTrue(script.contains("container-tools"))
         XCTAssertTrue(script.contains("manifest.json"))
         XCTAssertTrue(script.contains("tool[\"relativePath\"]"))
         XCTAssertTrue(script.contains("os.makedirs(os.path.dirname(dst), exist_ok=True)"))
+    }
+
+    func testInstallerTargetBuildsReleaseDmg() throws {
+        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
+        let makefile = try String(contentsOf: root.appendingPathComponent("Makefile"), encoding: .utf8)
+        let desktopScript = try String(contentsOf: root.appendingPathComponent("scripts/build-desktop-app.sh"), encoding: .utf8)
+        let installerScript = try String(contentsOf: root.appendingPathComponent("scripts/build-installer.sh"), encoding: .utf8)
+
+        XCTAssertTrue(makefile.contains("installer:"))
+        XCTAssertTrue(installerScript.contains("hdiutil create"))
+        XCTAssertTrue(installerScript.contains("du -sk -A"))
+        XCTAssertTrue(installerScript.contains("DMG_SIZE_MIB"))
+        XCTAssertTrue(installerScript.contains("MSL.app"))
+        XCTAssertTrue(desktopScript.contains("CFBundleIconFile"))
+        XCTAssertTrue(desktopScript.contains("MSL.icns"))
+        XCTAssertTrue(desktopScript.contains("internal-runtimes"))
+        XCTAssertTrue(desktopScript.contains("kernels/slim"))
     }
 
     func testStageContainerToolsStagesGuestBuildctl() throws {
@@ -151,7 +170,7 @@ final class ImagewriterScriptTests: XCTestCase {
         XCTAssertTrue(script.contains("INSTANCE_NAME=\"${CONTAINER_RUNTIME_INSTANCE:-_container}\""))
         XCTAssertTrue(script.contains("tmp/container-runtime-artifact"))
         XCTAssertTrue(script.contains("base.erofs.raw"))
-        XCTAssertTrue(script.contains("state.btrfs.template.raw"))
+        XCTAssertTrue(script.contains("state.btrfs.template.raw.gz"))
         XCTAssertFalse(script.contains("cp \"$INSTANCE_DIR/disk.raw\""))
         XCTAssertTrue(script.contains("metadata.json"))
         XCTAssertTrue(script.contains("source.json"))

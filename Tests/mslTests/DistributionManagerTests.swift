@@ -1483,6 +1483,49 @@ final class DistributionManagerTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: state), Data([0x01, 0x02, 0x03]))
     }
 
+    func testBundledContainerRuntimeExpandsCompressedStateTemplate() throws {
+        let ctx = try DistributionContext.make()
+        defer { ctx.cleanup() }
+
+        let bundleResources = ctx.root.appendingPathComponent("bundle-resources", isDirectory: true)
+        let artifactDir = bundleResources.appendingPathComponent("prebuilds/internal-runtimes/_container", isDirectory: true)
+        try FileManager.default.createDirectory(at: artifactDir, withIntermediateDirectories: true)
+
+        let baseURL = artifactDir.appendingPathComponent("base.erofs.raw", isDirectory: false)
+        try Data("base".utf8).write(to: baseURL)
+        let rawTemplateURL = ctx.root.appendingPathComponent("state-template.raw", isDirectory: false)
+        var templateData = Data(repeating: 0, count: 4096)
+        templateData.append(Data("state".utf8))
+        try templateData.write(to: rawTemplateURL)
+        try gzip(source: rawTemplateURL, destination: artifactDir.appendingPathComponent("state.btrfs.template.raw.gz", isDirectory: false))
+
+        let metadata = DistributionInstanceMetadata(
+            name: "_container",
+            createdAtEpochMs: nowEpochMs(),
+            source: DistributionSourceRecord(
+                sourceType: "container-runtime",
+                tarballFileName: "container-runtime",
+                sha256: "abc",
+                verifiedAtEpochMs: nowEpochMs()
+            ),
+            diskPath: baseURL.path,
+            baseDiskPath: baseURL.path,
+            stateDiskPath: ctx.paths.distroStateDiskFile(named: "_container").path,
+            rootMode: .readonlyBaseCowState,
+            kernelProfileRef: nil,
+            userConvergencePolicy: nil
+        )
+        try JSONEncoder().encode(metadata).write(to: artifactDir.appendingPathComponent("metadata.json"), options: .atomic)
+
+        setenv("MSL_BUNDLE_RESOURCES_DIR", bundleResources.path, 1)
+        defer { unsetenv("MSL_BUNDLE_RESOURCES_DIR") }
+        let manager = ctx.makeManager()
+        _ = try manager.ensureBundledInternalRuntimeInstalled(named: "_container")
+
+        let expanded = try Data(contentsOf: ctx.paths.distroStateDiskFile(named: "_container"))
+        XCTAssertEqual(expanded, templateData)
+    }
+
     func testResolveUserConvergencePolicyBackfillsFromManifestTemplate() throws {
         let ctx = try DistributionContext.make()
         defer { ctx.cleanup() }
@@ -1614,6 +1657,19 @@ final class DistributionManagerTests: XCTestCase {
             XCTAssertTrue(runtime.message.contains("commandFamily"))
         }
     }
+}
+
+private func gzip(source: URL, destination: URL) throws {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/gzip")
+    process.arguments = ["-c", source.path]
+    let pipe = Pipe()
+    process.standardOutput = pipe
+    try process.run()
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
+    XCTAssertEqual(process.terminationStatus, 0)
+    try data.write(to: destination, options: .atomic)
 }
 
 private struct DistributionContext {
