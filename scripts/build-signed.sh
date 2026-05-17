@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 BIN_PATH="$ROOT_DIR/.build/debug/msl"
 DESKTOP_BIN_PATH="$ROOT_DIR/.build/debug/MSLDesktop"
-APP_BUNDLE_PATH="$ROOT_DIR/.build/debug/MSLDesktop.app"
+APP_BUNDLE_PATH="$ROOT_DIR/.build/debug/MSL.app"
 FULL_ENTITLEMENTS_PATH="$ROOT_DIR/msl.entitlements"
 DEV_ENTITLEMENTS_PATH="$ROOT_DIR/msl.dev.entitlements"
 SWIFTPM_HOME="$ROOT_DIR/.build/swiftpm-home"

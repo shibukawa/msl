@@ -4,11 +4,13 @@ public final class BootstrapManager {
     private let paths: MSLPaths
     private let fileManager: FileManager
     private let logger: MSLLogger
+    private let prebuilds: PrebuildResolver
 
     public init(paths: MSLPaths, logger: MSLLogger, fileManager: FileManager = .default) {
         self.paths = paths
         self.logger = logger
         self.fileManager = fileManager
+        self.prebuilds = PrebuildResolver(paths: paths, fileManager: fileManager)
     }
 
     public func ensureBootstrapped(context: BootstrapContext) throws {
@@ -152,6 +154,9 @@ public final class BootstrapManager {
     }
 
     private func resolveGuestBinarySourcePath(envVar: String, binaryName: String) -> URL? {
+        if let bundled = prebuilds.guestBinary(envVar: envVar, name: binaryName) {
+            return bundled
+        }
         if let explicit = ProcessInfo.processInfo.environment[envVar], !explicit.isEmpty {
             let url = URL(fileURLWithPath: explicit)
             if fileManager.fileExists(atPath: url.path) {
@@ -261,6 +266,9 @@ public final class BootstrapManager {
         binaryName: String,
         supportDirName: String
     ) -> URL? {
+        if let bundled = prebuilds.hostTool(envVar: envVar, name: binaryName) {
+            return bundled
+        }
         if let explicit = ProcessInfo.processInfo.environment[envVar], !explicit.isEmpty {
             let url = URL(fileURLWithPath: explicit)
             if fileManager.fileExists(atPath: url.path), fileManager.isExecutableFile(atPath: url.path) {

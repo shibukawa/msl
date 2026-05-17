@@ -27,12 +27,12 @@ IMAGEWRITER_EARLY_INIT_BINARY="${MSL_EARLY_INIT_BINARY_PATH:-$HOME/.msl-system/m
 
 mkdir -p "$ARTIFACT_DIR"
 cp "$INSTANCE_DIR/base.erofs.raw" "$ARTIFACT_DIR/base.erofs.raw"
-cp "$INSTANCE_DIR/state.btrfs.template.raw" "$ARTIFACT_DIR/state.btrfs.template.raw"
+gzip -9 -c "$INSTANCE_DIR/state.btrfs.template.raw" > "$ARTIFACT_DIR/state.btrfs.template.raw.gz"
 cp "$INSTANCE_DIR/metadata.json" "$ARTIFACT_DIR/metadata.json"
 cp "$INSTANCE_DIR/source.json" "$ARTIFACT_DIR/source.json"
 
 echo "container runtime artifact ready: $ARTIFACT_DIR"
 echo "  base:           $ARTIFACT_DIR/base.erofs.raw"
-echo "  state template: $ARTIFACT_DIR/state.btrfs.template.raw"
+echo "  state template: $ARTIFACT_DIR/state.btrfs.template.raw.gz"
 echo "  metadata:       $ARTIFACT_DIR/metadata.json"
 echo "  source:         $ARTIFACT_DIR/source.json"

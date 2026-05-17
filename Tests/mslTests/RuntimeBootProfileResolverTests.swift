@@ -118,6 +118,32 @@ final class RuntimeBootProfileResolverTests: XCTestCase {
         XCTAssertTrue(profile.kernelURL.path.hasSuffix("/slim/vmlinuz"))
     }
 
+    func testResolvesBundledSlimKernelWhenUserTreeIsEmpty() throws {
+        let ctx = try RuntimeBootProfileResolverContext.make()
+        defer { ctx.cleanup() }
+
+        try ctx.writeMetadata(instanceName: "dev", kernelProfileRef: nil)
+        let bundleRoot = ctx.root.appendingPathComponent("bundle", isDirectory: true)
+        let bundledKernel = bundleRoot.appendingPathComponent("prebuilds/kernels/slim", isDirectory: true)
+        try FileManager.default.createDirectory(at: bundledKernel, withIntermediateDirectories: true)
+        FileManager.default.createFile(
+            atPath: bundledKernel.appendingPathComponent("vmlinuz").path,
+            contents: Data("kernel".utf8)
+        )
+
+        let resolver = RuntimeBootProfileResolver(
+            paths: ctx.paths,
+            logger: nil,
+            environment: ["MSL_BUNDLE_RESOURCES_DIR": bundleRoot.path]
+        )
+        let profile = try resolver.resolve(
+            metadataURL: ctx.metadataURL(instanceName: "dev"),
+            instanceName: "dev",
+            defaultKernelProfileRef: nil
+        )
+        XCTAssertEqual(profile.kernelURL.path, bundledKernel.appendingPathComponent("vmlinuz").path)
+    }
+
     func testFailsWhenVmlinuzIsMissing() throws {
         let ctx = try RuntimeBootProfileResolverContext.make()
         defer { ctx.cleanup() }

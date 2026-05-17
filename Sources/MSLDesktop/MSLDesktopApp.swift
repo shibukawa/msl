@@ -11,6 +11,165 @@ struct MSLDesktopApp: App {
         WindowGroup("MSL Desktop") {
             DashboardView(model: appDelegate.model)
                 .frame(minWidth: 1360, minHeight: 760)
+                .toolbar {
+                    ToolbarItem(placement: .primaryAction) {
+                        Button {
+                            appDelegate.showSettingsWindow()
+                        } label: {
+                            Label("Settings", systemImage: "gearshape")
+                                .labelStyle(.iconOnly)
+                        }
+                        .help("Settings")
+                    }
+                }
+        }
+        Settings {
+            MSLSettingsView()
+                .frame(width: 520)
+        }
+    }
+
+}
+
+@MainActor
+final class MSLSettingsModel: ObservableObject {
+    @Published var cliStatus = CLIIntegrationStatus(cliInstalled: false, dockerShimInstalled: false, localBinInPath: false)
+    @Published var message: String?
+    @Published var errorMessage: String?
+    @Published var isContainerRuntimeRunning = false
+
+    private let paths = MSLPaths()
+    private let cliIntegration: CLIIntegrationManager
+
+    init() {
+        let cliURL = Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/msl", isDirectory: false)
+        self.cliIntegration = CLIIntegrationManager(bundledCLIURL: cliURL)
+        refresh()
+    }
+
+    func refresh() {
+        cliStatus = cliIntegration.status()
+        let state = try? StateStore(paths: paths).loadState()
+        isContainerRuntimeRunning = state?.instances?.contains {
+            $0.instance == "_container" && ($0.lifecycleState == .running || $0.lifecycleState == .starting)
+        } == true
+    }
+
+    func installCLI() {
+        do {
+            try cliIntegration.install(includeDockerShim: false)
+            message = "Command-line tools installed."
+            errorMessage = nil
+            refresh()
+        } catch {
+            errorMessage = String(describing: error)
+        }
+    }
+
+    func setDockerShimInstalled(_ installed: Bool) {
+        do {
+            try cliIntegration.setDockerShimInstalled(installed)
+            message = installed ? "Docker shim installed." : "Docker shim uninstalled."
+            errorMessage = nil
+            refresh()
+        } catch {
+            errorMessage = String(describing: error)
+            refresh()
+        }
+    }
+
+    func uninstallCLI() {
+        do {
+            try cliIntegration.uninstall()
+            message = "Command-line tools uninstalled."
+            errorMessage = nil
+            refresh()
+        } catch {
+            errorMessage = String(describing: error)
+        }
+    }
+
+    func resetContainer() {
+        do {
+            let executablePath = Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/msl", isDirectory: false).path
+            let manager = try RuntimeManager(executablePath: executablePath)
+            let stateURL = try manager.resetContainerState(instanceName: "_container")
+            message = "Container state reset: \(stateURL.path)"
+            errorMessage = nil
+            refresh()
+        } catch {
+            errorMessage = String(describing: error)
+            refresh()
+        }
+    }
+}
+
+private struct MSLSettingsView: View {
+    @StateObject private var model = MSLSettingsModel()
+    @State private var showingResetConfirmation = false
+
+    var body: some View {
+        Form {
+            Section {
+                LabeledContent("CLI", value: model.cliStatus.cliInstalled ? "Installed" : "Not installed")
+                LabeledContent("Docker shim", value: model.cliStatus.dockerShimInstalled ? "Installed" : "Not installed")
+                LabeledContent("PATH", value: model.cliStatus.localBinInPath ? "~/.local/bin active" : "~/.local/bin not active")
+                if model.cliStatus.cliInstalled {
+                    Button("Uninstall CLI") { model.uninstallCLI() }
+                    Toggle(
+                        "Docker shim",
+                        isOn: Binding(
+                            get: { model.cliStatus.dockerShimInstalled },
+                            set: { model.setDockerShimInstalled($0) }
+                        )
+                    )
+                } else {
+                    Button("Install CLI") { model.installCLI() }
+                }
+            } header: {
+                Text("Command Line")
+                    .font(.headline)
+                    .fontWeight(.semibold)
+            }
+
+            Section {
+                LabeledContent("Container runtime", value: model.isContainerRuntimeRunning ? "Running" : "Stopped")
+                Button("Complete Reset Container", role: .destructive) {
+                    showingResetConfirmation = true
+                }
+                .disabled(model.isContainerRuntimeRunning)
+            } header: {
+                Text("Maintenance")
+                    .font(.headline)
+                    .fontWeight(.semibold)
+            }
+
+            if let message = model.message {
+                Section {
+                    Text(message)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            if let errorMessage = model.errorMessage {
+                Section {
+                    Text(errorMessage)
+                        .foregroundStyle(.red)
+                }
+            }
+        }
+        .padding(20)
+        .onAppear { model.refresh() }
+        .confirmationDialog(
+            "Complete reset container?",
+            isPresented: $showingResetConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Reset Container", role: .destructive) {
+                model.resetContainer()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This deletes the writable container runtime state. The container runtime must be stopped.")
         }
     }
 }
@@ -22,6 +181,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem?
     private var openWindowMenuItem: NSMenuItem?
     private var statusSummaryMenuItem: NSMenuItem?
+    private var settingsWindowController: NSWindowController?
     private var forceQuitRequested = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -48,20 +208,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         bringDashboardToFront()
         model.refresh()
-        guard model.hasActiveWorkers else {
+        guard model.hasActiveWorkloads else {
             return .terminateNow
         }
 
         let alert = NSAlert()
         alert.alertStyle = .warning
         alert.messageText = "Quit MSL Desktop?"
-        let workerNames = model.activeWorkerNames
-        if workerNames.isEmpty {
-            alert.informativeText = "Running or starting VMs will be stopped before MSL Desktop quits."
-        } else {
-            alert.informativeText = "The following VMs are still active and will be stopped: \(workerNames.joined(separator: ", "))"
-        }
-        alert.addButton(withTitle: "Quit and Stop VMs")
+        alert.informativeText = "The following workloads are still active and will be stopped: \(model.activeWorkloadNames.joined(separator: ", "))"
+        alert.addButton(withTitle: "Quit and Stop Workloads")
         alert.addButton(withTitle: "Cancel")
         alert.window.level = .modalPanel
         return alert.runModal() == .alertFirstButtonReturn ? .terminateNow : .terminateCancel
@@ -133,6 +288,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func quitApp() {
         bringDashboardToFront()
         NSApp.terminate(nil)
+    }
+
+    func showSettingsWindow() {
+        if let settingsWindowController {
+            settingsWindowController.showWindow(nil)
+            settingsWindowController.window?.makeKeyAndOrderFront(nil)
+        } else {
+            let hostingController = NSHostingController(rootView: MSLSettingsView().frame(width: 520))
+            let window = NSWindow(contentViewController: hostingController)
+            window.title = "MSL Settings"
+            window.styleMask = [.titled, .closable]
+            window.setContentSize(NSSize(width: 520, height: 340))
+            window.center()
+
+            let controller = NSWindowController(window: window)
+            settingsWindowController = controller
+            controller.showWindow(nil)
+        }
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     private func bringDashboardToFront() {
@@ -318,12 +492,23 @@ final class DashboardModel: ObservableObject {
         workers.filter { $0.lifecycleState == .running || $0.lifecycleState == .starting }
     }
 
-    var hasActiveWorkers: Bool {
-        !activeWorkers.isEmpty
+    var activeUserVMWorkers: [AppManagerWorkerRecord] {
+        activeWorkers.filter { !Self.hiddenInstanceNames.contains($0.instanceName) }
     }
 
-    var activeWorkerNames: [String] {
-        activeWorkers.map(\.instanceName).sorted()
+    var runningContainers: [RuntimeContainerListItem] {
+        guard isContainerRuntimeRunning else { return [] }
+        return containers.filter(isUpContainer)
+    }
+
+    var hasActiveWorkloads: Bool {
+        !activeUserVMWorkers.isEmpty || !runningContainers.isEmpty
+    }
+
+    var activeWorkloadNames: [String] {
+        let vmNames = activeUserVMWorkers.map { "VM \($0.instanceName)" }
+        let containerNames = runningContainers.map { "container \($0.name)" }
+        return (vmNames + containerNames).sorted()
     }
 
     var selectedSummary: DashboardSelectionSummary? {
@@ -399,6 +584,9 @@ final class DashboardModel: ObservableObject {
             refreshImageStorageSummaryOnLifecycleTransition(running: containerRuntimeIsRunning)
         }
         refreshGUISessions()
+        if containerRuntimeIsRunning {
+            fetchContainersIfPossible(force: false)
+        }
         refreshSelectedDataIfNeeded(force: false)
     }
 
@@ -799,6 +987,7 @@ final class DashboardModel: ObservableObject {
                     let next = response.containers ?? []
                     if self.containers != next {
                         self.containers = next
+                        self.statusItemUpdateHandler?(self.statusSummary())
                     }
                     self.lastContainersUpdatedEpochMs = nowEpochMs()
                     if self.selectedContainerID == nil {
@@ -1130,9 +1319,17 @@ final class DashboardModel: ObservableObject {
     }
 
     private func statusSummary() -> DashboardStatusSummary {
-        let runningCount = workers.filter { $0.lifecycleState == .running }.count
-        let bootingCount = workers.filter { $0.lifecycleState == .starting }.count
-        let hasError = managerError != nil || workers.contains { $0.lastErrorMessage?.isEmpty == false }
+        let runningVMCount = workers.filter {
+            $0.lifecycleState == .running && !Self.hiddenInstanceNames.contains($0.instanceName)
+        }.count
+        let runningContainerCount = runningContainers.count
+        let runningCount = runningVMCount + runningContainerCount
+        let bootingCount = workers.filter {
+            $0.lifecycleState == .starting && !Self.hiddenInstanceNames.contains($0.instanceName)
+        }.count
+        let hasError = managerError != nil || workers.contains {
+            !Self.hiddenInstanceNames.contains($0.instanceName) && $0.lastErrorMessage?.isEmpty == false
+        }
         let statusText: String
         if hasError {
             statusText = "error"
@@ -1143,7 +1340,7 @@ final class DashboardModel: ObservableObject {
         } else {
             statusText = "idle"
         }
-        let toolTip = managerError ?? "Installed: \(installedInstances.count), Running: \(runningCount), Starting: \(bootingCount)"
+        let toolTip = managerError ?? "Installed: \(installedInstances.count), Running workloads: \(runningCount), Starting VMs: \(bootingCount)"
         return DashboardStatusSummary(
             runningCount: runningCount,
             menuTitle: "MSL status: \(statusText)",

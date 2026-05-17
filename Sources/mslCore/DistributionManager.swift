@@ -525,6 +525,7 @@ final class DistributionManager {
         }
 
         do {
+            _ = try ensureBundledInternalRuntimeInstalled(named: imagewriterInstanceName)
             let materialized = try materializeRootFS(
                 targetAlias: targetAlias,
                 localFilePath: localFilePath,
@@ -1542,22 +1543,106 @@ final class DistributionManager {
         }
 
         let templateURL = paths.distroStateTemplateDiskFile(named: name)
+        let resolvedTemplateURL: URL
+        let compressedTemplateURL: URL?
+        if fileManager.fileExists(atPath: templateURL.path) {
+            resolvedTemplateURL = templateURL
+            compressedTemplateURL = nil
+        } else if let artifactDir = PrebuildResolver(paths: paths, environment: environment, fileManager: fileManager)
+            .internalRuntimeArtifactDirectory(named: name) {
+            let bundledRawTemplate = artifactDir.appendingPathComponent("state.btrfs.template.raw", isDirectory: false)
+            let bundledCompressedTemplate = artifactDir.appendingPathComponent("state.btrfs.template.raw.gz", isDirectory: false)
+            if fileManager.fileExists(atPath: bundledRawTemplate.path) {
+                resolvedTemplateURL = bundledRawTemplate
+                compressedTemplateURL = nil
+            } else {
+                resolvedTemplateURL = bundledCompressedTemplate
+                compressedTemplateURL = bundledCompressedTemplate
+            }
+        } else {
+            resolvedTemplateURL = templateURL
+            compressedTemplateURL = nil
+        }
         let stateURL = URL(fileURLWithPath: metadata.stateDiskPath ?? paths.distroStateDiskFile(named: name).path)
-        guard fileManager.fileExists(atPath: templateURL.path) else {
-            throw MSLRuntimeError("state template image not found for '\(name)': \(templateURL.path). reinstall or rebuild the instance.")
+        guard fileManager.fileExists(atPath: resolvedTemplateURL.path) else {
+            throw MSLRuntimeError("state template image not found for '\(name)': \(resolvedTemplateURL.path). reinstall or rebuild the instance.")
         }
 
         if fileManager.fileExists(atPath: stateURL.path) {
             try fileManager.removeItem(at: stateURL)
         }
         try fileManager.createDirectory(at: stateURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try copySparseFile(from: templateURL, to: stateURL)
+        if let compressedTemplateURL {
+            try expandGzipSparseFile(from: compressedTemplateURL, to: stateURL)
+        } else {
+            try copySparseFile(from: resolvedTemplateURL, to: stateURL)
+        }
         logger.log("state_disk_reset", fields: [
             "instance": name,
-            "template": templateURL.path,
+            "template": resolvedTemplateURL.path,
             "state": stateURL.path
         ])
         return stateURL
+    }
+
+    func ensureBundledInternalRuntimeInstalled(named name: String) throws -> URL? {
+        let metadataURL = paths.distroMetadataFile(named: name)
+        if fileManager.fileExists(atPath: metadataURL.path) {
+            return metadataURL
+        }
+        guard let artifactDir = PrebuildResolver(paths: paths, environment: environment, fileManager: fileManager)
+            .internalRuntimeArtifactDirectory(named: name) else {
+            return nil
+        }
+
+        let sourceMetadataURL = artifactDir.appendingPathComponent("metadata.json", isDirectory: false)
+        let baseURL = artifactDir.appendingPathComponent("base.erofs.raw", isDirectory: false)
+        let templateURL = artifactDir.appendingPathComponent("state.btrfs.template.raw", isDirectory: false)
+        let compressedTemplateURL = artifactDir.appendingPathComponent("state.btrfs.template.raw.gz", isDirectory: false)
+        let singleDiskURL = artifactDir.appendingPathComponent("disk.raw", isDirectory: false)
+        guard fileManager.fileExists(atPath: sourceMetadataURL.path) else {
+            throw MSLRuntimeError("bundled internal runtime artifact is incomplete: \(artifactDir.path)")
+        }
+
+        var metadata = try readJSON(DistributionInstanceMetadata.self, from: sourceMetadataURL)
+        let instanceDir = paths.distroDirectory(named: name)
+        try ensureDir(instanceDir)
+        metadata.name = name
+        if fileManager.fileExists(atPath: baseURL.path),
+           (fileManager.fileExists(atPath: templateURL.path) || fileManager.fileExists(atPath: compressedTemplateURL.path)) {
+            metadata.diskPath = baseURL.path
+            metadata.baseDiskPath = baseURL.path
+            metadata.stateDiskPath = paths.distroStateDiskFile(named: name).path
+            metadata.rootMode = .readonlyBaseCowState
+        } else if fileManager.fileExists(atPath: singleDiskURL.path) {
+            metadata.diskPath = singleDiskURL.path
+            metadata.baseDiskPath = nil
+            metadata.stateDiskPath = nil
+            metadata.rootMode = .singleDisk
+        } else {
+            throw MSLRuntimeError("bundled internal runtime artifact is incomplete: \(artifactDir.path)")
+        }
+        try writeJSON(metadata, to: metadataURL)
+        if metadata.resolvedRootMode() == .readonlyBaseCowState {
+            _ = try resetWritableState(name: name)
+        }
+        logger.log("bundled_internal_runtime_installed", fields: [
+            "instance": name,
+            "artifact": artifactDir.path
+        ])
+        return metadataURL
+    }
+
+    private func bundledImagewriterDiskPathIfNeeded(instanceName: String) -> String? {
+        if fileManager.fileExists(atPath: paths.distroDiskFile(named: instanceName).path) {
+            return nil
+        }
+        guard let artifactDir = PrebuildResolver(paths: paths, environment: environment, fileManager: fileManager)
+            .internalRuntimeArtifactDirectory(named: instanceName) else {
+            return nil
+        }
+        let bundledDisk = artifactDir.appendingPathComponent("disk.raw", isDirectory: false)
+        return fileManager.fileExists(atPath: bundledDisk.path) ? bundledDisk.path : nil
     }
 
     private func copySparseFile(from source: URL, to destination: URL) throws {
@@ -1568,6 +1653,46 @@ final class DistributionManager {
             }
         }
         try fileManager.copyItem(at: source, to: destination)
+    }
+
+    private func expandGzipSparseFile(from source: URL, to destination: URL) throws {
+        let gzip = "/usr/bin/gzip"
+        guard fileManager.isExecutableFile(atPath: gzip) else {
+            throw MSLRuntimeError("gzip is required to expand bundled state template: \(source.path)")
+        }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: gzip)
+        process.arguments = ["-dc", source.path]
+        let outputPipe = Pipe()
+        process.standardOutput = outputPipe
+        process.standardError = Pipe()
+        try process.run()
+
+        fileManager.createFile(atPath: destination.path, contents: nil)
+        let destinationHandle = try FileHandle(forWritingTo: destination)
+        defer { try? destinationHandle.close() }
+
+        var finalSize: off_t = 0
+        while true {
+            let data = outputPipe.fileHandleForReading.readData(ofLength: 1024 * 1024)
+            if data.isEmpty {
+                break
+            }
+            finalSize += off_t(data.count)
+            if data.allSatisfy({ $0 == 0 }) {
+                _ = lseek(destinationHandle.fileDescriptor, off_t(data.count), SEEK_CUR)
+            } else {
+                try destinationHandle.write(contentsOf: data)
+            }
+        }
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else {
+            throw MSLRuntimeError("failed to expand bundled state template: \(source.path)")
+        }
+        guard ftruncate(destinationHandle.fileDescriptor, finalSize) == 0 else {
+            throw MSLRuntimeError("failed to size expanded state template: \(destination.path)")
+        }
     }
 
     private func sanitizeContainerString(_ value: Any?) -> String? {
@@ -1653,11 +1778,8 @@ final class DistributionManager {
     }
 
     private func bundledContainerToolCandidateDirectories() -> [URL] {
-        var candidates: [URL] = []
-        if let override = environment["MSL_BUNDLED_CONTAINER_TOOLS_DIR"]?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !override.isEmpty {
-            candidates.append(URL(fileURLWithPath: override, isDirectory: true))
-        }
+        var candidates = PrebuildResolver(paths: paths, environment: environment, fileManager: fileManager)
+            .containerToolCandidateDirectories()
 
         if let resourceURL = Bundle.main.resourceURL {
             candidates.append(resourceURL.appendingPathComponent("container-tools", isDirectory: true))
@@ -2214,10 +2336,9 @@ final class DistributionManager {
     }
 
     private func resolveImagewriterBuildScriptPath(mslExecutablePath: String) throws -> String {
-        let envPath = ProcessInfo.processInfo.environment["MSL_IMAGEWRITER_BUILD_SCRIPT"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        if let envPath, !envPath.isEmpty, fileManager.fileExists(atPath: envPath) {
-            return envPath
+        if let resolved = PrebuildResolver(paths: paths, environment: environment, fileManager: fileManager)
+            .imagewriterBuildScript() {
+            return resolved.path
         }
 
         let executableURL = URL(fileURLWithPath: mslExecutablePath)
@@ -2323,6 +2444,9 @@ final class DistributionManager {
         }
         if let configuredInstance = ProcessInfo.processInfo.environment["MSL_IMAGEWRITER_INSTANCE"], !configuredInstance.isEmpty {
             env["IMAGEWRITER_INSTANCE"] = configuredInstance
+        }
+        if let bundledImagewriterDisk = bundledImagewriterDiskPathIfNeeded(instanceName: resolveImagewriterInstanceName()) {
+            env["IMAGEWRITER_DISK_PATH"] = bundledImagewriterDisk
         }
 
         let result = try process.run("/bin/sh", [scriptPath], captureOutput: true, environment: env)

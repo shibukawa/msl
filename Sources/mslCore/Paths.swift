@@ -6,6 +6,7 @@ public struct MSLPaths {
     public let mslHome: URL
     public let mslSystemHome: URL
     public let appSupport: URL
+    public let prebuildOverridesDir: URL
     public let appRuntime: URL
     public let runtimeRoot: URL
     public let runtime: URL
@@ -70,6 +71,7 @@ public struct MSLPaths {
             .appendingPathComponent("Library", isDirectory: true)
             .appendingPathComponent("Application Support", isDirectory: true)
             .appendingPathComponent("msl", isDirectory: true)
+        self.prebuildOverridesDir = appSupport.appendingPathComponent("prebuilds", isDirectory: true)
         self.appRuntime = appSupport.appendingPathComponent("runtime", isDirectory: true)
         self.runtimeRoot = runtimeRootURL ?? appRuntime
         self.runtime = runtimeRoot

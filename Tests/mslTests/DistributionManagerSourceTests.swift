@@ -56,6 +56,7 @@ final class DistributionManagerSourceTests: XCTestCase {
 
         XCTAssertTrue(source.contains("func resetWritableState(name rawName: String) throws -> URL"))
         XCTAssertTrue(source.contains("paths.distroStateTemplateDiskFile(named: name)"))
-        XCTAssertTrue(source.contains("try copySparseFile(from: templateURL, to: stateURL)"))
+        XCTAssertTrue(source.contains("try copySparseFile(from: resolvedTemplateURL, to: stateURL)"))
+        XCTAssertTrue(source.contains("expandGzipSparseFile"))
     }
 }

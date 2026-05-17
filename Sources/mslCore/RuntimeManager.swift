@@ -659,11 +659,17 @@ public final class RuntimeManager {
     }
 
     public func runContainerReset(instanceName rawName: String?) throws -> Never {
+        let stateURL = try resetContainerState(instanceName: rawName)
+        print("container state reset: \(stateURL.path)")
+        Foundation.exit(0)
+    }
+
+    public func resetContainerState(instanceName rawName: String?) throws -> URL {
         let resolvedName = (rawName?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
             ? rawName!.trimmingCharacters(in: .whitespacesAndNewlines)
             : distributionManager.resolveContainerRuntimeInstanceName()
 
-        let stateURL: URL = try lock.withExclusiveLock {
+        return try lock.withExclusiveLock {
             let state = try store.loadState()
             if state.vmState == .running, state.distro == resolvedName {
                 throw MSLRuntimeError("container runtime '\(resolvedName)' is running. run `msl stop \(resolvedName)` first.")
@@ -671,9 +677,6 @@ public final class RuntimeManager {
             _ = try resolveContainerRuntimeTarget(explicitInstanceName: resolvedName)
             return try distributionManager.resetWritableState(name: resolvedName)
         }
-
-        print("container state reset: \(stateURL.path)")
-        Foundation.exit(0)
     }
 
     public func runDefaultShell(instanceName: String? = nil) throws -> Never {
@@ -2411,11 +2414,45 @@ public final class RuntimeManager {
                 lastTransitionEpochMs: worker.lastTransitionEpochMs
             )
         }
-        let statusEntries = managerMapped.isEmpty ? instances : managerMapped.sorted { $0.instance < $1.instance }
+        var statusEntriesByInstance = Dictionary(uniqueKeysWithValues: instances.map { ($0.instance, $0) })
+        for entry in managerMapped {
+            statusEntriesByInstance[entry.instance] = entry
+        }
+        let publicBootableInstances = Set(
+            distributionManager.installedInstances()
+                .filter(\.hasDisk)
+                .map(\.name)
+        )
+        for instance in publicBootableInstances where statusEntriesByInstance[instance] == nil {
+            statusEntriesByInstance[instance] = RuntimeInstanceState(
+                instance: instance,
+                vmState: .stopped,
+                lifecycleState: .stopped,
+                activeSessionCount: 0,
+                idleTimer: IdleTimerState(),
+                runtimeUser: nil,
+                initChannel: nil,
+                runtimeHostPid: nil,
+                runtimeControlSocket: nil,
+                lastError: nil,
+                lastErrorCode: nil,
+                lastErrorMessage: nil,
+                startupEpochMs: nil,
+                startupStep: nil,
+                startupStepName: nil,
+                startupStepStatus: nil,
+                lastTransitionEpochMs: 0
+            )
+        }
+        let allStatusEntries = statusEntriesByInstance.values.sorted { $0.instance < $1.instance }
+        let publicStatusEntries = allStatusEntries.filter {
+            !distributionManager.isReservedInternalInstanceName($0.instance)
+                && publicBootableInstances.contains($0.instance)
+        }
 
         if all {
             print("INSTANCE\tMODE\tSTATE\tLIFECYCLE\tSTEP\tSESSIONS\tIDLE\tPID\tLAST_ERROR")
-            for entry in statusEntries {
+            for entry in allStatusEntries {
                 let idle = entry.idleTimer.armed ? "armed" : "not-armed"
                 let pid = entry.runtimeHostPid.map(String.init) ?? "-"
                 let lastError = (entry.lastErrorMessage ?? entry.lastError)?.replacingOccurrences(of: "\n", with: " ") ?? "-"
@@ -2431,8 +2468,14 @@ public final class RuntimeManager {
             return
         }
 
-        let targetInstance = instanceName ?? state.distro
-        guard let selected = statusEntries.first(where: { $0.instance == targetInstance }) else {
+        let targetInstance: String
+        if let explicit = instanceName?.trimmingCharacters(in: .whitespacesAndNewlines), !explicit.isEmpty {
+            targetInstance = explicit
+        } else {
+            targetInstance = try resolveRuntimeTarget(explicitInstanceName: nil).instanceName
+        }
+        let searchableEntries = instanceName == nil ? publicStatusEntries : allStatusEntries
+        guard let selected = searchableEntries.first(where: { $0.instance == targetInstance }) else {
             throw MSLRuntimeError("instance '\(targetInstance)' not found")
         }
         print("instance: \(selected.instance)")
@@ -3739,6 +3782,9 @@ public final class RuntimeManager {
             ? trimmedExplicit!
             : distributionManager.resolveContainerRuntimeInstanceName()
         let metadataURL = paths.distroMetadataFile(named: resolvedName)
+        if !fileManager.fileExists(atPath: metadataURL.path) {
+            _ = try distributionManager.ensureBundledInternalRuntimeInstalled(named: resolvedName)
+        }
         guard fileManager.fileExists(atPath: metadataURL.path) else {
             throw MSLRuntimeError("container runtime artifact is not installed; use `make build-container-runtime`")
         }

@@ -135,7 +135,11 @@ ALLOW_SETUP_WHEN_MISSING="${IMAGEWRITER_ALLOW_SETUP_WHEN_MISSING:-1}"
 REQUIRED_IMAGEWRITER_FS="${IMAGEWRITER_REQUIRED_FS:-}"
 
 instance_disk_path() {
-  printf '%s\n' "$APP_SUPPORT/distros/$INSTANCE/disk.raw"
+  if [ -n "${IMAGEWRITER_DISK_PATH:-}" ]; then
+    printf '%s\n' "$IMAGEWRITER_DISK_PATH"
+  else
+    printf '%s\n' "$APP_SUPPORT/distros/$INSTANCE/disk.raw"
+  fi
 }
 
 instance_exists() {

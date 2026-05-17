@@ -198,7 +198,8 @@ struct MSLCommand: ParsableCommand {
             NetworkCommand.self,
             PortCommand.self,
             SSHInfoCommand.self,
-            BootstrapInstallCommand.self
+            BootstrapInstallCommand.self,
+            ShellenvCommand.self
         ]
     )
 
@@ -231,6 +232,23 @@ struct MSLCommand: ParsableCommand {
                 setenv("MSL_ATTACH_SERIAL", "1", 1)
             }
             try manager.runDefaultShell(instanceName: instance)
+        }
+    }
+}
+
+struct ShellenvCommand: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "shellenv",
+        abstract: "Print shell configuration for MSL command-line tools."
+    )
+
+    mutating func run() throws {
+        let output = CLIIntegrationManager.shellenv(
+            homeDirectoryURL: FileManager.default.homeDirectoryForCurrentUser,
+            currentPATH: ProcessInfo.processInfo.environment["PATH"]
+        )
+        if !output.isEmpty {
+            print(output)
         }
     }
 }
